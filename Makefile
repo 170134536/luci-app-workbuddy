@@ -8,6 +8,10 @@
 #   make package/luci-app-workbuddy/compile V=s
 #
 # Or drop it into a feeds directory so it is picked up automatically.
+#
+# Layout follows luci.mk's install rules:
+#   root/*  -> /          (etc, usr)
+#   htdocs/* -> /www      (LuCI static assets)
 
 include $(TOPDIR)/rules.mk
 
@@ -19,7 +23,7 @@ PKG_LICENSE:=MIT
 PKG_MAINTAINER:=ZeroWrt user
 
 LUCI_TITLE:=LuCI support for the WorkBuddy relay
-LUCI_DEPENDS:=+ucode +ucode-mod-uloop +ucode-mod-socket +curl
+LUCI_DEPENDS:=+ucode +ucode-mod-uloop +ucode-mod-socket +curl +luci-base
 LUCI_PKGARCH:=all
 LUCI_DESCRIPTION:=Runs a small OpenAI-compatible relay on the router that \
 	shares the free WorkBuddy models with every device on the LAN. \
@@ -27,22 +31,35 @@ LUCI_DESCRIPTION:=Runs a small OpenAI-compatible relay on the router that \
 
 include $(TOPDIR)/feeds/luci/luci.mk
 
-# Call BuildPackage - the standard LuCI application entry point.
-# Both opkg (24.10 and older) and apk (25.12 and newer) output formats are
-# produced by the build system itself, so no extra handling is needed here.
+# NOTE: luci.mk ends with its own $(eval $(call BuildPackage,...)) for every
+# entry in LUCI_BUILD_PACKAGES, which already contains this package. Calling
+# BuildPackage again here would define the package twice and break the build,
+# so it is deliberately omitted.
 
-# The ucode relay must stay executable after installation.
+# Keep the interpreters executable and enable the service.
+#
+# luci.mk supplies a default postinst that clears the LuCI index and module
+# caches and reloads rpcd; defining this one replaces it (luci.mk guards its
+# default with ifndef), so the cache clearing is repeated here — without it the
+# menu entry stays invisible until the cache is cleared by hand.
 define Package/luci-app-workbuddy/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
 	chmod 755 /usr/bin/workbuddy-server 2>/dev/null
 	chmod 755 /usr/bin/workbuddy-ctl 2>/dev/null
 	/etc/init.d/workbuddy enable 2>/dev/null
+	rm -f /tmp/luci-indexcache.*
+	rm -rf /tmp/luci-modulecache/
+	/etc/init.d/rpcd reload 2>/dev/null
 }
 exit 0
 endef
 
-# Stop the relay and drop its runtime state on removal.
+# Stop the relay and drop its runtime state on removal. luci.mk defines no
+# default prerm, so this one simply supplements it.
+#
+# /etc/config/workbuddy is intentionally left in place so reinstalling keeps
+# the token.
 define Package/luci-app-workbuddy/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
@@ -53,11 +70,6 @@ define Package/luci-app-workbuddy/prerm
 exit 0
 endef
 
-# Keep the user's token when the package is upgraded. uci files under
-# /etc/config are already preserved by the package manager, so only the
-# explicit housekeeping is needed here.
 define Package/luci-app-workbuddy/conffiles
 /etc/config/workbuddy
 endef
-
-$(eval $(call BuildPackage,luci-app-workbuddy))

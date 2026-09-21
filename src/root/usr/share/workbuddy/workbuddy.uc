@@ -26,11 +26,24 @@ const CFG = {
 };
 
 function log(...a) {
-	if (CFG.debug) fprintf(stderr, '[workbuddy] ' + join(' ', a) + '\n');
+	if (CFG.debug) printf('[workbuddy] ' + join(' ', a) + '\n');
 }
 
-// ucode exposes wall-clock seconds as clock(); 1 = CLOCK_REALTIME.
-function now() { return clock(1); }
+// clock() returns a two element array: [seconds, nanoseconds]. Taking [0]
+// yields the seconds value. Called without arguments it reads the realtime
+// clock; a truthy argument would switch to the monotonic clock, which is not
+// comparable across the process restarts the TTL cache assumes.
+function now() {
+	const c = clock();
+	return c ? c[0] : 0;
+}
+
+// JSON serialisation: ucode has no sprintf(), only printf() (which writes
+// straight to stdout). render() captures output produced by a function, so it
+// is the way to obtain a formatted string.
+function toJson(v) {
+	return render(function (x) { printf('%J', x); }, v);
+}
 
 // ------------------------------------------------------------ model table
 // Fallback free set, used only when the remote catalogue cannot be fetched.
@@ -209,7 +222,7 @@ function sendHead(conn, code, reason, headers) {
 }
 
 function sendJson(conn, code, reason, obj) {
-	const body = sprintf('%J', obj);
+	const body = toJson(obj);
 	sendHead(conn, code, reason, [
 		'Content-Type: application/json',
 		'Content-Length: ' + length(body),
@@ -433,12 +446,12 @@ let server = null;
 try {
 	server = socket.listen(CFG.host, CFG.port, null, 64, true);
 } catch (e) {
-	fprintf(stderr, '[workbuddy] cannot bind ' + CFG.host + ':' + CFG.port + ': ' + e + '\n');
+	printf('[workbuddy] cannot bind ' + CFG.host + ':' + CFG.port + ': ' + e + '\n');
 	exit(1);
 }
 
 if (!server) {
-	fprintf(stderr, '[workbuddy] cannot bind ' + CFG.host + ':' + CFG.port + ': ' + socket.error() + '\n');
+	printf('[workbuddy] cannot bind ' + CFG.host + ':' + CFG.port + ': ' + socket.error() + '\n');
 	exit(1);
 }
 

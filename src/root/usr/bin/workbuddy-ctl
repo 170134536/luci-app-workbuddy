@@ -97,7 +97,11 @@ models)
 	;;
 
 url)
-	ip=$(uci -q get network.lan.ipaddr || echo '192.168.1.1')
+	# uci network.lan.ipaddr is empty on a DHCP-configured LAN, so fall back
+	# to the address actually assigned to the LAN bridge.
+	ip=$(uci -q get network.lan.ipaddr)
+	[ -n "$ip" ] || ip=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+	[ -n "$ip" ] || ip=192.168.1.1
 	echo "http://$ip:$PORT/v1"
 	;;
 

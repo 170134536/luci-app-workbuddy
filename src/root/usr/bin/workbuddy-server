@@ -1,7 +1,6 @@
 #!/bin/sh
 # WorkBuddy relay server for OpenWrt
 # Exposes an OpenAI-compatible endpoint backed by WorkBuddy free models.
-# Runs on ash + ucode (uses ucode's socket/http for the listener).
 
 WORKBUDDY_LIB=/usr/share/workbuddy/workbuddy.uc
 WORKBUDDY_CFG=workbuddy
@@ -33,4 +32,7 @@ export WORKBUDDY_SHARE_TOKEN="$share_token"
 export WORKBUDDY_EXPOSE_MODELS="$expose_models"
 export WORKBUDDY_DEBUG="$debug"
 
-exec ucode -L "$WORKBUDDY_LIB"
+# ucode runs a source file directly: `ucode program.uc`.
+# -L is a library *search path* prepend, not a way to name the script, so
+# passing the .uc file to -L would leave ucode with no program to run.
+exec ucode "$WORKBUDDY_LIB"
