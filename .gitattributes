@@ -1,0 +1,26 @@
+# Everything in this repo is consumed by Linux tools on the router:
+# shell scripts, ucode, and the LuCI JS page. A CRLF line ending makes the
+# shell and ucode interpreters fail outright, so LF must be preserved
+# regardless of the contributor's platform settings.
+* text=auto eol=lf
+
+# Shell and the service wrapper are POSIX scripts.
+*.sh      text eol=lf
+*.uc      text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+Makefile  text eol=lf
+
+# Windows-only helper: PowerShell 5.1 misparses a BOM-less non-ASCII .ps1,
+# so keep native line endings there.
+*.ps1     text eol=crlf
+*.psm1    text eol=crlf
+
+# Binary artifacts
+*.apk     binary
+*.tgz     binary
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.zip     binary
+*.gz      binary

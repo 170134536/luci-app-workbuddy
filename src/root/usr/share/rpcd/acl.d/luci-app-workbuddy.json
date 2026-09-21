@@ -1,0 +1,23 @@
+{
+	"luci-app-workbuddy": {
+		"description": "Grant access to WorkBuddy relay",
+		"read": {
+			"uci": [ "workbuddy" ],
+			"file": {
+				"/usr/bin/workbuddy-ctl": [ "exec" ],
+				"/etc/init.d/workbuddy": [ "exec" ],
+				"/var/log/workbuddy.log": [ "read" ]
+			},
+			"ubus": {
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "workbuddy" ],
+			"file": {
+				"/usr/bin/workbuddy-ctl": [ "exec" ],
+				"/etc/init.d/workbuddy": [ "exec" ]
+			}
+		}
+	}
+}

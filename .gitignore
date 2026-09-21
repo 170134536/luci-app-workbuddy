@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Build output: the .apk goes to GitHub Releases, not into the repo
+dist/
+*.apk
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local experiments
+/scratch/

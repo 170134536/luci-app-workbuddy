@@ -1,0 +1,118 @@
+#!/bin/sh
+# WorkBuddy control helper — used by the LuCI page and available on the CLI.
+#
+#   workbuddy-ctl status                 show relay + token state
+#   workbuddy-ctl login-start            begin the web login flow
+#   workbuddy-ctl login-poll [state]     poll once for the resulting token
+#   workbuddy-ctl set-token <token>      store a token by hand
+#   workbuddy-ctl clear-token            drop the stored token
+#   workbuddy-ctl models                 list the exposed models
+#   workbuddy-ctl url                    print the base URL for LAN clients
+
+. /lib/functions.sh
+
+PORT=$(uci -q get workbuddy.main.listen_port || echo 8789)
+ENDPOINT=$(uci -q get workbuddy.main.endpoint || echo 'https://www.workbuddy.ai')
+CVER=$(uci -q get workbuddy.main.client_version || echo '5.5.2')
+TOKEN=$(uci -q get workbuddy.main.access_token)
+STATE_FILE=/var/run/workbuddy-login.state
+
+ua() { echo "WorkBuddy/$CVER"; }
+
+need_curl() {
+	command -v curl >/dev/null 2>&1 || {
+		echo '{"error":"curl is not installed; run: apk add curl"}'
+		exit 1
+	}
+}
+
+case "$1" in
+status)
+	enabled=$(uci -q get workbuddy.main.enabled || echo 0)
+	running=0
+	pidof workbuddy-server >/dev/null 2>&1 && running=1
+	if [ -n "$TOKEN" ]; then has=1; else has=0; fi
+	printf '{"enabled":%s,"running":%s,"hasToken":%s,"port":%s,"endpoint":"%s"}\n' \
+		"$enabled" "$running" "$has" "$PORT" "$ENDPOINT"
+	;;
+
+login-start)
+	need_curl
+	resp=$(curl -sS --max-time 30 \
+		-X POST \
+		-H 'Content-Type: application/json' \
+		-H 'X-No-Authorization: true' \
+		-H "User-Agent: $(ua)" \
+		"$ENDPOINT/v2/plugin/auth/state?platform=CLI" 2>/dev/null)
+
+	echo "$resp"
+	# Remember the state so login-poll can be called without arguments.
+	st=$(echo "$resp" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	[ -n "$st" ] && echo "$st" >"$STATE_FILE"
+	;;
+
+login-poll)
+	need_curl
+	st="$2"
+	[ -n "$st" ] || st=$(cat "$STATE_FILE" 2>/dev/null)
+	[ -n "$st" ] || { echo '{"error":"no login state; call login-start first"}'; exit 1; }
+
+	resp=$(curl -sS --max-time 30 \
+		-H 'Content-Type: application/json' \
+		-H 'X-No-Authorization: true' \
+		-H "User-Agent: $(ua)" \
+		"$ENDPOINT/v2/plugin/auth/token?state=$st" 2>/dev/null)
+
+	echo "$resp"
+
+	# 11217 means the user has not finished logging in yet.
+	tok=$(echo "$resp" | sed -n 's/.*"accessToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	if [ -n "$tok" ]; then
+		uci set workbuddy.main.access_token="$tok"
+		uci commit workbuddy
+		rm -f "$STATE_FILE"
+		/etc/init.d/workbuddy restart >/dev/null 2>&1
+	fi
+	;;
+
+set-token)
+	[ -n "$2" ] || { echo '{"error":"usage: workbuddy-ctl set-token <token>"}'; exit 1; }
+	uci set workbuddy.main.access_token="$2"
+	uci commit workbuddy
+	/etc/init.d/workbuddy restart >/dev/null 2>&1
+	echo '{"ok":true}'
+	;;
+
+clear-token)
+	uci set workbuddy.main.access_token=''
+	uci commit workbuddy
+	/etc/init.d/workbuddy restart >/dev/null 2>&1
+	echo '{"ok":true}'
+	;;
+
+models)
+	need_curl
+	curl -sS --max-time 30 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null || \
+		echo '{"error":"relay not responding"}'
+	;;
+
+url)
+	ip=$(uci -q get network.lan.ipaddr || echo '192.168.1.1')
+	echo "http://$ip:$PORT/v1"
+	;;
+
+*)
+	cat <<-'EOF'
+	usage: workbuddy-ctl <command>
+
+	  status                 relay and token state as JSON
+	  login-start            begin the web login flow
+	  login-poll [state]     poll once for the token
+	  set-token <token>      store a token manually
+	  clear-token            remove the stored token
+	  models                 list exposed models
+	  url                    print the LAN base URL
+	EOF
+	exit 1
+	;;
+esac

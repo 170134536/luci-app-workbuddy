@@ -1,0 +1,13 @@
+{
+	"admin/services/workbuddy": {
+		"title": "WorkBuddy",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "workbuddy/relay"
+		},
+		"depends": {
+			"acl": [ "luci-app-workbuddy" ]
+		}
+	}
+}
