@@ -1,0 +1,57 @@
+config workbuddy 'main'
+	# 是否启用服务（1 启用 / 0 关闭）
+	option enabled '1'
+
+	# 监听端口与地址。0.0.0.0 表示允许局域网访问；仅本机使用可改为 127.0.0.1
+	option port '8789'
+	option host '0.0.0.0'
+
+	# WorkBuddy 上游地址（内置服务器，一般无需修改）
+	option endpoint 'https://www.workbuddy.ai'
+
+	# 客户端版本号，用于上游请求的 User-Agent
+	option client_version '5.5.2'
+
+	# 自动获取客户端版本（1 开启 / 0 关闭）。
+	# 开启后会尝试从官方来源探测最新版本，并记录上游实际接受过的最高版本；
+	# 探测全部失败时回退到 client_version，不会让服务不可用。
+	option auto_client_version '1'
+
+	# 管理页管理员密码。留空则管理页不可用（会提示先设置）。
+	# 设置后即可通过 http://<路由器IP>:8789/admin 打开独立管理网页，
+	# 用该密码登录后管理 API 密钥、服务器与 Key、凭据池与模型策略。
+	#   - 网页登录状态用带签名的 Cookie 保存，有效期 24 小时
+	#   - 修改此密码会让所有已登录会话立即失效
+	#   - 连续输错 8 次会锁定 5 分钟（同一来源 IP）
+	#   - 忘记密码时改这里即可，无需其他操作
+	option admin_password ''
+
+	# access token 缓存文件（网页登录后自动写入，作为「默认凭据」）
+	option token_file '/etc/workbuddy/token.json'
+
+	# 仅免费模型：开启后 /v1/models 只暴露免费模型（x0.00），
+	# 且 chat 请求若指定收费模型会自动替换为免费模型，避免扣费
+	option only_free_models '1'
+
+	# 公网访问：允许外网直连管理页与 API（1 开启 / 0 关闭）。
+	# 默认关闭，仅局域网可访问。
+	# 开启后本服务会自动在 UCI firewall 中创建端口转发规则 workbuddy_wan
+	# （WAN → 本机监听端口），关闭时删除该规则。
+	# 注意：管理页仍受管理员密码保护、API 仍受 API 密钥保护，
+	# 但开放公网会暴露登录界面，请确认密码足够强。
+	option wan_access '0'
+
+	# 公网访问的外部端口（外网侧监听端口）。
+	# 留空则与内部监听端口 port 一致；
+	# 设置后外网用该端口访问，转发到本机 port 端口（内外端口分离）。
+	# 例如设为 18789：外网 http://<公网IP>:18789 -> 本机 8789。
+	# 建议换一个不显眼的端口降低被扫描概率。
+	option wan_port ''
+
+	# 共享访问令牌：旧版鉴权方式（可选）。
+	# 推荐改用「API 密钥」（在 LuCI 中生成），支持多密钥、命名与单独吊销。
+	# 留空且无 API 密钥时，局域网内无需鉴权。
+	option share_token ''
+
+	# 调试日志（1 输出更多信息）
+	option debug '0'

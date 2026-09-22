@@ -1,0 +1,79 @@
+#!/bin/sh
+# 首次安装时准备运行环境
+
+[ -f /etc/config/workbuddy ] || exit 0
+
+mkdir -p /etc/workbuddy
+chmod 700 /etc/workbuddy
+
+# 旧版本可能残留的 token 位置，迁移到新路径
+if [ -f /etc/workbuddy.json ] && [ ! -f /etc/workbuddy/token.json ]; then
+	mv /etc/workbuddy.json /etc/workbuddy/token.json 2>/dev/null
+fi
+[ -f /etc/workbuddy/token.json ] && chmod 600 /etc/workbuddy/token.json
+[ -f /etc/workbuddy/pool.json ] && chmod 600 /etc/workbuddy/pool.json
+[ -f /etc/workbuddy/apikeys.json ] && chmod 600 /etc/workbuddy/apikeys.json
+
+# 补充旧配置缺失的默认项（幂等）
+uci -q get workbuddy.main.only_free_models >/dev/null 2>&1 || uci -q set workbuddy.main.only_free_models='1'
+
+# ---------- 端口转发规则 ----------
+#
+# 为「公网访问」预建一条端口转发规则（默认禁用，需在
+# 网络 → 防火墙 → 端口转发 中手动启用，或自行调整）。
+# 默认不启用、不 reload 防火墙，绝不打断现有网络。
+#
+# 实现要点：重定向是以**匿名段**加入的，UCI 分配 @redirect[N] 作为段名，
+# 段上的 name 只是一个普通选项。因此：
+#   - `uci get firewall.workbuddy_wan` 取不到（段名不是这个）
+#   - `uci get firewall.@redirect`     也取不到（该写法对段列表无效）
+# 必须用 `uci show firewall` 输出里的 `@redirect[N].name='workbuddy_wan'`
+# 反查真实索引，再做增删。
+
+workbuddy_wan_index() {
+	uci -q show firewall 2>/dev/null \
+		| sed -n "s/^firewall\.\(@redirect\[[0-9]*\]\)\.name='workbuddy_wan'$/\1/p" \
+		| head -n 1
+}
+
+# 清理历史重复（早期版本判断有误，可能留下多条），只保留一条。
+#
+# 关键：删除 @redirect[N] 后，后面的匿名段索引会整体前移，
+# 按正序删除会错位。因此先收集全部索引，再**从大到小**删除。
+cleanup_dups() {
+	local idxs n i
+	idxs=$(uci -q show firewall 2>/dev/null \
+		| sed -n "s/^firewall\.\(@redirect\[[0-9]*\]\)\.name='workbuddy_wan'$/\1/p")
+	n=$(echo "$idxs" | grep -c .)
+	[ "$n" -le 1 ] && return 0
+	# 保留第一条（最小索引），其余从最大索引开始删
+	i="$n"
+	while [ "$i" -gt 1 ]; do
+		idx=$(echo "$idxs" | sed -n "${i}p")
+		uci -q delete "firewall.$idx"
+		i=$((i - 1))
+	done
+	uci -q commit firewall
+}
+
+if [ -n "$(workbuddy_wan_index)" ]; then
+	cleanup_dups
+else
+	uci -q batch <<-EOF
+		add firewall redirect
+		set firewall.@redirect[-1].name='workbuddy_wan'
+		set firewall.@redirect[-1].src='wan'
+		set firewall.@redirect[-1].src_dport='8789'
+		set firewall.@redirect[-1].dest='lan'
+		set firewall.@redirect[-1].dest_ip='192.168.69.1'
+		set firewall.@redirect[-1].dest_port='8789'
+		set firewall.@redirect[-1].proto='tcp'
+		set firewall.@redirect[-1].target='DNAT'
+		set firewall.@redirect[-1].enabled='0'
+		commit firewall
+	EOF
+fi
+
+uci -q commit workbuddy
+
+exit 0
