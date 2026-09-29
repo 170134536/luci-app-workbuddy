@@ -232,6 +232,20 @@ sh install.sh remove
 | `token_file` | `/etc/workbuddy/token.json` | 凭据缓存路径 |
 | `share_token` | 空 | 旧版单一令牌（兼容用）；推荐改用 API 密钥 |
 | `debug` | `0` | 调试日志 |
+| `up_max_inflight` | `4` | 自定义上游并发上限；`0` = 不限制 |
+| `wb_max_inflight` | `6` | WorkBuddy 上游并发上限；`0` = 不限制 |
+| `queue_max` | `32` | 排队上限；`0` = 不排队（超出立即 429） |
+| `queue_timeout` | `20` | 排队超时秒数，等太久返回 429 + `Retry-After` |
+| `use_pool` | `1` | 启用上游连接复用（常驻 `workbuddy-pool`） |
+| `pool_port` | `8790` | 连接池端口（只监听 `127.0.0.1`） |
+| `pool_keepalive` | `30` | 连接池保活间隔秒数，防止空闲连接被回收 |
+| `rl_brake_hits` | `4` | 限流刹车：窗口内累计多少次上游限流拒绝后闭闸；`0` = 关闭刹车 |
+| `rl_brake_window` | `20` | 限流刹车计数窗口（秒） |
+| `rl_brake_sec` | `8` | 限流刹车闭闸时长（秒） |
+| `rl_brake_max_ra` | `15` | 回给客户端的 `Retry-After` 上限（秒） |
+| `up_first_byte_sec` | `12` | 静默看门狗「首字节档」：上游连上后多久还没吐出第一个字节就换 Key；`0` = 关闭该档 |
+| `up_idle_sec` | `60` | 静默看门狗「流中档」：已开始返回数据后，中途静默多久判定断流；`0` = 关闭该档 |
+| `wb_idle_sec` | `75` | WorkBuddy 通道静默上限（该通道首字节本来就慢，不参与首字节档）；`0` = 关闭 |
 
 配置项大多可在**管理网页 → 服务设置**里改；改完自动生效，无需手动重启。
 管理网页不可用时（例如忘了密码），直接改本文件：
@@ -507,10 +521,164 @@ curl http://192.168.69.1:8789/v1/chat/completions \
 
 ## 性能说明
 
+### 转发效率优化（2026-09-27 实测，详见 lessons/workbuddy-forward-efficiency.md）
+
+| 措施 | 实测效果 |
+|---|---|
+| 自定义上游模型列表缓存（TTL 300 s，`?refresh=1` 强制刷新） | `/v1/models` 1.66 s → **0.21 s**（首次）/ **0.004 s**（命中） |
+| 上游失败冷却按类型区分（限流 20s→40s→80s…上限 300s；鉴权 600s；瞬时 5s） | 连续 10 次请求 1.42~3.16 s，不再出现 12 s/60 s 挂起 |
+| 上游静默看门狗（自定义 25 s / WorkBuddy 75 s）+ curl `--speed-limit 1 --speed-time 30\|90` | 死链路 36 s 内收 502（修复前无限挂起） |
+| Key **严格轮播**（游标依次轮转，冷却中的跳过） | 实测序列 `3lw→RWe→F7L→6Wg→3lw`，4 把一轮 |
+| 单个 Key **被限流不换 Key**，直接返回 429 + 原因（附 Retry-After） | 实测 `attempt 2/` 出现 0 次；请求不再被拖成"连撞几把" |
+| 连接表回收（`closeConn` 摘除连接并释放缓冲） | 长跑不再累积请求体 / SSE 缓冲 |
+| `listen()` backlog 64 → 128 | 公网突发不再丢 SYN |
+| 内核参数 `files/etc/sysctl.d/99-workbuddy-forward.conf` | slow_start_after_idle=0 / fastopen=3 / mtu_probing=1 / syn_backlog=1024 |
+
+基础项：
+
 - 上游 curl 关闭缓冲（`-N`），并为客户端连接设置 `TCP_NODELAY`，减少小包延迟；
 - 转发缓冲 `16KB`，避免高频 `read()` 系统调用；
 - 上游连接超时 5 秒，配合凭据切换做快速失败；
 - 模型列表缓存 6 小时，并在服务启动 1.5 秒后预热，首个 `/v1/models` 请求不再等待。
+
+> **已知剩余开销**：每个请求仍会重新 fork curl 并重建到上游的 TCP+TLS 连接，
+> 实测固定开销约 130~190 ms/请求。
+
+### 上游连接复用（v1.8.0）
+
+上面那条「尚未实施」已于 v1.8.0 落地：新增一个常驻 Go 小程序 `workbuddy-pool`
+（静态编译 aarch64，约 6.3 MB，**零外部依赖**），持有到上游的 keep-alive 连接池，
+curl 改为把请求发给本机池；池不可用时自动回退直连，用户无感。
+
+| 项 | 说明 |
+|---|---|
+| 协议 | 请求头 `X-WB-Target: <上游基址>`，方法/路径/查询串/头/体原样透传 |
+| 本机端点 | `GET /health`、`GET /stats`（含复用率与新/旧连接 TTFB 拆分） |
+| 监听 | 只监听 `127.0.0.1`，且强制 target 带 http(s) scheme —— 主服务对公网开放（`wan_access`），池绝不能成为可被外部利用的开放代理 |
+
+实测收益（池 `/stats` 同主机拆分，n=16）：
+
+| 指标 | 新建连接 | 复用连接 | 差额 |
+|---|---|---|---|
+| TTFB p50 | 1603.077 ms | 1298.631 ms | **约 304 ms** |
+| DNS + conn_wait + TLS | — | — | 1.91 + 135.3 + 84.8 ≈ **222 ms** |
+
+（另一轮 n=138 测得 221.444 → 112.249 ms，省约 109 ms。**该拆分需 n≥15 才有意义**，
+小样本读数是噪声。）
+
+> 这个收益**用 `/metrics` 的直方图测不出来** —— 那些桶在 1–3 秒区间只有
+> 500–1000 ms 分辨率，分辨不出 300 ms 的差异。做这类对比必须看池自身的
+> new/reused 拆分。同理，用 curl 做 `use_pool=1` vs `0` 的 A/B 也**得不出结论**：
+> 上游生成耗时本身在 1.17–3.32 s 波动，远大于待测效果。
+
+设计上刻意做对的几处：
+
+- **`DisableCompression` + 逐块 `Write` + 立即 `Flush`**：SSE 必须逐字节原样透传。
+  若用默认的 bufio（4 KB）攒够才发，整场流式对话会被成段延迟 —— 这是插入代理的头号风险。
+- **预热用 `HEAD` 并读尽 body**：Go 的 transport 只在 body 读到 EOF 才把连接还给空闲池，
+  读一半就关会**亲手杀掉要保的连接**，比不预热更糟。
+- **`ResponseHeaderTimeout: 0`**：WorkBuddy 是 agent 上游，可能长时间思考后才吐首字节，
+  超时交给 ucode 的静默看门狗与 curl 的 `--speed-time`，不重复设易误杀的阈值。
+
+### 并发上限与 FIFO 排队（v1.8.0）
+
+上游限的是 tpm/rpm 而非连接数，并发越高越容易整批撞 429，因此加了闸门 + 队列。
+实测 8 并发（`up_max_inflight=4`）：闸门严格卡在 4，第 5~8 个进队列并按序排空，
+`timeoutTotal=0`、`rejectedTotal=0`、8/8 返回 200。
+
+> **但这并没有消除限流**。60 请求的 soak 里 `34×200 / 24×429 / 2×502`（40% 失败），
+> 日志显示上游原文 `rpm exhausted`、`inference exceeds tpm/rpm limit`。
+> 慢速顺序请求 3/3 全 200，说明 Key 没坏、是速率问题。详见
+> `lessons/workbuddy-remaining-optimization.md` 的 v1.8.0 附录。
+> 结论：**本地闸门只能削峰，不能扩容。**
+
+### 可观测指标（v1.8.0）
+
+`GET /metrics`（与 `/health` 一样不需要鉴权）输出：
+
+| 分组 | 内容 |
+|---|---|
+| `chat` | `total` / `ok` / `fail` / `clientErr` / `rateLimited429` |
+| `ttfbMs`、`totalMs` | 分 `pool` / `direct` 两条路径的 `p50` / `p90` / `p99` 与样本数 |
+| `queue` | `inflight`（分 `wb`/`up`）、`waiting`、`queuedTotal`、`timeoutTotal`、`rejectedTotal`、`maxDepth` |
+| `upstreams[]` | 每上游 ok/fail/rateLimited/authFail/inflight，以及**每把 Key** 的 ok/fail/rateLimited/authFail/coolingSec/lastErr（Key 一律掩码） |
+| `pool` | `enabled` / `usable` / `port` / `failCooldownSec` / `requests` / `fallbacks` |
+
+> 直方图桶在 1–3 秒区间分辨率只有 500–1000 ms，比较 ~300 ms 级别的差异时不要用它。
+
+### 限流刹车（v1.8.1）
+
+v1.8.0 的 soak 暴露了一个**正反馈放大**：一次请求撞上游限流后，代码会换下一把 Key 重试，
+最多试满 4 把；当 4 把 Key 都已在冷却中时，这 4 次尝试**注定全部失败**，却给上游打了 4 倍流量。
+实测池侧 **138 次上游请求 / 60 次客户端请求 = 2.25×**，其中 96 次（70%）就是这么烧掉的。
+
+限流刹车（上游级熔断器）掐断这条链：
+
+| 行为 | 说明 |
+|---|---|
+| 计数 | 每次上游回限流类错误时，在该上游的滑动窗口内 +1 |
+| 闭闸 | 窗口内累计达到 `rl_brake_hits` → 闭闸 `rl_brake_sec` 秒 |
+| 闭闸期间 | **只拦重试，不拦首次尝试** |
+| 闭闸尾巴 | 剩余 ≤ 2s 时先等一次再发，把失败转成成功 |
+| 客户端可见 | 被拦的请求直接回 `429` + 真实 `Retry-After`（上限 `rl_brake_max_ra`） |
+| 自愈 | 任一 Key 成功即合闸 |
+
+**为什么只拦重试**：首次尝试是唯一能探知"上游是否已恢复"的手段，拦掉它会把本可成功的
+请求变成失败；而闭闸期间的重试是纯浪费。只拦重试 = 拿掉浪费 + 完整保留"不通就换下一个"。
+
+**与 v1.7.1 被删掉的短路不同**：那个版本的判据是"我们自己的冷却模型"（4 把 Key 全在冷却就
+立刻 429），`retry_after` 会算到荒谬的 577s，且违背"不通的自动换下一个"的要求。
+本版判据是**观测到的上游拒绝**、要窗口内连续多次被拒才闭闸、`Retry-After` 有上限。
+
+`/metrics` 里可观察：
+
+| 位置 | 字段 |
+|---|---|
+| 顶层 `brake` | `enabled` / `hits` / `windowSec` / `brakeSec` / `maxRetryAfterSec` / `rejectedTotal` / `waitedTotal` |
+| `upstreams[].brake` | `enabled` / `open` / `leftSec` / `hits` / `trips` / `waited` / `rejected` |
+
+`rl_brake_hits=0` 可完全关闭刹车。
+
+### 静默看门狗：两档阈值（v1.8.2）
+
+上游连上之后一个字节都不回时，看门狗主动断开并按既有重试链换 Key，而不是让客户端干等到
+自己超时。v1.8.1 及以前只有**一个**阈值（`UP_IDLE_SEC = 25`，WorkBuddy 通道 75s），
+实测证明这个值是**客户端长尾的唯一来源**：
+
+| 证据（v1.8.1，60 请求） | 数值 |
+|---|---|
+| 慢请求（≥5s）数量 / 其中失败数 | 13 / **0**（13 个全部 200） |
+| 看门狗中止次数 | 32 次，idle 值**全部落在 25–29s** |
+| 客户端 TTFB p50 / p90 / p99 | 2.25 / 31.82 / 34.03 s |
+
+32 次中止全部卡在 25s 阈值之上（`UP_IDLE_TICK_MS = 5000` 扫描周期，故是 25+0~4s），
+且慢请求**无一失败** —— 说明看门狗一直在做对的事（把"上游还没受理"的尝试掐掉换 Key，
+换完几秒内就成功），只是**掐得太晚**：客户端因此白等 25~34 秒。
+
+关键洞察：**"还没有第一个字节"和"流中途断掉"是两种完全不同的事故**，不该共用一个阈值。
+没有第一个字节 = 上游根本没受理（多半是在服务端排队或撞了配额），早点换 Key 就好；
+流中途断掉 = 已经出了数据又卡住，这时换 Key 会浪费已生成的内容，应该多等一会。
+
+v1.8.2 拆成两档，用 `conn.attemptBytes` 判档 —— 它在每次尝试开始时清零
+（`spawnUpstreamDirect` / `spawnUpstream`）、收到字节就累加，天然就是
+"本次尝试是否已被上游受理"的标志位：
+
+| 档位 | 判据 | 配置项 | 默认 | 命中日志 |
+|---|---|---|---|---|
+| 首字节 | `attemptBytes === 0` | `up_first_byte_sec` | `12` | `upstream no first byte in Ns (>=Ns, key#K, client C), failover` |
+| 流中 | `attemptBytes > 0` | `up_idle_sec` | `60` | `upstream stalled Ns mid-stream (>=Ns, attempt A, client C), aborting` |
+| WorkBuddy | 非自定义上游 | `wb_idle_sec` | `75` | 同「流中」 |
+
+- `0` = 关闭该档（诊断链路时可用，生产不建议 —— 会让客户端一直干等）。
+- 一致性保护：若 `up_idle_sec < up_first_byte_sec`（两者都非 0），视为配错，双双回默认值；
+  否则首字节还没等到就被流中档杀掉，等于首字节档失效。
+- 两条失败原因串（`上游 Ns 未返回首字节` / `上游流中静默 Ns`）都不含限流关键词，
+  经 `isRateLimitReason()` 判为瞬时抖动，走 `UP_SOFT_COOL = 2` 秒冷却，**不会误计入刹车 hits**。
+- 启动日志会打印当前档位：`forward tuning: idle=60s/75s first_byte=12s ...`。
+
+> v1.8.0 曾怀疑 502 是 curl `--speed-time 30` 误杀"上游思考中"。**该假设已被推翻**：
+> 先到的是 25s 的看门狗，curl 的 30s 从来没机会触发。调 `--speed-time` 是修错了地方。
+
 
 ## 接入第三方客户端
 
@@ -647,6 +815,13 @@ logread | grep workbuddy
   代码页解析，中文字符串被误读并**污染后续代码的语法解析** —— 表现为
   脚本里明明正确的表达式抛「不能对 Null 值表达式调用方法」这类莫名错误。
   本次 `.check-forward.ps1` 加上 BOM 后才恢复正常。
+- **没有 `undefined` 这个标识符**（**v1.8.0 首次部署就是被它搞挂的**）：
+  ucode 里 `undefined` 既不是关键字也不是全局变量，写 `v === undefined` 会在运行期抛
+  `Reference error: access to undeclared variable undefined` —— **进程直接起不来、端口完全不监听**，
+  报错栈指向 `numOr()` / `loadConfig()`。判断字段是否存在要用 `type(v) === 'bool'`、`v === null`。
+  最阴的地方是它**看编译单元而定**：把出问题的那段原样抠进独立小文件里跑**不报错**，
+  `ucode -c` 编译期也**不报错**，**46 项单元测试全过照样抓不到**。
+  所以只能靠静态扫描（`.check-forward.ps1` 的 `UNDEFINED IDENTIFIER CHECK`）+ 纪律来防。
 - **字符串没有 `.indexOf()` / `.includes()`**：用全局 `match(s, /re/)`
   或 `index(s, sub)`。`.indexOf()` 与 `.push()` 报的是同一个错误信息
   （`left-hand side is not a function`），排查时要看行号而不是错误文本。
@@ -661,18 +836,26 @@ logread | grep workbuddy
 
 ### 静态检查脚本
 
-`.check-forward.ps1` 覆盖两类只在运行期暴露、且难靠语法检查发现的问题：
+`.check-forward.ps1` 覆盖六类只在运行期暴露、且难靠语法检查发现的问题：
 
 | 检查 | 拦住的错误 |
 | --- | --- |
-| 前向引用 | `access to undeclared variable <name>`（ucode 不提升函数与顶层 `let`/`const`） |
+| `FORWARD REF CHECK` 前向引用 | `access to undeclared variable <name>`（ucode 不提升函数与顶层 `let`/`const`） |
 | 重复定义 | 后定义的函数静默覆盖前一个 |
-| 不存在的内建方法 | `.push()` / `.replace()` / `.indexOf()` / `.has()` 等 → `left-hand side is not a function` |
+| `METHOD CALL CHECK` 不存在的内建方法 | `.push()` / `.replace()` / `.indexOf()` / `.has()` 等 → `left-hand side is not a function` |
+| `TEMPLATE ESCAPE CHECK` 模板转义 | 模板字符串里 `onclick` 引号转义不足 → 管理页永远停在「加载中…」 |
+| `UNSUPPORTED SYNTAX CHECK` 不支持的语法 | `finally`（ucode 只有 `try/catch`）→ `Syntax error: Expecting 'catch'` |
+| `UNDEFINED IDENTIFIER CHECK` 裸用 `undefined` | `access to undeclared variable undefined` → **服务起不来**（v1.8.0 首次部署的崩溃根因） |
+| `GLOBAL DECLARATION ORDER CHECK` 全局声明顺序 | 函数引用「比它的定义行更靠后」才声明的顶层 `let`/`const` → `Reference error: access to undeclared variable cfg`，**服务陷入崩溃-重启循环**（v1.8.1 首次部署的崩溃根因） |
 
 ```powershell
 pwsh -File .check-forward.ps1
-# 输出两项都 OK 才算通过
+# 输出六项都 OK 才算通过
 ```
+
+> `UNDEFINED IDENTIFIER CHECK` 会跳过注释与模板字符串（浏览器 JS 里 `undefined` 合法），
+> 也跳过字符串字面量。加规则时务必做一次**负向测试**：故意注入一处违规，
+> 确认它恰好报 1 处、且不误报字符串与注释 —— 从不报警的检查等于没有检查。
 
 > 该脚本会跳过模板字符串区间，因为反引号里的 JS 是给浏览器执行的，
 > 那里的 `.push()` / `.replace()` 都是合法的。
@@ -696,11 +879,18 @@ curl -s http://127.0.0.1:8789/health
    `sha256Hex` / `secureEq` / `truthy` / `writeJsonFile` / `readJsonFile` /
    `genApiKey` 等被广泛复用的底层函数一律放在文件最前面的
    「基础工具函数」区，避免"定义在使用之后"。
+3. **配置对象 `cfg` 与连接表 `connections` 提前声明**：函数按**定义时**的词法作用域
+   解析标识符，所以一个位于文件中部、却引用 `cfg.xxx` 的函数，要求 `cfg` 在那之前
+   就已声明。`let cfg = {};` 因此被提到全局声明区，读盘赋值留在启动流程里
+   （`cfg = loadConfig();`，纯赋值）。v1.8.1 首次上线正是漏了这一步：
+   `ucode -c` 通过、单元测试也通过，只有真机上撞到限流、走进 `brakeNoteRateLimit()`
+   才抛 `Reference error: access to undeclared variable cfg`，服务被打成崩溃-重启循环。
+   规则：**新增任何引用 `cfg` 的函数后，都要跑一次 `GLOBAL DECLARATION ORDER CHECK`**。
 
 仓库里附带两个自检脚本：
 
 ```powershell
-pwsh -File .check-forward.ps1        # 静态检查，输出两项 OK 才算通过
+pwsh -File .check-forward.ps1        # 静态检查，输出六项 OK 才算通过
 ```
 
 ```sh
@@ -720,12 +910,18 @@ sh /root/luci-app-workbuddy/wan-test.sh
 
 四套合计 **94 项断言**。当前实测结果：`36 / 17 / 11 / 30` 全部通过。
 
-静态检查除「前向引用」「非法方法」外，还含一项 **`TEMPLATE ESCAPE CHECK`** ——
-专门扫模板字符串里 `onclick` 的引号转义。改动管理页后务必跑一遍：
+这六项**每次改动 `workbuddy.uc` 后都要跑一遍**，动过管理页 HTML 或闸门/池相关
+代码之后尤其不能省。但它只扫静态模式，不能替代真机验证 —— 完整门禁是三步：
 
 ```sh
-pwsh -File .check-forward.ps1        # 应输出 3 项 OK
+pwsh -File .check-forward.ps1              # 1. 静态检查（本地，六项 OK）
+ucode -c -o /tmp/probe.bin workbuddy.uc    # 2. ucode 语法/编译检查（真机）
+/etc/init.d/workbuddy restart && logread | grep workbuddy   # 3. 真机启动 + 看日志
 ```
+
+> 第 2 步只能查语法，**查不出**前向引用、裸用 `undefined` 这类运行期问题；
+> 而第 3 步才是唯一的最终裁判 —— v1.8.0 首次部署正是在这一步崩掉的
+> （前两步都过了）。
 
 > `upstream-test.sh` 会真的往各服务器发请求，因此可能触发对方的限流
 > （日日新有 RPM 限制）。测试脚本开头有 60 秒等待，用于让上一轮冷却结束。
@@ -738,25 +934,44 @@ luci-app-workbuddy/
 ├── Makefile                                  OpenWrt 包定义
 ├── install.sh                                设备端直接部署脚本
 ├── README.md
-├── .check-forward.ps1                         ucode 静态检查（前向引用/重复定义/非法方法）
+├── .check-forward.ps1                         ucode 静态检查（六项，详见上文）
 ├── pool-test.sh                               凭据池功能回归测试（36 项）
 ├── .upstream-test.sh                          服务器/上游功能回归测试（17 项）
 ├── .server-test.sh                            服务器增删改查回归测试（11 项）
 ├── .wan-test.sh                               公网访问开关回归测试（30 项）
+├── pool/                                      上游连接复用代理（Go，v1.8.0）
+│   ├── go.mod                                 Go 模块定义（零外部依赖）
+│   ├── main.go                                连接池代理，约 500 行（中文注释）
+│   └── testsse/main.go                        本地回调用最小 SSE 上游（不参与打包）
 └── files/
     ├── etc/
     │   ├── config/workbuddy                   UCI 默认配置
-    │   ├── init.d/workbuddy                   procd 服务
+    │   ├── init.d/workbuddy                   procd 服务（先拉池，再拉主服务）
+    │   ├── sysctl.d/99-workbuddy-forward.conf 内核转发参数
     │   └── uci-defaults/50-workbuddy          首次安装初始化
     ├── usr/
+    │   ├── bin/workbuddy-pool                 上游连接复用代理（aarch64 静态二进制，6.3 MB）
     │   └── share/
-    │       ├── ucode/workbuddy.uc             核心中转 + 管理网页（约 79 KB）
+    │       ├── ucode/workbuddy.uc             核心中转 + 管理网页（约 210 KB）
     │       ├── rpcd/ucode/workbuddy           rpcd 后端（状态/密码/凭据/模型）
     │       ├── luci/menu.d/luci-app-workbuddy.json
     │       └── rpcd/acl.d/luci-app-workbuddy.json
     └── www/luci-static/resources/view/workbuddy/
         └── status.js                          运行状态页（只读 + 管理员密码）
 ```
+
+> `files/usr/bin/workbuddy-pool` 是**预编译的 aarch64 二进制**（本机无 Go、
+> 路由器也不能编译），改动 `pool/main.go` 后必须重新交叉编译再提交：
+
+```powershell
+cd D:\AI\luci-app-workbuddy\pool          # 必须在模块目录内，用 . 作包路径
+$env:GOOS='linux'; $env:GOARCH='arm64'; $env:CGO_ENABLED='0'; $env:GOTOOLCHAIN='local'
+& 'D:\AI\_tools\go-sdk\go\bin\go.exe' build -trimpath -ldflags '-s -w' -o ..\files\usr\bin\workbuddy-pool .
+```
+
+> 两个坑：① 在模块目录**外面**用 `go build <绝对路径>` 会报
+> `cannot find main module, but found .git/config`；② 该二进制与 `Makefile` 里
+> `LUCI_PKGARCH:=all` 的「架构无关」声明相矛盾 —— 打包时需按目标架构处理。
 
 > 文件名与 rpcd 对象名均保留 `workbuddy` 前缀，理由见文首「命名说明」。
 

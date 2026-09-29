@@ -18,6 +18,31 @@ FILES="$SRC/files"
 die() { echo "错误: $*" >&2; exit 1; }
 info() { echo "[$PKG] $*"; }
 
+SYSCTL_CONF=/etc/sysctl.d/99-workbuddy-forward.conf
+
+# 应用转发效率内核参数。
+# 优先走内核自带的 sysctl 初始化脚本（ImmortalWrt 会读取 /etc/sysctl.d/*.conf）；
+# 没有该脚本时退化为逐条 sysctl -w，保证在精简固件上也能生效。
+apply_sysctl() {
+	if [ -x /etc/init.d/sysctl ]; then
+		/etc/init.d/sysctl restart >/dev/null 2>&1 || true
+		return 0
+	fi
+	# shellcheck disable=SC2013
+	for kv in $(grep '=' "$SYSCTL_CONF" 2>/dev/null | grep -v '^#'); do
+		sysctl -w "$kv" >/dev/null 2>&1 || true
+	done
+}
+
+# 还原本插件改过的四项（默认值来自出厂实测，见 conf 文件注释）
+restore_sysctl() {
+	sysctl -w net.ipv4.tcp_slow_start_after_idle=1 >/dev/null 2>&1 || true
+	sysctl -w net.ipv4.tcp_fastopen=1 >/dev/null 2>&1 || true
+	sysctl -w net.ipv4.tcp_mtu_probing=0 >/dev/null 2>&1 || true
+	sysctl -w net.ipv4.tcp_max_syn_backlog=128 >/dev/null 2>&1 || true
+}
+
+
 [ -d "$FILES" ] || die "找不到 files/ 目录，请在包根目录执行本脚本"
 
 # ---------- 依赖检查 ----------
@@ -61,6 +86,11 @@ do_remove() {
 	rm -f /usr/share/rpcd/acl.d/luci-app-workbuddy.json
 	rm -rf /www/luci-static/resources/view/workbuddy
 	rm -f /usr/share/ucode/workbuddy.uc
+	rm -f /usr/bin/workbuddy-pool
+
+	info "还原转发效率内核参数..."
+	rm -f "$SYSCTL_CONF"
+	restore_sysctl
 
 	info "保留 /etc/config/workbuddy 与 /etc/workbuddy/token.json（如需彻底清除请手动删除）"
 	info "重启 rpcd 与 uhttpd..."
@@ -86,6 +116,24 @@ do_install() {
 	cp -f "$FILES/usr/share/ucode/workbuddy.uc" /usr/share/ucode/workbuddy.uc || die "复制 workbuddy.uc 失败"
 	chmod 644 /usr/share/ucode/workbuddy.uc
 
+	# 上游连接池（可选组件）。
+	# 缺失或架构不符都只告警、不中断安装：ucode 侧对池是静默降级的，
+	# 没有池服务照样能用，只是每个请求多付一次 TCP+TLS 握手。
+	if [ -f "$FILES/usr/bin/workbuddy-pool" ]; then
+		info "部署上游连接池..."
+		cp -f "$FILES/usr/bin/workbuddy-pool" /usr/bin/workbuddy-pool
+		chmod 755 /usr/bin/workbuddy-pool
+		# 架构不符时内核只会给出 "not found"（退出码 127），在这里先拦下来，
+		# 免得等启动后才发现池一直起不来。
+		POOL_RC=0
+		/usr/bin/workbuddy-pool -version >/dev/null 2>&1 || POOL_RC=$?
+		if [ "$POOL_RC" -eq 127 ]; then
+			info "  警告：workbuddy-pool 无法在本机执行（架构不符？），将回退直连 curl"
+		fi
+	else
+		info "  未找到 workbuddy-pool，跳过（将使用直连 curl）"
+	fi
+
 	info "部署 rpcd 后端..."
 	cp -f "$FILES/usr/share/rpcd/ucode/workbuddy" /usr/share/rpcd/ucode/workbuddy || die "复制 rpcd 脚本失败"
 	chmod 644 /usr/share/rpcd/ucode/workbuddy
@@ -106,6 +154,11 @@ do_install() {
 	cp -f "$FILES/etc/uci-defaults/50-workbuddy" /etc/uci-defaults/50-workbuddy
 	chmod 755 /etc/uci-defaults/50-workbuddy
 
+	info "部署转发效率内核参数..."
+	mkdir -p /etc/sysctl.d
+	cp -f "$FILES/etc/sysctl.d/99-workbuddy-forward.conf" "$SYSCTL_CONF" || die "复制 sysctl 配置失败"
+	apply_sysctl
+
 	info "执行 uci-defaults..."
 	sh /etc/uci-defaults/50-workbuddy || true
 
@@ -125,6 +178,18 @@ do_install() {
 		info "服务已监听 :$PORT"
 		curl -sS -m 5 "http://127.0.0.1:$PORT/health" 2>/dev/null | head -c 200
 		echo ""
+
+		# 连接池是可选件：没起来只提示，不影响判定安装成功
+		USE_POOL=$(uci -q get workbuddy.main.use_pool || echo 1)
+		POOL_PORT=$(uci -q get workbuddy.main.pool_port || echo 8790)
+		if [ "$USE_POOL" = "1" ]; then
+			if netstat -ltn 2>/dev/null | grep -q "127.0.0.1:$POOL_PORT "; then
+				info "连接池已监听 127.0.0.1:$POOL_PORT"
+			else
+				info "提示：连接池未监听 :$POOL_PORT（将以直连方式工作），可查 logread | grep workbuddy"
+			fi
+		fi
+
 		info "安装成功"
 	else
 		info "警告：:$PORT 未监听，请查看日志：logread | grep workbuddy"

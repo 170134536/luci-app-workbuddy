@@ -35,7 +35,7 @@ function logErr(msg) { logMsg('error', msg); }
 // ---------- 常量 ----------
 
 const LOG_TAG = 'workbuddy';
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.2';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -165,64 +165,68 @@ const CODE_LOGIN_ING = 11217;
 
 const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
-// 建一个字符 -> 6bit 值的查找表（只建一次）
-let b64Table = null;
+// 建一个字符 -> 6bit 值的查找表（模块加载时建一次，之后只读）
+let b64Table = {};
+for (let i = 0; i < length(B64_CHARS); i++)
+	b64Table[substr(B64_CHARS, i, 1)] = i;
 
 function b64Index(ch) {
-	if (b64Table === null) {
-		b64Table = {};
-		for (let i = 0; i < length(B64_CHARS); i++)
-			b64Table[substr(B64_CHARS, i, 1)] = i;
-	}
-	if (type(b64Table[ch]) === 'int') return b64Table[ch];
-	return -1;
+	let v = b64Table[ch];
+	return (type(v) === 'int') ? v : -1;
 }
 
 // base64url 解码为字符串。忽略 padding 与非法字符。
 // 只用于解析 JWT 头部与 payload（都是 UTF-8 JSON），够用即可。
+//
+// 性能说明：本机是 ARMv8（BogoMIPS 48）+ 解释执行的 ucode，任何"逐字符
+// 调一次函数"的写法都要付真实代价 —— 原来的实现（逐字符 substr + b64Index()
+// 调用）解码 843 字符的 payload 要 18–21ms。改为「每 4 字符一组、组内直接
+// 查表、结果累积到数组再 join」后降到 11ms。
+// 真正的开销大头不在这里，而在 parseJwt 的记忆化（见下）。
 function b64UrlDecode(s) {
 	if (type(s) !== 'string') return '';
-	let out = '';
-	let buf = 0;
-	let bits = 0;
+	let n = length(s);
+	if (n === 0) return '';
 
-	for (let i = 0; i < length(s); i++) {
-		let ch = substr(s, i, 1);
-		if (ch === '=') break;            // padding 之后不再有数据
-		if (ch === '-') ch = '+';         // base64url 还原
-		if (ch === '_') ch = '/';
-		let v = b64Index(ch);
-		if (v < 0) continue;              // 跳过换行等杂字符
+	let tab = b64Table;
 
-		buf = (buf << 6) | v;
-		bits += 6;
-		if (bits >= 8) {
-			bits -= 8;
-			let byte = (buf >> bits) & 0xff;
-			out += chr(byte);
-		}
+	// 补齐到 4 的倍数：JWT 用无 padding 的 base64url，而按 4 字符分组
+	// 解码需要完整组。补 '=' 而不是 'A'，这样末尾不会多输出字节。
+	let pad = (4 - (n % 4)) % 4;
+	let str = (pad > 0) ? (s + substr('====', 0, pad)) : s;
+	let m = length(str);
+	let acc = [];
+
+	for (let i = 0; i < m; i += 4) {
+		let c0 = substr(str, i, 1), c1 = substr(str, i + 1, 1);
+		let c2 = substr(str, i + 2, 1), c3 = substr(str, i + 3, 1);
+		if (c0 === '-') c0 = '+'; else if (c0 === '_') c0 = '/';
+		if (c1 === '-') c1 = '+'; else if (c1 === '_') c1 = '/';
+		if (c2 === '-') c2 = '+'; else if (c2 === '_') c2 = '/';
+		if (c3 === '-') c3 = '+'; else if (c3 === '_') c3 = '/';
+
+		let v0 = tab[c0], v1 = tab[c1], v2 = tab[c2], v3 = tab[c3];
+		if (type(v0) !== 'int') continue;        // 组首非法：整组丢弃
+		v1 = (type(v1) === 'int') ? v1 : 0;
+		v2 = (type(v2) === 'int') ? v2 : 0;
+		v3 = (type(v3) === 'int') ? v3 : 0;
+
+		let w = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+		push(acc, chr((w >> 16) & 0xff));
+		if (c2 !== '=') push(acc, chr((w >> 8) & 0xff));
+		if (c3 !== '=') push(acc, chr(w & 0xff));
 	}
-	return out;
+	return join('', acc);
 }
 
 // 解析 JWT，返回 { exp, iat, username, sub } 或 null。
 // 完全不验签：这里的用途只是读过期时间与账号名，不做安全判断。
-function parseJwt(token) {
+function parseJwtUncached(token) {
 	if (type(token) !== 'string' || length(token) === 0) return null;
 
-	// 按点号切三段
-	let parts = [];
-	let cur = '';
-	for (let i = 0; i < length(token); i++) {
-		let ch = substr(token, i, 1);
-		if (ch === '.') {
-			push(parts, cur);
-			cur = '';
-		} else {
-			cur += ch;
-		}
-	}
-	push(parts, cur);
+	// 按点号切三段。原先用逐字符循环拼接，1298 字符要 10ms；
+	// split() 是原生实现，几乎免费。
+	let parts = split(token, '.');
 	if (length(parts) < 2) return null;
 
 	let payload;
@@ -239,6 +243,40 @@ function parseJwt(token) {
 	out.username = '' + (payload.preferred_username || payload.email || '');
 	out.sub = '' + (payload.sub || '');
 	return out;
+}
+
+// ---- parseJwt 记忆化：本插件最大的一处 CPU 开销 ----
+//
+// 实测（本机 ARMv8 / BogoMIPS 48，ucode 解释执行）：
+//   完整解析一个 1298 字符的 accessToken = 31ms
+//     ├─ 逐字符切三段                      10ms
+//     └─ base64url 解码 843 字符 payload    21ms
+// 而 loadPool() 每处理一个凭据要调它两次（credStatus 一次、取 sub 一次），
+// 于是**单次 /health 就有 95ms 纯 CPU 花在这里**；转发链路上 loadPool /
+// usablePool 被多处调用，开销按调用次数翻倍 —— 这才是"转发慢"的真正原因，
+// 与网络、与 curl 参数都无关。
+//
+// token 是不可变的：同一条 token 的 claims 永远相同，换了 token 就是另一个
+// 键。所以按 token 记忆化即可 —— 首次 11ms，之后约 0.00001ms。
+// 表上限 16 条，避免异常输入把内存撑大；失败结果也缓存（避免反复解析坏 token）。
+let jwtCache = {};
+let jwtCacheN = 0;
+
+function parseJwt(token) {
+	if (type(token) !== 'string' || length(token) === 0) return null;
+
+	let hit = jwtCache[token];
+	// 用 type() 判定而不是 `!== undefined`：ucode 里普通对象的键查询可能
+	// 命中原型链上的同名属性（返回函数），那样会被误当成解析结果。
+	if (type(hit) === 'object' && hit !== null) return hit;
+	if (hit === false) return null;
+
+	let r = parseJwtUncached(token);
+	if (jwtCacheN < 16) {
+		jwtCache[token] = r ? r : false;
+		jwtCacheN++;
+	}
+	return r;
 }
 
 // 凭据状态：'ok' | 'expiring'（7 天内过期）| 'expired' | 'unknown'
@@ -262,6 +300,187 @@ const WB_PREFIX = 'workbuddy';
 const COOL_MS = 60;
 // 单个请求最多尝试的凭据数
 const MAX_TRY = 3;
+
+// 账号被风控时的凭据冷却时长（秒）。
+//
+// 上游对「内容未通过安全审核」（code 11140）这类拦截是**账号级**的：
+// 实测同一账号对 "hi" / "1+1=?" / 中文闲聊一律返回 11140，
+// 而 system prompt 缺失时给的是另一个码（11-128），说明请求本身没写错，
+// 是账号被风控了。这种状态下对同一账号重试毫无意义，反而加重风控。
+// 因此给足 30 分钟，把多凭据池的机会让给其他账号 —— 这才是"智能换 Key"
+// 该有的行为：能区分"账号坏了"和"网络抖了一下"。
+const COOL_RISK = 1800;
+
+// ---------- 转发效率参数 ----------
+//
+// 数值全部来自 2026-09-26 在 192.168.69.1 上的实测（见 lessons/workbuddy-forward-efficiency.md）
+//
+// 1) 上游 Key 的冷却。
+//
+// **设计原则（2026-09-28 按用户要求改）：冷却只影响"尝试顺序"，不影响"能不能试"。**
+// 用户明确要求「不通的自动换下一个」—— 所以每把 Key 始终保持可尝试，
+// 冷却只把它排到队尾，绝不把它锁死。
+// 配套地，handleChat 里"全部冷却中就直接回 429"的提前返回已删除 ——
+// 那句 `429 retry_after:577` 正是"一次请求错误让整个上游停摆 10 分钟"的来源。
+//
+// 历史上这里给到 20s→300s 指数退避、鉴权档 600s，理由是"避免同一把 Key 被
+// 立刻再次选中而连撞限流、造成 12~60s 挂起"。但那个挂起的真正原因是
+// **单次请求的重试次数没有上界**；现在 tryNextUpKey / spawnUpstreamDirect
+// 用 `conn.upTry < length(conn.upKeys)` 把尝试次数钉死在 Key 总数以内
+// （最多 4 次），所以短冷却不再有挂起风险。
+const UP_RATE_COOL = 5;         // 限流类：起始 5s，连续失败翻倍
+const UP_RATE_COOL_MAX = 20;    // 限流类冷却上限 20s
+const UP_AUTH_COOL = 60;        // 鉴权类：Key 疑似失效，最多避开 60s
+const UP_SOFT_COOL = 2;         // 空响应/网络抖动：短暂避让
+//
+// 2) 上游静默看门狗。连接建立后连续 N 秒收不到任何字节即判定链路已死，
+//    主动断开并按既有逻辑换 Key —— 客户端不再干等到自己超时。
+//
+//    v1.8.2 起按「首字节前 / 首字节后」分两档，因为这两段的性质完全不同：
+//
+//    首字节前：一个字节都没回，说明请求**根本没被上游受理** —— 限流挂起、
+//    服务端排队、链路黑洞都属此类。此时干等毫无收益（那条连接不会自己好起来），
+//    越早换 Key 越早拿到能用的 Key。实测池化后正常 TTFB p50 0.19~0.31s、
+//    p99 2.0~2.5s，给 12s 已是 5 倍余量。
+//
+//    首字节后：流已经建立，模型在流中途"思考"（reasoning）时确实会长时间不吐字，
+//    这是正常现象，误杀会让客户端白等一场。故放宽到 60s。
+//
+//    实测依据（v1.8.1，60 请求 × 3 档并发）：13 个慢请求（≥5s）**全部成功**，
+//    而客户端 p90 高达 30s —— 32 次看门狗中止全部发生在 25~29s（即首字节档），
+//    慢的根因正是首字节前干等到 25s 才换 Key。把首字节档压到 12s，
+//    是把这条尾巴砍掉的关键。
+//
+//    WorkBuddy 是 agent 上游，可能在静默工作，独立保持 75s。
+//    任一档配 0 表示**关闭该档看门狗**（诊断链路时用）。
+const UP_FIRST_BYTE_SEC_DEFAULT = 12;  // 首字节等待上限（未受理即换 Key）
+const UP_IDLE_SEC_DEFAULT = 60;        // 首字节之后的流中静默上限
+const WB_IDLE_SEC_DEFAULT = 75;        // WorkBuddy agent 路径静默上限
+const UP_IDLE_TICK_MS = 5000;          // 看门狗扫描间隔
+//
+// 3) 自定义上游模型列表缓存。/v1/models 原来每次都逐个上游外呼，实测单上游
+//    一次 1.66s；缓存后除首次外全走内存。
+const UP_MODEL_TTL = 300;
+
+//
+// 4) 转发并发闸门 + FIFO 排队（v1.8.0）。
+//
+//    背景：v1.7.x 对并发**完全不设限**。N 个客户端同时进来就是 N 个 curl 同时
+//    打上游，而上游限的是 tpm/rpm 而非连接数 —— 并发越高越容易整批撞 429，
+//    表现就是"人一多，所有人一起失败"。排队把突发削成上游吃得下的形状，
+//    代价是队尾请求的首字节变晚。
+//
+//    上限按**每个上游**分别设，不设全局：不同上游是不同账号、不同额度，
+//    互相排队没有意义；WorkBuddy 是 agent 上游、单请求耗时长，额度给得更大。
+//    0 = 不限制（退回 v1.7.x 行为，出问题可一键回退）。
+const UP_MAX_INFLIGHT_DEFAULT = 4;   // 每个自定义上游默认在途上限
+const WB_MAX_INFLIGHT_DEFAULT = 6;   // WorkBuddy 通道默认在途上限
+const UP_QUEUE_MAX_DEFAULT = 32;     // 队列上限，超出立即 429（不无限攒请求）
+const UP_QUEUE_TIMEOUT_DEFAULT = 20; // 排队等待上限（秒）
+const UP_QUEUE_TICK_MS = 1000;       // 排队超时扫描间隔
+
+//
+// 5) 上游连接复用（常驻 workbuddy-pool 进程，v1.8.0）。
+//
+//    实测每请求固定开销：curl fork ~20ms + DNS ~9ms + 上游 TCP 49~87ms +
+//    TLS 80~100ms。curl 每次调用都是新进程，连接池在 curl 里活不过一次请求，
+//    这部分开销**在 ucode+curl 内无法消除**。做法是另起一个常驻进程持有到上游
+//    的 TLS 连接池，curl 只连本机回环（源码与协议见仓库 pool/ 目录）。
+//
+//    回退是被动的：某次池化尝试"一个字节都没收到且尚未推流"即判定池不可用，
+//    置一段冷却，本条请求立刻改用直连重发（且不消耗 Key 冷却）。冷却到期后
+//    下次池化尝试成功即自动恢复 —— 不引入额外定时探活，不占单线程事件循环。
+const POOL_FAIL_COOLDOWN = 30;       // 判定池挂掉后强制直连的时长（秒）
+const POOL_CONNECT_TIMEOUT = 3;      // 走回环时连接超时要短，才能快速暴露池挂了
+
+//
+// 6) 上游限流刹车（v1.8.1）。
+//
+//    背景（soak 实测数据，60 个客户端请求）：池统计到 **138 次上游请求 = 2.25× 放大**，
+//    其中 24 个请求以 429 收场 —— 每个都试满了 4 把 Key，即 96 次上游调用
+//    **注定全部失败**，占上游总流量的 70%。
+//
+//    成因：撞限流后 tryNextUpKey 会无条件换下一把 Key 重试（这是用户明确要求的行为，
+//    不能删）。但当 4 把 Key 都已因限流进入冷却时，这 4 次尝试**没有一次可能成功**
+//    —— "冷却"的定义就是"这把现在不行"—— 流量却照打。于是上游额度被自己烧得更狠、
+//    Key 恢复得更慢，形成正反馈。实测在**零并发**下也能看到单请求连烧 2 把 Key：
+//    `key sk-3lw…TOC5 cooling 20s (限流)` → `attempt 2/4` → 1s 后该 Key 也 cooling。
+//
+//    做法：上游级熔断器。在滑动窗口内累计"被上游限流拒绝"的次数，达到阈值就把这条
+//    上游**短时闭闸**：闭闸期间的尝试不再打上游，直接回 429 + 真实 Retry-After。
+//    任一次成功立刻合闸自愈（不引入额外探活，不占事件循环）。
+//
+//    与 v1.7.1 被删除的"全部 Key 冷却就立刻 429"短路的区别（删除理由见
+//    markUpKeyFail 上方注释：它回的 retry_after 高达 577s，且违背"不通的自动换下一个"）：
+//      1) 判据是**观测到的上游拒绝**，不是我们自己的冷却模型 —— 冷却只是估计，
+//         上游是否已恢复只有上游知道；
+//      2) 要在窗口内**连续多次**被拒才闭闸（默认 20s 内 4 次），偶发一次不闭；
+//      3) Retry-After 有上限（默认 15s），不再是几百秒的荒谬值；
+//      4) 闭闸尾巴上到达的请求会**先等一次**（剩余 ≤ RATE_BRAKE_WAIT_MS），
+//         等完直接放行 —— 把本会失败的请求尽量转成成功，而不是一律拒绝。
+//    rl_brake_hits = 0 关闭该功能（退回 v1.8.0 行为）。
+const RATE_BRAKE_HITS_DEFAULT = 4;    // 窗口内累计多少次限流拒绝后闭闸
+const RATE_BRAKE_WINDOW_DEFAULT = 20; // 计数滑动窗口（秒）
+const RATE_BRAKE_SEC_DEFAULT = 8;     // 闭闸时长（秒）
+const RATE_BRAKE_MAX_RA_DEFAULT = 15; // 回给客户端的 Retry-After 上限（秒）
+const RATE_BRAKE_WAIT_MS = 2000;      // 闭闸剩余 ≤ 此值时先等一次再发（毫秒）
+
+// 数值型 UCI 选项的安全解析。三个必须显式处理的坑：
+//
+//   1) **ucode 没有 undefined 这个标识符。** 写 `v === undefined` 不会在
+//      `ucode -c` 语法检查阶段报错，只在运行时抛
+//      "Reference error: access to undeclared variable undefined" ——
+//      本次 v1.8.0 首次部署就因此让服务起不来（loadConfig 第一行就炸，
+//      端口都没监听）。缺失值在 ucode 里就是 null，布尔与空串另外挡。
+//   2) ucode 里 +'' 和 +null **都等于 0**。而这些参数中 0 是"不限制"的意思，
+//      所以留空/缺失的选项会被静默当成"用户主动关掉了限制"，而不是"用默认值"。
+//      在设备上实测出来的：numOr('',4,0,64) 与 numOr(null,4,0,64) 都返回 0。
+//   3) 不能用 `+cfg.x || def` —— 那样合法的 '0'（本意"不限制"）会被当假值顶掉。
+//
+// 越界分方向处理：写小了（含负数）多半是笔误，退回默认值；写大了是"想要更多"，
+// 夹到上限比直接无视更贴近意图。
+function numOr(v, def, min, max) {
+	if (v === null || type(v) === 'bool' || v === '') return def;
+	let n = +v;
+	// NaN 与任何数比较都是 false，据此识别非数字输入
+	if (!(n >= min || n <= max)) return def;
+	if (n < min) return def;
+	if (n > max) return max;
+	return n;
+}
+
+// 在途连接表。
+// 必须声明在 closeConn() 之前 —— ucode 不提升声明，函数按定义时的词法作用域
+// 解析标识符，声明在后会抛 "access to undeclared variable"（本文件多处已踩过）。
+let connections = [];
+
+// 看门狗定时器句柄。必须持有引用 —— ucode 的 uloop 句柄一旦失去引用就可能被
+// 回收，定时器随之失效（本文件 login.timer 同样持有）。这里的自重置写法
+// 依赖它每次都能再排下一轮。
+let idleTimer = null;
+
+// 自定义上游模型列表缓存：cacheKey -> { at, list }
+let upModelCache = {};
+
+// ---------- 并发闸门与排队状态（v1.8.0） ----------
+//
+// upInflight: 闸门键 -> 当前在途请求数。键为 'wb'（WorkBuddy 通道）
+//             或 'up:<上游id>'（每个自定义上游各自计数）。
+let upInflight = {};
+
+// chatQueue: FIFO 等待队列（元素是连接对象）。全局只有一个数组，
+// 但放行时按各自闸门键的容量判断 —— 某个上游满了不会连坐另一个上游。
+let chatQueue = [];
+
+// 重入保护：pumpQueue 里发起的 spawn 可能同步失败并立刻 closeConn，
+// 从而再进一次 releaseGate → pumpQueue。没有这个标志会把 chatQueue 改坏。
+let pumpingQueue = false;
+let queuePumpAgain = false;
+let queueTimer = null;
+
+// 连接池可用性：0 表示上次观测正常；非 0 表示在此之前一律走直连。
+// 由一次"零字节且未推流"的池化尝试置位（见 spawnUpstreamDirect）。
+let poolFailUntil = 0;
 
 // ---------- 管理页会话 ----------
 //
@@ -318,6 +537,17 @@ function loadConfig() {
 		wan_access: '0',
 		wan_port: '',
 		debug: '0',
+		// ---------- v1.8.0 ----------
+		up_max_inflight: '4',    // 每个自定义上游在途上限，0=不限
+		wb_max_inflight: '6',    // WorkBuddy 通道在途上限，0=不限
+		queue_max: '32',         // 排队上限，0=不排队（满员直接 429）
+		queue_timeout: '20',     // 排队等待上限（秒）
+		use_pool: '1',           // 是否走本机连接池（pool/ 目录的常驻进程）
+		pool_port: '8790',       // 连接池监听端口（仅回环）
+		// ---------- v1.8.2 ----------
+		up_idle_sec: '60',       // 首字节之后的流中静默上限，0=关闭该档
+		up_first_byte_sec: '12', // 首字节等待上限，0=关闭该档
+		wb_idle_sec: '75',       // WorkBuddy 通道静默上限，0=关闭该档
 	};
 
 	let ctx = uci.cursor();
@@ -334,6 +564,13 @@ function loadConfig() {
 	cfg.enabled = (('' + cfg.enabled) !== '0');
 	cfg.onlyFree = (('' + cfg.only_free_models) !== '0');
 	cfg.autoVersion = (('' + cfg.auto_client_version) !== '0');
+	// 【v1.7.11 起 up_failover_429 已失效，配置项保留但不再读取】
+	//
+	// 它原本控制"限流时是否换下一把 Key"。但实测两条分支**本来都会换 Key**
+	// （关闭时落到 spawnUpstreamDirect，同样推进到下一个槽位），
+	// 唯一差别只是"没 Key 可换时回哪种错误" —— 属于准死配置。
+	// 现在"不通就换下一个"是无条件行为，故不再需要这个开关。
+	// UCI 里残留的 up_failover_429 值不会报错，只是被忽略。
 	// 公网访问默认关闭。只有显式写 '1' 才算开，避免历史配置缺项被误判成开。
 	cfg.wanAccess = (('' + cfg.wan_access) === '1');
 	// 外部端口（公网侧监听端口）。合法 1–65535 才采用，否则回退到内部端口。
@@ -343,6 +580,43 @@ function loadConfig() {
 		cfg.wanPort = (wp >= 1 && wp <= 65535) ? wp : cfg.port;
 	}
 	cfg.adminPass = '' + (cfg.admin_password || '');
+
+	// ---------- v1.8.0：并发闸门 / 排队 / 连接池 ----------
+	cfg.upMaxInflight = numOr(cfg.up_max_inflight, UP_MAX_INFLIGHT_DEFAULT, 0, 64);
+	cfg.wbMaxInflight = numOr(cfg.wb_max_inflight, WB_MAX_INFLIGHT_DEFAULT, 0, 64);
+	cfg.queueMax = numOr(cfg.queue_max, UP_QUEUE_MAX_DEFAULT, 0, 512);
+	cfg.queueTimeout = numOr(cfg.queue_timeout, UP_QUEUE_TIMEOUT_DEFAULT, 1, 300);
+
+	cfg.usePool = (('' + cfg.use_pool) === '1');
+	{
+		let pp = +cfg.pool_port;
+		if (!(pp >= 1 && pp <= 65535)) {
+			// 端口非法就直接关池：否则 curl 会去连一个不存在的端口，
+			// 每个请求先白等一次连接超时再回退直连，比不开池还慢。
+			cfg.usePool = false;
+			pp = 8790;
+		}
+		cfg.poolPort = pp;
+	}
+	cfg.poolBase = 'http://127.0.0.1:' + cfg.poolPort;
+
+	// ---------- v1.8.1：上游限流刹车 ----------
+	// rl_brake_hits = 0 表示关闭刹车（退回 v1.8.0：撞限流就一路换 Key 试到底）。
+	cfg.brakeHits = numOr(cfg.rl_brake_hits, RATE_BRAKE_HITS_DEFAULT, 0, 1000);
+	cfg.brakeWindow = numOr(cfg.rl_brake_window, RATE_BRAKE_WINDOW_DEFAULT, 1, 600);
+	cfg.brakeSec = numOr(cfg.rl_brake_sec, RATE_BRAKE_SEC_DEFAULT, 0, 300);
+	cfg.brakeMaxRa = numOr(cfg.rl_brake_max_ra, RATE_BRAKE_MAX_RA_DEFAULT, 1, 3600);
+
+	// ---------- v1.8.2：静默看门狗分档 ----------
+	// 0 = 关闭该档（诊断链路时用；生产不建议，会让客户端干等）。
+	cfg.upFirstByteSec = numOr(cfg.up_first_byte_sec, UP_FIRST_BYTE_SEC_DEFAULT, 0, 3600);
+	cfg.upIdleSec = numOr(cfg.up_idle_sec, UP_IDLE_SEC_DEFAULT, 0, 3600);
+	cfg.wbIdleSec = numOr(cfg.wb_idle_sec, WB_IDLE_SEC_DEFAULT, 0, 3600);
+	// 上限必须大于下限，否则首字节还没等到就被流中档杀掉。配错了就回默认。
+	if (cfg.upFirstByteSec > 0 && cfg.upIdleSec > 0 && cfg.upIdleSec < cfg.upFirstByteSec) {
+		cfg.upFirstByteSec = UP_FIRST_BYTE_SEC_DEFAULT;
+		cfg.upIdleSec = UP_IDLE_SEC_DEFAULT;
+	}
 
 	return cfg;
 }
@@ -547,6 +821,33 @@ function togglePoolCred(id, enabled) {
 	return savePoolRaw(list);
 }
 
+// 删除「网页登录凭据」—— 即 token.json 里那个账号本体。
+//
+// 这是**账号级**操作，与 deletePoolCred 有本质区别：
+//   deletePoolCred   只是从 pool.json 摘掉一个条目，账号凭据仍在我们手里
+//                    （同一个 token 随时能再粘回来）；
+//   deleteLegacyCred 删掉的是本机保存的账号凭据本体（accessToken 与
+//                    refreshToken），删完本机不再持有该账号。
+//
+// 因此这里做**真删除**（unlink 文件），而不是写空文件、也不是加个
+// disabled 标记：用户点这个按钮的动机通常就是"把这个账号从本机清掉"
+// （账号被上游风控、要换号、或借出设备），留任何残片都不符合预期。
+// 需要恢复时用管理页的「网页登录」重新登录即可，不需要本地留副本。
+//
+// 顺带清掉它在内存里的冷却状态，否则管理页会显示一个已经不存在的账号
+// "冷却中"，让人以为还有残留。
+function deleteLegacyCred(cfg) {
+	let p = tokenPath(cfg);
+	if (!access(p, 'f'))
+		return { ok: false, error: '没有可删除的网页登录凭据' };
+
+	if (!unlink(p))
+		return { ok: false, error: '删除失败：' + error() };
+
+	delete credState['default'];
+	return { ok: true };
+}
+
 function loadPool(cfg) {
 	let pool = [];
 	let seen = {};
@@ -596,6 +897,30 @@ function loadPool(cfg) {
 	return pool;
 }
 
+// 判定失败原因是否属于"账号被风控"。
+//
+// 上游封控账号时不会说"你被封了"，而是对所有请求统一返回内容审核类错误：
+//   {"code":11140,"msg":"request illegal",
+//    "displayMsg":{"zh":"内容未通过安全审核，请调整后重试。"}}
+// 或安全策略拦截（code 11-128）。
+//
+// 与"内容真的违规"的区别：真违规只针对某条内容，换个问题就能过；
+// 账号级风控则**任何**内容都过不去（实测 "hi"、"1+1=?" 全被拒）。
+//
+// 位置说明：必须定义在 usablePool / markCredFail **之前**。
+// ucode 的函数声明不像 JS 那样提升到作用域顶部，只对已解析的定义生效，
+// 因此"先调用后定义"会拿到未定义值而不是函数。
+//
+// 匹配策略按错误文本而非 code 字段：上游 code 在不同网关上类型不一致
+// （字符串/整数都出现过，11140 与 "11-128" 前者是数字后者带横杠）。
+function isRiskControlReason(reason) {
+	let low = lc('' + (reason || ''));
+	return (index(low, '11140') >= 0) || (index(low, '11-128') >= 0) ||
+		(index(low, '安全审核') >= 0) || (index(low, '安全策略') >= 0) ||
+		(index(low, 'safety review') >= 0) || (index(low, 'security policy') >= 0) ||
+		(index(low, 'did not pass') >= 0) || (index(low, 'request illegal') >= 0);
+}
+
 // 仅取当前可用的凭据（跳过冷却中的），按轮询顺序返回
 function usablePool(cfg) {
 	let pool = loadPool(cfg);
@@ -607,15 +932,23 @@ function usablePool(cfg) {
 		push(ok, c);
 	}
 
-	// 全部冷却中：退回冷却最早结束的那个，避免完全不可用
+	// 全部冷却中：退回冷却最早结束的那个，避免完全不可用。
+	//
+	// 但"被风控"的凭据不在此列：它冷却 30 分钟是有意义的，退回它只会
+	// 让每个请求都去撞一次已封账号 —— 既拿不到结果（每次都要等上游拒绝），
+	// 又拖慢客户端拿到"账号已被风控"这条可行动信息的时间。
+	// 结果是 usablePool 返回空数组，由 handleChat 给出准确报错。
 	if (length(ok) === 0 && length(pool) > 0) {
-		let best = pool[0];
+		let best = null;
 		for (let c in pool) {
+			let st = credState[c.id];
+			if (st && isRiskControlReason(st.lastErr)) continue;
+			if (best === null) { best = c; continue; }
 			let a = credState[c.id] ? credState[c.id].coolUntil : 0;
 			let b = credState[best.id] ? credState[best.id].coolUntil : 0;
 			if (a < b) best = c;
 		}
-		push(ok, best);
+		if (best !== null) push(ok, best);
 	}
 
 	// 从游标处轮转，实现轮流使用
@@ -637,9 +970,16 @@ function markCredFail(cfg, id, reason) {
 	let now = time();
 	let st = credState[id] || { coolUntil: 0, fails: 0, lastErr: '' };
 	st.fails = (st.fails || 0) + 1;
-	// 连续失败则指数退避，上限 10 分钟
-	let cool = COOL_MS;
-	for (let i = 1; i < st.fails && cool < 600; i++) cool *= 2;
+	// 连续失败则指数退避，上限 10 分钟。
+	// 但"账号被风控"不是网络抖动，重试无意义 —— 直接给足 COOL_RISK
+	// 并跳过指数退避，让请求尽快落到池里其他账号上。
+	let cool;
+	if (isRiskControlReason(reason)) {
+		cool = COOL_RISK;
+	} else {
+		cool = COOL_MS;
+		for (let i = 1; i < st.fails && cool < 600; i++) cool *= 2;
+	}
 	st.coolUntil = now + cool;
 	st.lastErr = '' + reason;
 	credState[id] = st;
@@ -651,6 +991,32 @@ function markCredOk(id) {
 	credState[id].fails = 0;
 	credState[id].coolUntil = 0;
 	credState[id].lastErr = '';
+}
+
+// 凭据健康摘要（供 /health 使用）。
+//
+// 为什么需要它：出问题时 /health 只说 credentials=1，看不出这个凭据到底能不能用。
+// 上游风控时客户端拿到的是 "所有可用凭据均失败：上游错误码：11140"，
+// 而 11140 是什么只能去翻上游响应 —— 这一层把"哪个凭据、冷却多久、上次为什么失败"
+// 直接透出，排障不用再猜。
+//
+// 只暴露 id 的末 4 位与错误文本，不含 token 本身：/health 是不鉴权的，
+// 不能成为凭据泄露面。
+function credSummary(pool) {
+	let now = time();
+	let out = [];
+	for (let c in pool) {
+		let st = credState[c.id];
+		let id = '' + c.id;
+		let e = {
+			id: length(id) > 4 ? substr(id, length(id) - 4, 4) : id,
+			cooling: (st && st.coolUntil > now) ? (st.coolUntil - now) : 0,
+			fails: st ? (st.fails || 0) : 0,
+		};
+		if (st && st.lastErr) e.lastErr = st.lastErr;
+		push(out, e);
+	}
+	return out;
 }
 
 // 取一个当前可用的凭据 token 字符串（供模型列表等非重试场景使用）
@@ -826,6 +1192,149 @@ function maskKey(k) {
 	return substr(s, 0, 6) + '…' + substr(s, length(s) - 4, 4);
 }
 
+// ---------- 指标采集（v1.8.0） ----------
+//
+// 用直方图而不是"存样本再排序"：ucode 的 sort() 对数字按字符串比较
+// （'1000' < '9'），分位数会直接算错；归到固定桶里既绕开这个坑，
+// 也把内存钉在常数级 —— 长跑不涨，这是转发服务最需要的性质。
+const METRIC_BUCKETS = [
+	5, 10, 20, 30, 50, 75, 100, 150, 200, 300,
+	500, 750, 1000, 1500, 2000, 3000, 5000, 10000, 30000,
+];
+
+function histNew() {
+	let h = [];
+	for (let i = 0; i <= length(METRIC_BUCKETS); i++) push(h, 0);
+	return h;
+}
+
+function histAdd(h, v) {
+	if (!h || !(v >= 0)) return;
+	let i = 0;
+	while (i < length(METRIC_BUCKETS) && v > METRIC_BUCKETS[i]) i++;
+	h[i] = h[i] + 1;
+}
+
+function histCount(h) {
+	if (!h) return 0;
+	let t = 0;
+	for (let i = 0; i < length(h); i++) t += h[i];
+	return t;
+}
+
+// p 分位所在的桶上界（近似值，思路同 Prometheus histogram_quantile）。
+// 返回 -1 表示落在最后一个溢出桶，即超过 30000ms。
+function histPct(h, p) {
+	if (!h) return 0;
+	let total = 0;
+	for (let i = 0; i < length(h); i++) total += h[i];
+	if (total === 0) return 0;
+	// 整数**上**取整。
+	// ucode 的 / 是整除：直接写 (total*p)/100 会把 1.98 截成 1，
+	// 小样本下 p99 于是落在"第 9 小的样本"上，把慢请求藏起来。
+	// 分位数宁可高报一点，也不能低报 —— 低报会掩盖正要排查的问题。
+	let want = (total * p + 99) / 100;
+	let acc = 0;
+	for (let i = 0; i < length(h); i++) {
+		acc += h[i];
+		if (acc >= want) return (i < length(METRIC_BUCKETS)) ? METRIC_BUCKETS[i] : -1;
+	}
+	return -1;
+}
+
+// 一次取齐 p50/p90/p99 与样本数。
+// 必须定义在 histPct 之后：ucode 不提升函数，反过来写会在首次调用时抛
+// "access to undeclared variable"。
+function metricStat(h) {
+	return {
+		n: histCount(h),
+		p50: histPct(h, 50),
+		p90: histPct(h, 90),
+		p99: histPct(h, 99),
+	};
+}
+
+// 毫秒时间戳。time() 只有整秒精度，量 TTFB 必须用 clock()（返回 [秒, 纳秒]）。
+// 不用 int()：ucode 里 % 的结果本就是整数，先减掉再除即为整数毫秒。
+function nowMs() {
+	let c = clock();
+	let ns = c[1] % 1000000;
+	return c[0] * 1000 + (c[1] - ns) / 1000000;
+}
+
+function initMetrics() {
+	return {
+		since: time(),
+		chatTotal: 0,       // 进入转发链的聊天请求总数
+		chatOk: 0,          // 以 2xx 收尾
+		chatFail: 0,        // 以 5xx 或 429 收尾
+		chatClientErr: 0,   // 以 4xx（非 429）收尾 —— 客户端问题，不算上游故障
+		rateLimited429: 0,  // 以 429 收尾（上游限流 + 本机排队超时/拒绝）
+		queued: 0,          // 曾经进过排队
+		queueTimeout: 0,    // 排队等到超时
+		queueRejected: 0,   // 队列已满被直接拒绝
+		// 直连与池化分开统计 —— 否则"池到底有没有用"永远只能靠感觉
+		mode: {
+			direct: { req: 0, ttfb: histNew(), total: histNew() },
+			pool: { req: 0, ttfb: histNew(), total: histNew() },
+		},
+		up: {},             // upstreamId -> { ok, fail, rateLimited, authFail }
+		key: {},            // upstreamId|maskedKey -> { ok, fail, rateLimited, authFail, lastErr }
+		pool: { used: 0, fallback: 0 },
+		// v1.8.1 限流刹车：被刹车拦下的重试次数 / 其中"等一次再放行"的次数。
+		// 两者之比就是刹车的有效性 —— 全是 rejected 说明上游确实长时间饱和，
+		// 全是 waited 说明闭闸时长设得偏长（每次都能等到）。
+		brakeRejected: 0,
+		brakeWaited: 0,
+	};
+}
+
+let metrics = initMetrics();
+
+function metricUp(upId) {
+	if (!metrics.up[upId])
+		metrics.up[upId] = { ok: 0, fail: 0, rateLimited: 0, authFail: 0 };
+	return metrics.up[upId];
+}
+
+function metricKey(upId, key) {
+	let id = upId + '|' + maskKey(key);
+	if (!metrics.key[id])
+		metrics.key[id] = { ok: 0, fail: 0, rateLimited: 0, authFail: 0, lastErr: '' };
+	return metrics.key[id];
+}
+
+// 记一次上游 Key 失败。kind 由调用方判定后传入（'' | 'rate' | 'auth'）——
+// 判定函数 isRateLimitReason/isAuthReason 定义在 1075+，本函数在 1025，
+// ucode 不提升且按词法解析，在这里直接调用会抛 undeclared variable。
+function metricFail(upId, key, kind, reason) {
+	let u = metricUp(upId);
+	let k = metricKey(upId, key);
+	u.fail++;
+	k.fail++;
+	if (kind === 'rate') { u.rateLimited++; k.rateLimited++; }
+	else if (kind === 'auth') { u.authFail++; k.authFail++; }
+	if (reason) k.lastErr = '' + reason;
+}
+
+function metricMode(conn) {
+	return metrics.mode[conn.usedPool ? 'pool' : 'direct'];
+}
+
+// 每条完成的连接记一次总时长与结局。
+// 挂在 closeConn 上，是因为它是唯一的收尾咽喉：正常结束/超时/换 Key 用尽/
+// 客户端中途断开，四条分支最后都走到这里，不会漏记也不会重复记。
+function recordConnMetrics(conn) {
+	if (!conn.reqAt) return;   // 不是聊天请求（/health、/models、管理页等）
+	metrics.chatTotal++;
+	let st = conn.httpStatus || 0;
+	if (st >= 200 && st < 300) metrics.chatOk++;
+	else if (st === 429) { metrics.rateLimited429++; metrics.chatFail++; }
+	else if (st >= 400 && st < 500) metrics.chatClientErr++;
+	else metrics.chatFail++;
+	histAdd(metricMode(conn).total, nowMs() - conn.reqAt);
+}
+
 // 读取上游配置。返回数组，每条形如：
 //   { id, name, prefix, baseUrl, keys: [...], enabled, createdAt }
 function loadUpstreams() {
@@ -869,12 +1378,199 @@ function loadUpstreams() {
 
 // 上游健康状态：仅存内存，重启即清（冷却本来就不该跨重启持久化）
 let upState = {};
+// v1.8.1 上游级限流刹车状态：upId -> { hits, winStart, openUntil, trip, waited, rejected }
+let upBrake = {};
+
+// 【提前声明，勿删】v1.8.1：cfg 原本只在「连接处理」区 `let cfg = loadConfig();`（约 2842 行），
+// 但 brakeNoteRateLimit() / brakeLeft() 定义在 1471 / 1460 行、需要读 cfg.brakeHits 等。
+// ucode **不提升声明**：函数按定义时的词法作用域解析标识符，声明在函数之后就抛
+//   Reference error: access to undeclared variable cfg
+// 而且只在**真正调用到那一行**时才炸 —— `ucode -c` 语法检查与单元测试都拦不住。
+// v1.8.1 首次上线就是这么把服务打成崩溃-重启循环的：平时看着正常，一撞上游限流就死，
+// procd 拉起来、下一个限流请求再死一次（日志里能看到 pid 连续变化）。
+// 因此按本文件既有做法（connections 同样被提前到头部）把**声明**挪到这里，
+// 真正的赋值仍留在 2842 行 —— 那行才是"读盘"发生的时刻，顺序不能动。
+let cfg = {};
+
+// 判定失败原因是否属于"上游限流"（tpm/rpm 配额、429、too many requests）。
+//
+// 这个判定两处共用同一份逻辑，不能各写一份：
+//   1) markUpKeyFail()  —— 决定冷却时长（限流走指数退避，避免 2 秒后又去撞一次）
+//   2) tryNextUpKey()   —— 限流**不换 Key**，直接把结果返回客户端
+//      （用户明确要求：Key 只做轮播，不自动切换到下一把）
+function isRateLimitReason(reason) {
+	let low = lc('' + (reason || ''));
+	return (index(low, 'tpm') >= 0) || (index(low, 'rpm') >= 0) ||
+		(index(low, 'rate limit') >= 0) || (index(low, 'too many') >= 0) ||
+		(index(low, '429') >= 0) || (index(low, '限流') >= 0);
+}
+
+// 判定是否"这把 Key 本身不可用"（鉴权失败）—— 这类冷却时间给最长。
+//
+// ⚠️ 这里**绝对不能**用裸 `'invalid'` 做子串匹配。实测教训（2026-09-28）：
+// 上游对**请求体**有问题时会回 `inference request is invalid`，
+// 而裸 'invalid' 会把它判成鉴权失败 → 4 把 Key 各冷却 600s →
+// 客户端收到 `429 retry_after:577`，一次请求错误让整个上游停摆 10 分钟。
+// 判据必须绑到"鉴权"这个词本身，或明确的鉴权报文措辞。
+function isAuthReason(reason) {
+	let low = lc('' + (reason || ''));
+	return (index(low, 'unauthorized') >= 0) ||
+		(index(low, 'authentication') >= 0) ||
+		(index(low, 'invalid api key') >= 0) ||
+		(index(low, 'invalid apikey') >= 0) ||
+		(index(low, 'invalid access token') >= 0) ||
+		(index(low, 'invalid token') >= 0) ||
+		(index(low, 'invalid key') >= 0) ||
+		(index(low, 'invalid authorization') >= 0) ||
+		(index(low, 'api key') >= 0) ||
+		(index(low, '401') >= 0) || (index(low, '403') >= 0);
+}
+
+// 判定失败原因是否属于"上游不接受这个模型名"（模型不存在 / 不在套餐内）。
+//
+// 这类是**客户端错误**，且对同一个上游的**所有 Key 结果完全相同**，所以：
+//   1) 不该给 Key 记冷却 —— Key 本身是好的，冤枉它只会让好请求也被拖住；
+//   2) 不该换下一把 Key 重试 —— 必然同样失败，白白多打 3 次上游；
+//   3) 不该报"所有 Key 均失败" —— 那是把"模型名写错"说成了"服务故障"。
+//
+// 实测依据（直连 token.sensenova.cn，2026-09-28）：
+//   sensenova-u1-fast     -> 404 "model is not found"
+//   sensenova-u1.5-lite   -> 404 "model is not found"
+//   deepseek-v4.1-flash   -> 403 "model is not available in the current token plan"
+// 注意前两个**仍出现在上游自己的 /v1/models 列表里** —— 上游的模型表并不权威。
+// 所以这条路径一定会被走到：客户端照列表选模型，照样可能被上游拒绝。
+function isModelRejectReason(reason) {
+	let low = lc('' + (reason || ''));
+	return (index(low, 'model is not found') >= 0) ||
+		(index(low, 'model not found') >= 0) ||
+		(index(low, 'no such model') >= 0) ||
+		(index(low, 'model does not exist') >= 0) ||
+		(index(low, 'unsupported model') >= 0) ||
+		(index(low, 'invalid model') >= 0) ||
+		(index(low, 'not available in the current token plan') >= 0);
+}
+
+// 判定失败原因是否属于"上游不接受这次的**请求体**"（与 Key 无关）。
+//
+// 实测依据（2026-09-28 生产日志）：
+//   `inference request is invalid` —— 请求参数不被上游接受。
+// 这类同样是**确定性**失败：换任何一把 Key 结果都一样，
+// 所以不该冷却 Key、不该换 Key、更不该报"所有 Key 均失败"。
+//
+// ⚠️ 措辞要挑准，**别用 `'exceeds'`** —— 它会撞上
+// `inference exceeds tpm/rpm limit`（那是限流，必须走冷却+换 Key 那条路）。
+function isRequestRejectReason(reason) {
+	let low = lc('' + (reason || ''));
+	return (index(low, 'request is invalid') >= 0) ||
+		(index(low, 'invalid request') >= 0) ||
+		(index(low, 'bad request') >= 0) ||
+		(index(low, 'malformed') >= 0) ||
+		(index(low, 'request body') >= 0) ||
+		(index(low, 'context length') >= 0) ||
+		(index(low, 'maximum context') >= 0) ||
+		(index(low, 'payload too large') >= 0) ||
+		(index(low, 'request too large') >= 0);
+}
+
+// 客户端错误总判定：模型层面 + 请求体层面。
+// 两者都指向"请求本身有问题"，不是 Key 的问题。
+function isClientErrorReason(reason) {
+	return isModelRejectReason(reason) || isRequestRejectReason(reason);
+}
+
+// ---------- v1.8.1：上游限流刹车 ----------
+//
+// 状态机（每条上游一份，懒创建）：
+//   hits       本窗口内观测到的"被上游限流拒绝"次数
+//   winStart   本窗口起点
+//   openUntil  闭闸截止时间戳（0 = 未闭闸）
+//   trip/waited/rejected  诊断计数（闭闸次数 / 等待放行次数 / 直接拒绝次数）
+//
+// 一条铁律：**闭闸期间不产生上游流量**。计数与开闸在 brakeNoteRateLimit 里做
+// （由 markUpKeyFail 在判明 rate 后调用），合闸在 brakeClear 里做（成功即自愈）。
+function brakeState(upId) {
+	let b = upBrake[upId];
+	if (!b) {
+		b = { hits: 0, winStart: 0, openUntil: 0, trip: 0, waited: 0, rejected: 0 };
+		upBrake[upId] = b;
+	}
+	return b;
+}
+
+// 闭闸剩余秒数。0 = 未闭闸（或刹车功能被 rl_brake_hits=0 关闭）。
+function brakeLeft(up) {
+	if (cfg.brakeHits <= 0) return 0;
+	let b = upBrake[up.id];
+	if (!b || b.openUntil <= 0) return 0;
+	let left = b.openUntil - time();
+	return (left > 0) ? left : 0;
+}
+
+// 记一次"上游限流拒绝"，窗口内累计到阈值就闭闸。
+// 注意判据是**观测到的上游拒绝**，不是我们自己的冷却模型 —— 冷却只是估计，
+// 上游到底恢没恢复只有上游知道，所以不拿冷却当开闸条件。
+function brakeNoteRateLimit(up) {
+	if (cfg.brakeHits <= 0) return;
+	let b = brakeState(up.id);
+	let now = time();
+
+	// 窗口过期就重新计数。起点是"上次重置时间"而非精确滑动 ——
+	// 单线程 ucode 里做真滑窗要存时间戳数组，为这点精度不值得。
+	if (b.winStart === 0 || (now - b.winStart) > cfg.brakeWindow) {
+		b.winStart = now;
+		b.hits = 0;
+	}
+
+	b.hits++;
+	if (b.hits < cfg.brakeHits) return;
+
+	// 达阈值：闭闸。若已处于闭闸中则取更晚的截止时间，绝不缩短已有闭闸。
+	let until = now + cfg.brakeSec;
+	if (until > b.openUntil) b.openUntil = until;
+	b.hits = 0;
+	b.winStart = now;
+	b.trip++;
+	logErr(sprintf('上游 %s 在 %ds 内被限流拒绝 %d 次，刹车 %ds（期间不再打上游，直接回 429）',
+		up.prefix, cfg.brakeWindow, cfg.brakeHits, cfg.brakeSec));
+}
+
+// 任一上游成功即合闸。刹车是应急手段，不该比上游自己的恢复更久。
+// 也正因为"成功即清零计数"，一个还在正常出结果的（只是偶尔被拒的）上游
+// 永远不会被闭闸 —— 宁可少刹，不可误刹。
+function brakeClear(up) {
+	let b = upBrake[up.id];
+	if (!b || b.openUntil === 0) return;
+	if (time() < b.openUntil)
+		logInfo(sprintf('上游 %s 刹车期间请求成功，提前解除刹车', up.prefix));
+	b.openUntil = 0;
+	b.hits = 0;
+	b.winStart = 0;
+}
+
+// 该上游最早一把 Key 还有多少秒脱离冷却。
+// 全部 Key 都在冷却时用它填 Retry-After —— 让客户端按正确节奏退避，
+// 而不是立刻重试、再撞一次限流（这正是"越限流越慢"的来源）。
+// 返回 0 表示至少有一把 Key 当前可用。
+function upEarliestRetrySec(up) {
+	let now = time();
+	let best = -1;
+	for (let k in up.keys) {
+		let st = upState[up.id + '|' + k];
+		let rem = (st && st.coolUntil > now) ? (st.coolUntil - now) : 0;
+		if (rem <= 0) return 0;
+		if (best < 0 || rem < best) best = rem;
+	}
+	return best < 0 ? 0 : best;
+}
 
 function saveUpstreamsFile(j) {
 	if (!writeJsonFile(UPSTREAM_FILE, j)) {
 		logErr('upstream save failed');
 		return false;
 	}
+	// 上游配置变了（增删 / 改 Key / 停用），模型列表缓存必须作废，
+	// 否则管理页改完还要等 TTL 到期才看得到新模型。
+	upModelCache = {};
 	return true;
 }
 
@@ -910,44 +1606,66 @@ function normalizePrefix(raw) {
 	return p;
 }
 
-// 取当前可用的 Key（跳过冷却中的），按轮询顺序返回。
-// 逻辑与凭据池的 usablePool 保持一致，便于维护者对照理解。
+// 取该上游的 Key **尝试顺序**。
+//
+// 不变量（v1.7.11 起，勿破坏）：
+//   1) `up.keys` 非空时，返回值**必定包含每一把 Key**，且不重复；
+//   2) 顺序 =「健康 Key（严格轮询）」+「有失败记录的 Key（冷却结束早的在前）」。
+//
+// 为什么必须返回全部 Key：上层靠 `conn.upTry < length(conn.upKeys)` 限制单次
+// 请求的尝试次数，并实现「不通就换下一个」。若这里只返回一把，那个机制就退化成
+// "只试一把就放弃" —— 旧实现正是如此：全部冷却时只退回一把，
+// 于是"所有 Key 都在冷却"变成了客户端的死局（用户实际撞到的问题）。
+//
+// 为什么健康 Key 优先且轮询：正常流量在 Key 之间均摊（负载均衡），
+// 刚失败的 Key 不会被新流量立刻再撞一次，但它**仍然排在队里**、随时可被尝试。
 function usableUpKeys(up) {
-	let now = time();
-	let ok = [];
+	let clean = [];
+	let rec = [];
 	for (let k in up.keys) {
 		let st = upState[up.id + '|' + k];
-		if (st && st.coolUntil > now) continue;
-		push(ok, k);
+		if (st && st.fails > 0) push(rec, k); else push(clean, k);
 	}
 
-	// 全部冷却中：退回冷却最早结束的那条，避免完全不可用
-	if (length(ok) === 0 && length(up.keys) > 0) {
-		let best = up.keys[0];
-		let bestUntil = upState[up.id + '|' + best] ? upState[up.id + '|' + best].coolUntil : 0;
-		for (let k in up.keys) {
-			let st = upState[up.id + '|' + k];
-			let cu = st ? st.coolUntil : 0;
-			if (cu < bestUntil) {
-				best = k;
-				bestUntil = cu;
-			}
-		}
-		push(ok, best);
-	}
-
-	// 从游标处轮转
-	if (length(ok) > 1) {
-		let n = length(ok);
+	// 健康 Key 之间严格轮播（沿用 upCursor），避免单把 Key 过载。
+	let n = length(clean);
+	if (n > 1) {
 		let start = (upCursor[up.id] || 0) % n;
-		let rotated = [];
-		for (let i = 0; i < n; i++)
-			push(rotated, ok[(start + i) % n]);
+		let rot = [];
+		for (let i = 0; i < n; i++) push(rot, clean[(start + i) % n]);
 		upCursor[up.id] = (start + 1) % n;
-		ok = rotated;
+		clean = rot;
 	}
 
-	return ok;
+	// 恢复中的 Key：冷却结束早的排前面（先试最可能已恢复的那把）。
+	// Key 数量很小（个位数），用"反复取最小"即可，不必引排序依赖。
+	let rest = [];
+	let used = {};
+	let m = length(rec);
+	for (let i = 0; i < m; i++) {
+		let best = null;
+		let bestV = 0;
+		for (let j = 0; j < m; j++) {
+			let k = rec[j];
+			if (used[k]) continue;
+			let st = upState[up.id + '|' + k];
+			let v = st ? st.coolUntil : 0;
+			if (best === null || v < bestV) { best = k; bestV = v; }
+		}
+		if (best === null) break;
+		used[best] = true;
+		push(rest, best);
+	}
+
+	let out = [];
+	for (let k in clean) push(out, k);
+	for (let k in rest) push(out, k);
+
+	// 兜底：正常走不到（loadUpstreams 已滤掉空 Key），但绝不能让上层拿到空数组 ——
+	// 那会被当作"没有配置 Key"而直接 503。
+	if (length(out) === 0 && length(up.keys) > 0) push(out, up.keys[0]);
+
+	return out;
 }
 
 function markUpKeyFail(up, key, reason) {
@@ -955,17 +1673,72 @@ function markUpKeyFail(up, key, reason) {
 	let id = up.id + '|' + key;
 	let st = upState[id] || { coolUntil: 0, fails: 0, lastErr: '' };
 	st.fails = (st.fails || 0) + 1;
-	// 连续失败指数退避，上限 10 分钟（与凭据池一致）
-	let cool = UP_COOL_SEC;
-	for (let i = 1; i < st.fails && cool < 600; i++) cool *= 2;
+
+	// 冷却时长按失败类型区分。
+	//
+	// 实测教训：这里曾固定冷却 2 秒。但上游限流是按 tpm/rpm 计的 —— 2 秒后该
+	// Key 又被选中、立刻再撞一次限流，一次客户端请求能在 4 个 Key 之间连撞多轮，
+	// 实测出现 12.45s 与 60s+ 的挂起。限流必须指数退避。
+	let rate = isRateLimitReason(reason);
+	let auth = isAuthReason(reason);
+
+	let cool;
+	if (rate) {
+		cool = UP_RATE_COOL;
+		for (let i = 1; i < st.fails && cool < UP_RATE_COOL_MAX; i++) cool *= 2;
+		if (cool > UP_RATE_COOL_MAX) cool = UP_RATE_COOL_MAX;
+	} else if (auth) {
+		cool = UP_AUTH_COOL;
+	} else {
+		cool = UP_SOFT_COOL;
+	}
+
 	st.coolUntil = now + cool;
 	st.lastErr = '' + reason;
 	upState[id] = st;
-	logErr(sprintf('upstream %s key %s cooling %ds: %s',
-		up.prefix, maskKey(key), cool, reason));
+	logErr(sprintf('upstream %s key %s cooling %ds (%s): %s',
+		up.prefix, maskKey(key), cool, rate ? '限流' : (auth ? '鉴权' : '瞬时'), reason));
+
+	// 指标埋点就放这里：本函数是"这把 Key 失败过"的唯一入口，
+	// 分档判据 rate/auth 上一行已经算好，不必让指标层再判一遍。
+	metricFail(up.id, key, rate ? 'rate' : (auth ? 'auth' : ''), reason);
+
+	// v1.8.1：限流类失败同时喂给上游刹车。连续被同一上游拒到阈值就闭闸，
+	// 掐断"4 把 Key 全冷却时仍打满 4 次注定失败的上游调用"这个正反馈。
+	if (rate) brakeNoteRateLimit(up);
 }
 
+// 【已删除】nextUsableUpKey()：v1.7.1 用它从 up.keys 里挑一把"未冷却"的 Key，
+// 全部冷却时返回 null → 上层直接回 `429 当前 Key 被限流`（还有 Key 没试过就放弃）。
+// v1.7.11 删除，因为顺序现在统一由 usableUpKeys() 在请求开始时算好
+// （健康 Key 轮询在前、失败过的按冷却结束时间在后），
+// 换下一把只需推进 conn.upTry 槽位即可，不需要在转发中途再挑一次。
+
+// 【已删除】allUpKeysCooling()：v1.7.1 曾用它做"全部 Key 都冷却就立刻回
+// 429 + Retry-After，省掉空转"的短路。v1.7.11 移除，原因有两条：
+//   1) 它的对外表现就是用户投诉的那句
+//      `429 上游 sensenova 所有 Key 均在冷却中（retry_after:577）` ——
+//      把一次局部失败放大成"整个上游不可用"，还让客户端退避近 10 分钟；
+//   2) 用户明确要求「不通的自动换下一个」，即宁可多打几次上游，
+//      也不能在还有 Key 没试过的情况下就放弃。
+// 相关的不变量：usableUpKeys() 现在**永远返回全部 Key**（只调整顺序），
+// 因此"空转"已被天然限制在 `conn.upKeys` 长度以内（最多 4 次）。
+
 function markUpKeyOk(up, key) {
+	// 成功计数必须放在下面的提前 return 之前：一把从未失败过的 Key 在 upState
+	// 里根本没有条目，但它的成功同样要计 —— 否则"成功率"只统计到失败过的 Key。
+	metricUp(up.id).ok++;
+	metricKey(up.id, key).ok++;
+
+	// v1.8.1：任一成功即合闸（含清零计数）。
+	// 这一行同时保证了刹车**不会误刹**：只要这把上游还在正常出结果，
+	// 它的限流计数就永远攒不到阈值。
+	//
+	// 位置必须在下面那个提前 return **之前**：一把从未失败过的 Key 在 upState
+	// 里没有条目，若把 brakeClear 放在 return 之后，它成功时刹车就不合闸，
+	// 「成功即自愈」对这把 Key 等于没接线（本函数第一版就是这么写的）。
+	brakeClear(up);
+
 	let id = up.id + '|' + key;
 	if (!upState[id]) return;
 	upState[id].fails = 0;
@@ -1272,6 +2045,31 @@ function applyWanAccess(cfg, on) {
 	let iport = cfg.port || 8789;             // 内部监听端口
 	let eport = cfg.wanPort || iport;         // 外部暴露端口
 
+	// dest_ip 必须显式给出。fw4 只为「带 dest_ip 的 DNAT」生成 LAN 侧反射规则
+	// （dstnat_lan），只写 src_dport/dest_port 的话内网设备用公网地址访问
+	// 会被直接拒绝 —— 家用场景里这很常见（手机连着 WiFi 却填了公网地址）。
+	// 有了它，内网和外网用同一个地址都能通，不必维护两套配置。
+	//
+	// 坑（实测踩过，务必保留这段说明）：uci 的 network.lan.ipaddr 常带前缀长度，
+	// 返回的是 "192.168.69.1/24" 而不是 "192.168.69.1"。原样写进 dest_ip 后，
+	// fw4 会把 CIDR 透给 nft，nft 取**网络地址**生成
+	//   dnat ip to 192.168.69.0:8789
+	// —— 192.168.69.0 是网段地址，没有任何主机响应，后果是**外网访问全部失效**
+	// （实测：加 dest_ip 后 5 国外部节点从全部 HTTP 200 变成全部不通）。
+	// 所以这里必须剥掉 /前缀，并校验是纯点分四段；格式不对就退回旧写法，
+	// 宁可没有反射也不能把外网弄坏。
+	let lanIp = trim(shRun('uci -q get network.lan.ipaddr').out);
+	if (type(lanIp) !== 'string') lanIp = '';
+	let slash = index(lanIp, '/');
+	if (slash >= 0) lanIp = trim(substr(lanIp, 0, slash));
+	if (length(lanIp) === 0 || !match(lanIp, /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/)) {
+		logInfo('wan: 无法解析 LAN 地址，跳过 dest_ip（仅外网可用，无 LAN 反射）');
+		lanIp = '';
+	}
+	let destIpArg = (lanIp !== '')
+		? ('uci set firewall.' + FW_SECTION + '.dest_ip=' + lanIp + ' && ')
+		: '';
+
 	let cmd;
 
 	if (on) {
@@ -1282,6 +2080,7 @@ function applyWanAccess(cfg, on) {
 			'uci set firewall.' + FW_SECTION + '.src=wan && ' +
 			'uci set firewall.' + FW_SECTION + '.proto=tcp && ' +
 			'uci set firewall.' + FW_SECTION + '.src_dport=' + eport + ' && ' +
+			destIpArg +
 			'uci set firewall.' + FW_SECTION + '.dest_port=' + iport + ' && ' +
 			'uci commit firewall';
 	} else {
@@ -1583,13 +2382,42 @@ function closeConn(conn) {
 	try {
 		if (conn.tmpFile) unlink(conn.tmpFile);
 	} catch (e) { }
+
+	// 从在途连接表摘除并释放缓冲。
+	//
+	// 实测问题：connections 原来只 push 不摘除（全文仅两处引用、从不读取），
+	// 每个连接持有的请求体字符串与 SSE 累积缓冲因此永久驻留 —— 转发服务长跑
+	// 就是无上界的内存泄漏。看门狗也要靠这张表扫描，必须只含活动连接。
+	let keep = [];
+	for (let c in connections)
+		if (c !== conn) push(keep, c);
+	connections = keep;
+	conn.buf = '';
+	conn.sseBuf = '';
+
 	try {
 		conn.sock.close();
 	} catch (e) { }
+
+	// 收尾统计 + 释放并发额度。必须是本函数最后一步。
+	//
+	// 顺序理由：pumpQueue 会立刻发起新请求并把新连接 push 进 connections，
+	// 若放在上面那段 `connections = keep` 之前，新连接会被随后重建的数组丢掉，
+	// 看门狗从此扫不到它 —— 静默看门狗失效，SSE 会一直挂着。
+	//
+	// releaseGate 走 F 表：它定义在本函数之后，ucode 标识符按词法作用域解析，
+	// 直接调用会抛 undeclared variable（踩坑记录 #12）。
+	recordConnMetrics(conn);
+	try {
+		if (conn.gateHeld) F.releaseGate(conn);
+	} catch (e) {
+		logErr('releaseGate failed: ' + e);
+	}
 }
 
 function jsonResponse(conn, status, obj, extraHeaders) {
 	if (conn.closed) return;
+	conn.httpStatus = status;   // 供 /metrics 判定结局，见 recordConnMetrics()
 	let body = sprintf('%.J', obj);
 	let extra = '';
 	if (extraHeaders) {
@@ -1616,6 +2444,7 @@ function jsonResponse(conn, status, obj, extraHeaders) {
 // 顺序颠倒会在运行时抛 "access to undeclared variable rawResponse"。
 function rawResponse(conn, status, ctype, body, extraHeaders) {
 	if (conn.closed) return;
+	conn.httpStatus = status;   // 供 /metrics 判定结局
 	body = '' + (body || '');
 	let extra = '';
 	if (extraHeaders) {
@@ -1644,6 +2473,7 @@ function textResponse(conn, status, title, body) {
 
 function sseHeaders(conn) {
 	if (conn.closed || conn.headersSent) return;
+	conn.httpStatus = 200;      // 已经开始推流即视为成功，见 recordConnMetrics()
 	let head =
 		'HTTP/1.1 200 OK\r\n' +
 		'Content-Type: text/event-stream\r\n' +
@@ -1922,7 +2752,12 @@ function availableModels(cfg) {
 		return list;
 	}
 	list = fallbackModels();
-	modelCache = { at: now, list: list };
+	// **降级结果不进缓存**。
+	//
+	// 走到这里通常意味着"此刻没有可用凭据"，而这是个**会变的临时状态** ——
+	// 用户一登录新账号就变了。若按 6 小时 TTL 把它缓存下来，用户登录成功后
+	// 模型列表仍旧停在降级版，表现成"刚登录却不生效"，只能靠重启服务解决。
+	// 降级列表本身是常数（FREE_MODELS），每次算一遍的代价可以忽略。
 	return list;
 }
 
@@ -2049,8 +2884,11 @@ function startWebLogin(cfg) {
 
 // ---------- 连接处理 ----------
 
-let cfg = loadConfig();
-let connections = [];
+// 这里是**赋值**不是声明 —— 声明已提前到文件头部（upState/upBrake 附近）的
+// `let cfg = {};`，因为 brakeLeft()/brakeNoteRateLimit() 定义在本行之前却要读 cfg。
+// 赋值留在此处，是为了不改变"配置在启动流程的这一刻才读盘"的既有顺序。
+// 同理 connections 也已提前到文件头部 —— closeConn() 需要它，而它定义在本行之前。
+cfg = loadConfig();
 
 function parseHead(head) {
 	let lines = split(head, '\r\n');
@@ -2084,6 +2922,41 @@ function parseHead(head) {
 // 注意：这个表必须在文件最前面声明（见顶部 F 的定义处），不能放在这里 ——
 // clientVersion() 也要通过它调用 runCurl()，而 clientVersion 在本行之前。
 
+// 池当前是否可用：配置里开着 且 不处于"疑似挂了"的回退冷却期内。
+// 定义在这里而不是文件顶部：它读 cfg，而 cfg 的声明位置更靠后，
+// ucode 按词法解析标识符，放前面会抛 undeclared variable。
+function poolUsable() {
+	return cfg.usePool && (poolFailUntil === 0 || time() >= poolFailUntil);
+}
+
+// 池化尝试失败但一个字节都没收到 → 判定池不可用，立刻改用直连重发同一次尝试。
+// 返回 true 表示"本函数已接手处理"，调用方不要再走原有的失败分支。
+//
+// 关键点：**不调用 markCredFail / markUpKeyFail**。池挂了跟这把 Key 毫无关系，
+// 记一次失败会把一把好 Key 打进冷却 —— 池恢复后反而少一把可用 Key，
+// 日志里还会多出一堆指向错误方向的"上游失败"。
+function poolFallback(conn) {
+	if (!conn.usedPool || conn.headersSent) return false;
+	if (conn.attemptBytes > 0) return false;
+	poolFailUntil = time() + POOL_FAIL_COOLDOWN;
+	metrics.pool.fallback++;
+	logErr(sprintf('连接池疑似不可用（尝试 %d 零字节响应），%ds 内改用直连重发 (client %s)',
+		conn.tries || conn.upTry || 0, POOL_FAIL_COOLDOWN, conn.ip || '?'));
+	conn.usedPool = false;
+	// 回退必须用**同一把**凭据/Key 重发：spawnUpstream 取 pool[tries]、
+	// spawnUpstreamDirect 取 upKeys[upTry]，两者都是"取用时自增"，
+	// 所以得先把指针退回去 —— 否则池一挂就白跳一把 Key，几次下来好 Key 全被跳过。
+	if (conn.upstream) {
+		if (conn.upTry > 0) conn.upTry--;
+		if (conn.upKeyInUse) conn.upKeyInUse = null;
+	} else {
+		if (conn.tries > 0) conn.tries--;
+	}
+	if (conn.upstream) F.spawnUpstreamDirect(conn);
+	else F.spawnUpstream(conn);
+	return true;
+}
+
 function spawnUpstream(conn) {
 	if (conn.closed) return;
 
@@ -2092,6 +2965,19 @@ function spawnUpstream(conn) {
 	conn.credId = cred.id;
 	conn.sseBuf = '';
 	conn.headersSent = false;
+	// 本次尝试的计时与池化决策。这三个字段同时服务指标与回退判定，
+	// 每次尝试都必须清零 —— 否则上一轮的首字节时间会被算进这一轮的 TTFB。
+	conn.firstByteAt = 0;
+	conn.attemptBytes = 0;
+	conn.attemptAt = nowMs();
+	conn.usedPool = poolUsable();
+	// 一条请求只计一次 mode.req —— 池化失败回退直连时会用同一把凭据重发，
+	// 若按"尝试次数"计数会把一次请求算成两次（且口径会随回退次数漂移）。
+	if (!conn.modeCounted) {
+		conn.modeCounted = true;
+		metricMode(conn).req++;
+		if (conn.usedPool) metrics.pool.used++;
+	}
 
 	logInfo(sprintf('chat via credential %s (attempt %d/%d)',
 		cred.id, conn.tries, conn.tryLimit));
@@ -2101,16 +2987,50 @@ function spawnUpstream(conn) {
 	let ua = clientVersion(cfg);
 	conn.usedVersion = ua;
 
-	let cmdline = join(' ', [
-		'curl', '-sS', '-N', '-X', 'POST',
-		'--connect-timeout', '5',
-		shquote('-H'), shquote('Content-Type: application/json'),
-		shquote('-H'), shquote('Authorization: Bearer ' + cred.token),
-		shquote('-H'), shquote('Accept: text/event-stream'),
-		shquote('-H'), shquote('User-Agent: WorkBuddy/' + ua),
-		shquote('--data-binary'), shquote('@' + conn.tmpFile),
-		shquote(cfg.endpoint + '/v2/chat/completions'),
-	]);
+	// 连接方式不同，curl 参数也不同，所以这里逐个 push 而不是写数组字面量：
+	//   * 回环是明文 HTTP/1.1，-4 / --http2 / --tcp-fastopen 全是无意义的开销；
+	//   * 连接超时压到 POOL_CONNECT_TIMEOUT：池要是挂了要尽快暴露并回退，
+	//     而不是让客户端先白等 5 秒连接超时。
+	let args = ['curl', '-sS', '-N', '-X', 'POST'];
+	if (conn.usedPool) {
+		push(args, '--connect-timeout');
+		push(args, '' + POOL_CONNECT_TIMEOUT);
+	} else {
+		push(args, '-4');
+		push(args, '--http2');
+		push(args, '--tcp-fastopen');
+		push(args, '--connect-timeout');
+		push(args, '5');
+	}
+	// 静默兜底：curl 侧 90 秒无字节即断开（75s 看门狗通常会先触发，
+	// 这层是看门狗万一失效时的最后保险）；--max-time 防连接无限占用。
+	push(args, '--speed-limit');
+	push(args, '1');
+	push(args, '--speed-time');
+	push(args, '90');
+	push(args, '--max-time');
+	push(args, '1800');
+	push(args, '--keepalive-time');
+	push(args, '30');
+	push(args, shquote('-H'));
+	push(args, shquote('Content-Type: application/json'));
+	push(args, shquote('-H'));
+	push(args, shquote('Authorization: Bearer ' + cred.token));
+	push(args, shquote('-H'));
+	push(args, shquote('Accept: text/event-stream'));
+	push(args, shquote('-H'));
+	push(args, shquote('User-Agent: WorkBuddy/' + ua));
+	if (conn.usedPool) {
+		// 池的协议约定：curl 连的是 127.0.0.1，真正的上游由 X-WB-Target 指定
+		push(args, shquote('-H'));
+		push(args, shquote('X-WB-Target: ' + cfg.endpoint));
+	}
+	push(args, shquote('--data-binary'));
+	push(args, shquote('@' + conn.tmpFile));
+	push(args, shquote(conn.usedPool
+		? (cfg.poolBase + '/v2/chat/completions')
+		: (cfg.endpoint + '/v2/chat/completions')));
+	let cmdline = join(' ', args);
 
 	let proc;
 	try {
@@ -2125,6 +3045,8 @@ function spawnUpstream(conn) {
 	}
 
 	conn.proc = proc;
+	// 静默看门狗计时起点（两档阈值见 cfg.upFirstByteSec / cfg.upIdleSec 与 watchdogTick）
+	conn.lastByteAt = time();
 
 	conn.procHandle = uloop.handle(proc, () => {
 		let chunk;
@@ -2137,6 +3059,15 @@ function spawnUpstream(conn) {
 		if (chunk === null || length(chunk) === 0) {
 			F.onUpstreamEnd(conn);
 			return;
+		}
+		// 有字节回来即刷新静默计时
+		conn.lastByteAt = time();
+		conn.attemptBytes += length(chunk);
+		// 首字节即 TTFB：从发起到收到第一个字节，包含 DNS/TCP/TLS/上游排队，
+		// 正是"池化到底省了多少"要对比的那个量。
+		if (conn.firstByteAt === 0) {
+			conn.firstByteAt = nowMs();
+			histAdd(metricMode(conn).ttfb, conn.firstByteAt - conn.attemptAt);
 		}
 
 		if (conn.wantNonStream) {
@@ -2173,7 +3104,16 @@ function tryNextCred(conn, reason) {
 	conn.procHandle = null;
 	conn.proc = null;
 
-	if (reason) markCredFail(cfg, conn.credId, reason);
+	// 池化尝试零字节收场：先判是不是池本身挂了。是的话就地直连重发，
+	// 并且**不记这次凭据失败** —— 见 poolFallback 的说明。
+	if (poolFallback(conn)) return;
+
+	if (reason) {
+		markCredFail(cfg, conn.credId, reason);
+		metricFail('wb', conn.credId,
+			isRateLimitReason(reason) ? 'rate'
+				: (isAuthReason(reason) ? 'auth' : ''), reason);
+	}
 
 	if (conn.headersSent) {
 		// 已经开始向客户端推流，无法回退重试
@@ -2186,9 +3126,18 @@ function tryNextCred(conn, reason) {
 		return;
 	}
 
+	// 风控类失败附一句人话解释。否则客户端只拿到 "上游错误码：11140"，
+	// 无法判断是"我写的问题太敏感"还是"账号被封了"—— 后者要换账号，
+	// 前者改提问即可，处理方式完全不同。
+	let risk = isRiskControlReason(reason);
+	let hint = risk
+		? '（上游对所有内容都返回内容审核类拦截，说明该 WorkBuddy 账号已被风控，请更换账号凭据）'
+		: '';
+
 	jsonResponse(conn, 502, {
 		error: {
-			message: '所有可用凭据均失败：' + (reason || '上游无响应'),
+			message: '所有可用凭据均失败：' + (reason || '上游无响应') + hint,
+			type: risk ? 'account_restricted' : 'upstream_error',
 			tried: conn.tries,
 		},
 	});
@@ -2204,10 +3153,63 @@ function spawnUpstreamDirect(conn) {
 	if (conn.closed) return;
 
 	let up = conn.upstream;
+
+	// v1.8.1 限流刹车：闭闸期间**不再产生重试流量**。
+	//
+	// 为什么只拦重试、不拦首次尝试：首次尝试是唯一能探知"上游是否已恢复"的手段，
+	// 拦掉它就会把本来能成功的请求变成失败。而闭闸期间的重试是纯浪费 ——
+	// soak 实测 24 个失败请求每个试满 4 把 Key，96 次上游调用无一成功，
+	// 占上游总流量的 70%（池统计 138 次 / 60 个客户端请求 = 2.25× 放大）。
+	// 只拦重试既拿掉这份浪费，又完整保留"不通就换下一个"（未闭闸时行为一字不变）。
+	if (conn.upTry > 0) {
+		let left = brakeLeft(up);
+		if (left > 0) {
+			let b = brakeState(up.id);
+			if (left * 1000 <= RATE_BRAKE_WAIT_MS && !conn.brakeWaited) {
+				// 闭闸只剩个尾巴：等它过去再发，比直接回 429 对客户端友好得多。
+				// 只能等一次（conn.brakeWaited），否则会无限自旋。
+				conn.brakeWaited = true;
+				b.waited++;
+				metrics.brakeWaited++;
+				logInfo(sprintf('上游 %s 刹车剩 %ds，等 %dms 后再重试 (client %s)',
+					up.prefix, left, left * 1000, conn.ip || '?'));
+				uloop.timer(left * 1000, () => { F.spawnUpstreamDirect(conn); });
+				return;
+			}
+			b.rejected++;
+			metrics.brakeRejected++;
+			let ra = (left > cfg.brakeMaxRa) ? cfg.brakeMaxRa : left;
+			logErr(sprintf('上游 %s 刹车中（剩 %ds），停止重试并回 429 (client %s)',
+				up.prefix, left, conn.ip || '?'));
+			jsonResponse(conn, 429, {
+				error: {
+					message: '上游 ' + up.prefix + ' 正在限流（' + cfg.brakeWindow + 's 内被拒 ' +
+						cfg.brakeHits + ' 次，已刹车 ' + cfg.brakeSec + 's），请稍后重试',
+					type: 'rate_limit_error',
+					retry_after: ra,
+				},
+			}, { 'Retry-After': '' + ra });
+			return;
+		}
+	}
+
 	if (conn.upTry >= length(conn.upKeys)) {
-		jsonResponse(conn, 502, {
-			error: { message: '上游 ' + up.prefix + ' 的所有 Key 均失败' },
-		});
+		// 全部 Key 都失败：把"最后一次失败原因 + 最早可恢复时间"一并返回。
+		// 冷却中的 Key 一律用 429 + Retry-After（标准限流语义），客户端据此退避；
+		// 非冷却类失败（Key 无效/上游 5xx）仍用 502。
+		let retry = upEarliestRetrySec(up);
+		let extra = null;
+		if (retry > 0) {
+			extra = { 'Retry-After': '' + retry };
+		}
+		jsonResponse(conn, retry > 0 ? 429 : 502, {
+			error: {
+				message: '上游 ' + up.prefix + ' 的所有 Key 均失败' +
+					(conn.lastFailReason ? '：' + conn.lastFailReason : ''),
+				type: retry > 0 ? 'rate_limit_error' : 'upstream_error',
+				retry_after: retry,
+			},
+		}, extra);
 		return;
 	}
 
@@ -2215,6 +3217,17 @@ function spawnUpstreamDirect(conn) {
 	conn.upTry++;
 	conn.sseBuf = '';
 	conn.headersSent = false;
+	// 本次尝试的计时与池化决策 —— 同 spawnUpstream，每轮必须清零，
+	// 否则上一轮的首字节时间会被算进这一轮 TTFB。
+	conn.firstByteAt = 0;
+	conn.attemptBytes = 0;
+	conn.attemptAt = nowMs();
+	conn.usedPool = poolUsable();
+	if (!conn.modeCounted) {
+		conn.modeCounted = true;
+		metricMode(conn).req++;
+		if (conn.usedPool) metrics.pool.used++;
+	}
 
 	logInfo(sprintf('chat via upstream %s key %s (attempt %d/%d)',
 		up.prefix, maskKey(key), conn.upTry, length(conn.upKeys)));
@@ -2225,17 +3238,49 @@ function spawnUpstreamDirect(conn) {
 	// 表现为"请求了非流式却拿到流"。踩坑记录 #14。
 	let accept = conn.wantNonStream ? 'application/json' : 'text/event-stream';
 
-	let cmdline = join(' ', [
-		'curl', '-sS', '-N', '-X', 'POST',
-		'--connect-timeout', '8',
-		'-4',
-		q('-H'), q('Content-Type: application/json'),
-		q('-H'), q('Authorization: Bearer ' + key),
-		q('-H'), q('Accept: ' + accept),
-		q('-H'), q('User-Agent: ai-gateway/' + APP_VERSION),
-		q('--data-binary'), q('@' + conn.tmpFile),
-		q(up.baseUrl + '/chat/completions'),
-	]);
+	// 连接方式不同则参数不同，逐个 push 而不是数组字面量：
+	// 回环是明文 HTTP/1.1（--http2 / --tcp-fastopen 无意义），且连接超时要压到
+	// POOL_CONNECT_TIMEOUT，好让池挂掉时尽快暴露并回退直连。
+	let args = ['curl', '-sS', '-N', '-X', 'POST'];
+	if (conn.usedPool) {
+		push(args, '--connect-timeout');
+		push(args, '' + POOL_CONNECT_TIMEOUT);
+	} else {
+		push(args, '--http2');
+		push(args, '--tcp-fastopen');
+		push(args, '--connect-timeout');
+		push(args, '8');
+		push(args, '-4');
+	}
+	// 自定义上游通常直接返回 JSON/SSE，静默 30 秒即可判死（25s 看门狗通常是
+	// 先触发的那一道，这层是兜底）；--max-time 防无限占用。
+	push(args, '--speed-limit');
+	push(args, '1');
+	push(args, '--speed-time');
+	push(args, '30');
+	push(args, '--max-time');
+	push(args, '900');
+	push(args, '--keepalive-time');
+	push(args, '30');
+	push(args, q('-H'));
+	push(args, q('Content-Type: application/json'));
+	push(args, q('-H'));
+	push(args, q('Authorization: Bearer ' + key));
+	push(args, q('-H'));
+	push(args, q('Accept: ' + accept));
+	push(args, q('-H'));
+	push(args, q('User-Agent: ai-gateway/' + APP_VERSION));
+	if (conn.usedPool) {
+		// 池的协议约定：curl 连的是 127.0.0.1，真正的上游由 X-WB-Target 指定
+		push(args, q('-H'));
+		push(args, q('X-WB-Target: ' + up.baseUrl));
+	}
+	push(args, q('--data-binary'));
+	push(args, q('@' + conn.tmpFile));
+	push(args, q(conn.usedPool
+		? (cfg.poolBase + '/chat/completions')
+		: (up.baseUrl + '/chat/completions')));
+	let cmdline = join(' ', args);
 
 	let proc;
 	try {
@@ -2251,6 +3296,8 @@ function spawnUpstreamDirect(conn) {
 
 	conn.proc = proc;
 	conn.upKeyInUse = key;
+	// 静默看门狗计时起点
+	conn.lastByteAt = time();
 
 	conn.procHandle = uloop.handle(proc, () => {
 		let chunk;
@@ -2263,6 +3310,14 @@ function spawnUpstreamDirect(conn) {
 		if (chunk === null || length(chunk) === 0) {
 			F.onUpstreamDirectEnd(conn);
 			return;
+		}
+		// 有字节回来即刷新静默计时
+		conn.lastByteAt = time();
+		conn.attemptBytes += length(chunk);
+		// 首字节即 TTFB（含 DNS/TCP/TLS/上游排队），池化收益就看这个量
+		if (conn.firstByteAt === 0) {
+			conn.firstByteAt = nowMs();
+			histAdd(metricMode(conn).ttfb, conn.firstByteAt - conn.attemptAt);
 		}
 
 		if (conn.wantNonStream) {
@@ -2297,14 +3352,70 @@ function tryNextUpKey(conn, reason) {
 	conn.procHandle = null;
 	conn.proc = null;
 
+	// 池化尝试零字节收场：先判是不是池本身挂了。是的话就地直连重发同一把 Key，
+	// 并且不把它算作这把 Key 的失败（否则池一挂就会连坐冷却掉一批好 Key）。
+	if (poolFallback(conn)) return;
+
+	// 客户端错误（模型名不被接受 / 请求体不被接受）：
+	// 确定性失败，换 Key 结果一模一样，所以就地返回，不进换 Key 链。
+	// 这一步必须放在 markUpKeyFail **之前** —— 否则一次"模型名写错"或
+	// "请求参数不对"，会依次烧掉这个上游全部 Key 的冷却，把好请求也一起拖住。
+	if (reason && isClientErrorReason(reason)) {
+		let isModel = isModelRejectReason(reason);
+		// 请求体层面的拒绝（"inference request is invalid" 一类）：把实际发出的
+		// 请求体摘要记入日志。临时文件在 closeConn 时会删除，错过这一次，
+		// 就再也无法定位是哪个字段触发上游拒绝（这正是 1.7.10 时代排查不透的教训）。
+		if (!isModel && conn.tmpFile) {
+			let peek = '';
+			try {
+				peek = readfile(conn.tmpFile) || '';
+			} catch (e) { peek = '(read failed: ' + e + ')'; }
+			if (length(peek) > 800) peek = substr(peek, 0, 800) + ' …(截断)';
+			logInfo(sprintf('upstream %s 拒绝该请求，请求体摘要: %s',
+				conn.upstream.prefix,
+				replace(replace(peek, '\n', '\\n'), '\r', '')));
+		}
+		logInfo(sprintf('upstream %s 拒绝该%s（不冷却 Key，不换 Key）：%s',
+			conn.upstream.prefix, isModel ? '模型' : '请求', reason));
+		if (!conn.headersSent) {
+			jsonResponse(conn, isModel ? 404 : 400, {
+				error: {
+					message: '上游 ' + conn.upstream.prefix + ' ' +
+						(isModel ? '不接受该模型：' : '不接受该请求：') + reason +
+						(isModel
+							? '（模型名请照 /v1/models 里带前缀的写法填；上游自己的模型列表有时会列出它实际不提供的模型）'
+							: '（这是请求参数问题，换 Key 与重试都无用，请检查请求体）'),
+					type: isModel ? 'model_not_found' : 'invalid_request_error',
+				},
+			});
+		} else {
+			closeConn(conn);
+		}
+		return;
+	}
+
 	if (reason && conn.upKeyInUse)
 		markUpKeyFail(conn.upstream, conn.upKeyInUse, reason);
+
+	// 记住最后一次失败原因：全部 Key 都用尽时，把它连同 Retry-After 一起返回给客户端
+	if (reason) conn.lastFailReason = '' + reason;
 
 	if (conn.headersSent) {
 		closeConn(conn);
 		return;
 	}
 
+	// 一律尝试下一把 Key —— 这就是用户要的「不论上游回复什么，不通的自动换下一个」。
+	//
+	// 这里**不再**有按失败类型分叉的"智能换 Key"特例（v1.7.1 起、v1.7.11 移除）：
+	//   - 旧特例只在 `isRateLimitReason(reason)` 时挑一把"未冷却"的 Key 覆盖下一个
+	//     槽位，其它失败类型虽然也会落到 spawnUpstreamDirect，但语义不统一；
+	//   - 那个特例还会在"其余 Key 都在冷却"时直接返回 `429 当前 Key 被限流`，
+	//     这正是用户撞到的"还有 Key 没试过就放弃"。
+	//
+	// 现在顺序完全由 usableUpKeys() 决定（健康 Key 轮询在前、失败过的按恢复时间在后），
+	// 本函数只负责"推进到下一个槽位"。尝试次数上界由 spawnUpstreamDirect 的
+	// `conn.upTry >= length(conn.upKeys)` 保证 —— 最多试满 Key 总数（4 次），不会无限连撞。
 	F.spawnUpstreamDirect(conn);
 }
 
@@ -2327,6 +3438,19 @@ function onUpstreamDirectEnd(conn) {
 			tryNextUpKey(conn, fail);
 			return;
 		}
+		// 走到这里说明上游确实产出了内容 → 这把 Key 可用。
+		//
+		// v1.8.1 修复：这里必须真正把"成功"回报给 Key 状态，原因是
+		//   (1) markUpKeyOk 是全文件唯一会调 brakeClear 的地方，而它此前
+		//       只被"逐 Key 探活/拉模型"那条冷路径调用 —— 聊天成功路径从不调用，
+		//       于是 /metrics 里上游 ok 恒为 0（soak 实测 ok=0/fail=53），
+		//       文档宣称的「任一成功即合闸」在聊天路径上等于没接线，
+		//       刹车只能靠 openUntil 到期自愈，恢复得比应有速度慢；
+		//   (2) fails/coolUntil 也需要在成功时归零，否则一把偶发失败过的 Key
+		//       会一直带着 fails>0，在 usableUpKeys() 的排序里永远排在健康 Key 之后。
+		// 放在 fail 判定**之后**：失败路径已经在 tryNextUpKey 里记过失败了。
+		if (conn.upstream && conn.upKeyInUse)
+			markUpKeyOk(conn.upstream, conn.upKeyInUse);
 		if (conn.wantNonStream) {
 			// 上游遵守了 stream:false，直接回完整 JSON；
 			// 若它仍然返回 SSE（少数上游无视 stream 字段），再本地合并。
@@ -2345,6 +3469,12 @@ function onUpstreamDirectEnd(conn) {
 		closeConn(conn);
 		return;
 	}
+
+	// 走到这里说明 headersSent 已为真：这条流的开头是真内容，已经透传给客户端了，
+	// 同样是一次成功的尝试 —— 与上面 !headersSent 分支保持一致的账本，
+	// 否则"流式成功"这一类请求在上游 ok 指标里永远不出现、也不参与合闸。
+	if (conn.upstream && conn.upKeyInUse)
+		markUpKeyOk(conn.upstream, conn.upKeyInUse);
 
 	if (conn.wantNonStream) {
 		let merged = mergeChunks(conn.sseBuf);
@@ -2437,20 +3567,164 @@ function onUpstreamEnd(conn) {
 	closeConn(conn);
 }
 
-function handleChat(conn, bodyRaw) {
-	let pool = usablePool(cfg);
-	if (length(pool) === 0) {
-		let started = startWebLogin(cfg);
-		jsonResponse(conn, 502, {
-			error: {
-				message: 'WorkBuddy access token 缺失：' +
-					(started.ok ? ('已生成登录链接（' + login.lastError + '），登录后自动生效') : login.lastError),
-				login: started,
-			},
-		});
+// ---------- 并发闸门 + FIFO 排队（v1.8.0） ----------
+//
+// 设计取舍：
+//   * 闸门键按上游分。全局单闸门会让"一个慢上游"阻塞所有上游的请求，
+//     而每个上游是独立账号、独立额度，跨上游排队没有意义。
+//   * 队列是同一个数组，但**放行时按各自闸门键的容量**：同键严格 FIFO
+//     （顺序扫描、先到先得），跨键互不阻塞。
+//   * 只在**首次**尝试前过闸门。换 Key / 换凭据的重试沿用已持有的额度
+//     （conn.gateHeld 一直为真），否则重试会把自己重新排到队尾。
+//   * 上限为 0 表示不限流，直接放行 —— 保留 v1.7.x 行为，出问题可一键回退。
+
+function gateKeyOf(conn, kind) {
+	return (kind === 'wb') ? 'wb' : ('up:' + conn.upstream.id);
+}
+
+function gateLimitOf(kind) {
+	return (kind === 'wb') ? cfg.wbMaxInflight : cfg.upMaxInflight;
+}
+
+function gateLabel(key) {
+	return (key === 'wb') ? 'WorkBuddy' : substr(key, 3);
+}
+
+// 申请额度：能进就立刻发请求，满员就进 FIFO 队列等
+function gateStart(conn, kind) {
+	conn.gateKind = kind;
+	let key = gateKeyOf(conn, kind);
+	conn.gateKey = key;
+
+	let limit = gateLimitOf(kind);
+	let cur = upInflight[key] || 0;
+
+	if (limit === 0 || cur < limit) {
+		upInflight[key] = cur + 1;
+		conn.gateHeld = true;
+		if (kind === 'wb') F.spawnUpstream(conn);
+		else F.spawnUpstreamDirect(conn);
 		return;
 	}
 
+	// 队列也有上限：无限攒请求只会让每个客户端都等到自己超时，
+	// 不如立刻告诉后来者"现在忙"，让它自己退避或换上游。
+	if (length(chatQueue) >= cfg.queueMax) {
+		metrics.queueRejected++;
+		logErr(sprintf('并发 %s 已满 %d/%d 且队列已满(%d)，直接拒绝 (client %s)',
+			gateLabel(key), cur, limit, cfg.queueMax, conn.ip || '?'));
+		jsonResponse(conn, 429, {
+			error: {
+				message: '服务繁忙：' + gateLabel(key) + ' 在途请求已达上限 ' + limit +
+					'，等待队列也已满（' + cfg.queueMax + '）',
+				type: 'rate_limit_error',
+			},
+		}, { 'Retry-After': '5' });
+		return;
+	}
+
+	conn.gateHeld = false;
+	conn.queuedAt = time();
+	push(chatQueue, conn);
+	metrics.queued++;
+	logInfo(sprintf('并发 %s 已满 %d/%d，请求入队（队列深度 %d，client %s）',
+		gateLabel(key), cur, limit, length(chatQueue), conn.ip || '?'));
+}
+
+// 释放额度并放行队列（由 closeConn 经 F 表调用）
+function releaseGate(conn) {
+	if (!conn.gateHeld) return;
+	conn.gateHeld = false;
+	let key = conn.gateKey;
+	if (key) {
+		let cur = upInflight[key] || 0;
+		upInflight[key] = (cur > 0) ? cur - 1 : 0;
+	}
+	// 走 F 表而非直接调用：pumpQueue 定义在下面，ucode 不提升函数，
+	// 直接写 pumpQueue() 会抛 undeclared variable。
+	F.pumpQueue();
+}
+
+function pumpQueue() {
+	if (pumpingQueue) {
+		// 重入：本轮 spawn 同步失败并触发了 closeConn。
+		// 只置标志让外层再扫一遍 —— 内层直接改数组会把外层的结果覆盖掉。
+		queuePumpAgain = true;
+		return;
+	}
+	pumpingQueue = true;
+	// 注意：ucode 只支持 try/catch，**不支持 finally**（`} finally {` 会报
+	// "Expecting 'catch'"）。所以这里不能靠 finally 复位标志，只能顺序复位。
+	for (;;) {
+		queuePumpAgain = false;
+		let keep = [];
+		let served = 0;
+		for (let c in chatQueue) {
+			if (c.closed || c.gateHeld) continue;
+			let kind = c.gateKind;
+			let key = c.gateKey;
+			let limit = gateLimitOf(kind);
+			let cur = upInflight[key] || 0;
+			if (limit !== 0 && cur >= limit) {
+				push(keep, c);
+				continue;
+			}
+			let waited = (c.queuedAt > 0) ? (time() - c.queuedAt) : 0;
+			upInflight[key] = cur + 1;
+			c.gateHeld = true;
+			c.queuedAt = 0;
+			served++;
+			logInfo(sprintf('排队请求放行 %s（等待 %ds，client %s）',
+				gateLabel(key), waited, c.ip || '?'));
+			if (kind === 'wb') F.spawnUpstream(c);
+			else F.spawnUpstreamDirect(c);
+		}
+		chatQueue = keep;
+		if (!queuePumpAgain || served === 0) break;
+	}
+	pumpingQueue = false;
+}
+
+// 排队超时扫描：等太久的直接 429 + Retry-After，不让客户端无限干等。
+// 与看门狗同理，uloop.timer 是一次性的，每轮结束必须自己重排。
+function queueTick() {
+	if (length(chatQueue) > 0) {
+		let now = time();
+		let keep = [];
+		for (let c in chatQueue) {
+			if (c.closed || c.gateHeld) continue;
+			let waited = (c.queuedAt > 0) ? (now - c.queuedAt) : 0;
+			if (waited < cfg.queueTimeout) {
+				push(keep, c);
+				continue;
+			}
+			metrics.queueTimeout++;
+			c.queuedAt = 0;
+			logErr(sprintf('排队超时 %ds（上限 %ds），返回 429 (client %s)',
+				waited, cfg.queueTimeout, c.ip || '?'));
+			jsonResponse(c, 429, {
+				error: {
+					message: '服务繁忙：排队等待 ' + waited + ' 秒仍未获得执行额度' +
+						'（上限 ' + cfg.queueTimeout + 's），请稍后重试',
+					type: 'rate_limit_error',
+				},
+			}, { 'Retry-After': '5' });
+		}
+		chatQueue = keep;
+	}
+	queueTimer = uloop.timer(UP_QUEUE_TICK_MS, () => queueTick());
+}
+
+function handleChat(conn, bodyRaw) {
+	// ---- 先定路由，再要凭据 ----
+	//
+	// 顺序至关重要。凭据池**只服务于 WorkBuddy 自身**；自定义上游
+	// （sensenova 等）用的是它自己的 Key，与 WorkBuddy 账号无关。
+	//
+	// 原来这里是"一上来就查凭据池、为空即 502"，于是删掉 WorkBuddy 账号后，
+	// 连明确带 sensenova/ 前缀的请求也被一并打死。用户的预期是
+	// "不登 WorkBuddy 只是用不了它的免费模型，其它上游照常"——
+	// 所以必须先把请求解析成"走哪条上游"，再决定要不要凭据。
 	let adapted = adaptBody(bodyRaw, cfg);
 	if (!adapted) {
 		jsonResponse(conn, 400, { error: { message: 'invalid JSON body' } });
@@ -2459,6 +3733,62 @@ function handleChat(conn, bodyRaw) {
 	if (adapted.error) {
 		jsonResponse(conn, 400, { error: { message: adapted.error, type: 'invalid_request_error' } });
 		return;
+	}
+
+	// 归一成一个判据：非空字符串才算"路由到自定义上游"。
+	// id 由 addUpstream 生成为 'u' + 时间戳，不会是空串；这里统一写法是为了
+	// 避免"查凭据池"与"走自定义上游"两处用了不同语义的判断而留下隐患。
+	let customUp = adapted.upstreamId;
+	if (type(customUp) !== 'string' || length(customUp) === 0) customUp = null;
+
+	// 仅当目标是本机 WorkBuddy 时才需要凭据；自定义上游不查池。
+	let pool = null;
+	if (customUp === null) {
+		pool = usablePool(cfg);
+		if (length(pool) === 0) {
+			// 先区分两种"没有可用凭据"：
+			//   1) 池里压根没有凭据      -> 需要登录，提示登录链接
+			//   2) 凭据都在冷却/被风控   -> 说成"token 缺失"会把人引向错误方向
+			//      （用户会去重新登录，但重新登录也救不回一个被风控的账号）
+			let total = loadPool(cfg);
+			let riskN = 0;
+			let riskErr = '';
+			for (let c in total) {
+				let st = credState[c.id];
+				if (st && isRiskControlReason(st.lastErr)) {
+					riskN++;
+					if (riskErr === '') riskErr = '' + st.lastErr;
+				}
+			}
+
+			// 说清"这不是整体故障"。看到 502 很容易以为整个中转挂了，
+			// 实际上受影响的只有 WorkBuddy 自己的模型。
+			let hint = '；带前缀的其它上游模型（如 sensenova/...）不受影响，可继续调用';
+
+			if (riskN > 0) {
+				jsonResponse(conn, 502, {
+					error: {
+						message: 'WorkBuddy 凭据不可用：' + riskN + ' 个账号被上游风控' +
+							(riskErr !== '' ? '（' + riskErr + '）' : '') +
+							'，请更换账号凭据' + hint,
+						type: 'account_restricted',
+						credState: credSummary(total),
+					},
+				});
+				return;
+			}
+
+			let started = startWebLogin(cfg);
+			jsonResponse(conn, 502, {
+				error: {
+					message: 'WorkBuddy access token 缺失：' +
+						(started.ok ? ('已生成登录链接（' + login.lastError + '），登录后自动生效') : login.lastError) +
+						hint,
+					login: started,
+				},
+			});
+			return;
+		}
 	}
 
 	// body 走临时文件，避免 JSON 内容进入命令行被 shell 解释
@@ -2475,32 +3805,44 @@ function handleChat(conn, bodyRaw) {
 	conn.wantNonStream = adapted.wantNonStream;
 	conn.sseBuf = '';
 	conn.tries = 0;
+	// 指标计时起点：从"确定要转发"算起，不含解析请求体的时间。
+	// 这个字段同时是"这是一条聊天请求"的标记 —— recordConnMetrics 靠它把
+	// /health、/models、管理页这些也走 closeConn 的请求排除在转发指标之外。
+	conn.reqAt = nowMs();
 
 	// 自定义上游：不走凭据池，改用该上游自己的 Key 轮询
-	if (adapted.upstreamId) {
+	if (customUp !== null) {
 		let up = null;
 		let all = loadUpstreams();
-		for (let u in all) if (u.id === adapted.upstreamId) { up = u; break; }
+		for (let u in all) if (u.id === customUp) { up = u; break; }
 		if (up === null) {
 			jsonResponse(conn, 404, { error: { message: 'upstream not found' } });
 			return;
 		}
+		// 这里**不再**有"全部 Key 都在冷却 → 直接回 429"的提前返回。
+		//
+		// 那句话（`上游 xxx 所有 Key 均在冷却中` + `retry_after:577`）是用户实际
+		// 遇到的问题：它把"某把 Key 的一次失败"放大成"整个上游对我不可用"，
+		// 客户端据此退避近 10 分钟。现在一律进入转发链，
+		// 由 usableUpKeys 按"健康的先轮询、失败的排后面"给出顺序，
+		// 不通就换下一个，全部试完才报错。
 		let keys = usableUpKeys(up);
 		if (length(keys) === 0) {
-			jsonResponse(conn, 503, { error: { message: 'upstream has no usable key' } });
+			jsonResponse(conn, 503, { error: { message: 'upstream has no key configured' } });
 			return;
 		}
 		conn.upstream = up;
 		conn.upKeys = keys;
 		conn.upTry = 0;
-		F.spawnUpstreamDirect(conn);
+		// 首次尝试过并发闸门；换 Key 的重试沿用已持有的额度（gateHeld）
+		gateStart(conn, 'direct');
 		return;
 	}
 
 	conn.tryLimit = (length(pool) < MAX_TRY) ? length(pool) : MAX_TRY;
 	conn.pool = pool;
 
-	F.spawnUpstream(conn);
+	gateStart(conn, 'wb');
 }
 
 // 挂到前向引用表上：这些函数定义在管理页代码之后，
@@ -2516,6 +3858,10 @@ F.spawnUpstreamDirect = spawnUpstreamDirect;
 F.tryNextUpKey = tryNextUpKey;
 F.onUpstreamDirectEnd = onUpstreamDirectEnd;
 F.upstreamLooksFailed = upstreamLooksFailed;
+// 并发闸门/排队：releaseGate 必须能被 closeConn() 调用，而 closeConn 定义在
+// 文件很靠前的位置，只能走这张前向引用表。
+F.releaseGate = releaseGate;
+F.pumpQueue = pumpQueue;
 
 // ---------- 管理页 ----------
 //
@@ -2806,6 +4152,9 @@ function adminAppPage() {
       <h2>凭据池</h2>
       <p class="desc">多个账号轮询使用，某个账号被限流时自动冷却并切换到其他账号。
         同一账号只会保留一条，重复添加会被自动拦截。</p>
+      <p class="hint">要清掉某个账号，用表格右侧的删除按钮：「网页登录凭据」那一行的
+        <b>删除账号</b>会把本机保存的登录凭据一并删掉（不可撤销），之后可用下方
+        「登录并添加账号」换一个新账号。</p>
       <div id="credsBody">加载中…</div>
     </div>
 
@@ -3285,9 +4634,13 @@ function renderCreds(d) {
       actions += '<button onclick="testCred(\\'' + esc(c.id) + '\\')">测试</button> ';
       actions += '<button onclick="toggleCred(\\'' + esc(c.id) + '\\',' + (c.enabled ? 'false' : 'true') + ')">' +
                  (c.enabled ? '停用' : '启用') + '</button> ';
-      actions += '<button class="danger" onclick="delCred(\\'' + esc(c.id) + '\\',\\'' + esc(c.name) + '\\')">删除</button>';
+      actions += '<button class="danger" onclick="delCred(\\'' + esc(c.id) + '\\',\\'' + esc(c.name) + '\\',\\'' + esc(c.username || '') + '\\')">删除</button>';
     } else {
-      actions = '<span class="hint" style="font-size:12px">请用「退出登录」清除</span>';
+      // 网页登录凭据：没有启停开关（它不在 pool.json 里），但**可以删除**。
+      // 删除走的是另一条路径（清 token.json），按钮文案也刻意写成"删除账号"
+      // 以区别于池内凭据的"删除"——两者后果不同，用户需要一眼看出差别。
+      actions += '<button onclick="testCred(\\'' + esc(c.id) + '\\')">测试</button> ';
+      actions += '<button class="danger" onclick="delCred(\\'' + esc(c.id) + '\\',\\'' + esc(c.name) + '\\',\\'' + esc(c.username || '') + '\\')">删除账号</button>';
     }
 
     h += '<tr><td>' + esc(c.name) + '</td>' +
@@ -3342,10 +4695,27 @@ function addCred() {
   }).catch(function(e) { toast('添加失败：' + e.message, 'err'); });
 }
 
-function delCred(id, name) {
-  if (!confirm('确定删除凭据「' + name + '」？删除后该账号将不再参与轮询。')) return;
+// 删除凭据。两条语义不同的路径共用这个入口，确认强度也不同：
+//   池内凭据     —— 只从 pool.json 摘掉一个条目，token 还在用户手上，
+//                  随时能再粘回来，一次确认即可
+//   网页登录凭据 —— id 固定为 'default'，删的是 token.json 里的账号本体，
+//                  删完本机不再持有该账号，属于账号级操作，
+//                  所以做两次确认，并把后果写清楚
+function delCred(id, name, account) {
+  var who = account ? ('（账号 ' + account + '）') : '';
+
+  if (id === 'default') {
+    if (!confirm('确定删除账号' + who + '？\\n\\n' +
+                 '这会删除本机保存的「网页登录凭据」，删除后本机不再持有该账号；' +
+                 '所有走本机 WorkBuddy 上游的请求都会失败，除非池里还有其它凭据。\\n\\n' +
+                 '此操作不可撤销（不会保留本地副本）。如需恢复，请用下方的「网页登录」重新登录。')) return;
+    if (!confirm('再次确认：真的要删除这个账号吗？')) return;
+  } else {
+    if (!confirm('确定删除凭据「' + name + '」？删除后该账号将不再参与轮询。')) return;
+  }
+
   api('creds/delete', { id: id }).then(function(r) {
-    if (r.ok) { toast('已删除', 'ok'); load(); }
+    if (r.ok) { toast(id === 'default' ? '账号已删除' : '已删除', 'ok'); load(); }
     else { toast('删除失败：' + (r.error || ''), 'err'); }
   }).catch(function(e) { toast('删除失败：' + e.message, 'err'); });
 }
@@ -3653,6 +5023,14 @@ function handleAdmin(conn, req, method, path, query, body) {
 	// 以下均需已登录
 	let authed = adminAuthed(cfg, req.headers);
 
+	// 审计标识：所有**会改状态**的管理操作都要在日志里带来源 IP。
+	//
+	// 为什么单独立个变量：以前这些日志只有动作没有来源，于是"谁把账号删了"
+	// 这种问题无法归属 —— 只能靠"当时有没有新的登录记录"去反推，
+	// 而管理 cookie 有效期 24 小时，完全可以不重新登录就执行删除，
+	// 归属就断了。带上 IP 后，一次 logread 就能定位到具体来源。
+	let who = ' [' + (conn.ip || '?') + ']';
+
 	if (path === '/admin' || path === '/admin/') {
 		if (!authed) {
 			textResponse(conn, 200, '管理登录', adminLoginPage(''));
@@ -3704,8 +5082,10 @@ function handleAdmin(conn, req, method, path, query, body) {
 			});
 		}
 
-		// 网页登录凭据（token.json）。它是池的一部分，但不可删除，
-		// 只能通过「退出登录」清除，所以单独标注 managed=false。
+		// 网页登录凭据（token.json）。它是池的一部分，但**不走 pool.json 那套**
+		// 增删改：没有启停开关（它在另一个存储里），删除也走另一条路径
+		// （清掉 token.json 本体）。所以单独标注 managed=false，
+		// 前端据此换成「测试 / 删除账号」这组按钮。
 		let legacyTok = getToken(cfg);
 		if (legacyTok) {
 			let lj = readJsonFile(tokenPath(cfg)) || {};
@@ -3793,7 +5173,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 		let j = parseJsonBody(body);
 		let r = addPoolCred('' + (j.name || ''), '' + (j.token || ''), cfg);
 		if (r.ok) {
-			logInfo('admin added pool credential ' + r.id);
+			logInfo('admin added pool credential ' + r.id + who);
 			jsonResponse(conn, 200, { ok: true, id: r.id, name: r.name });
 		} else {
 			// 重复用 409，让前端给出针对性提示
@@ -3808,12 +5188,23 @@ function handleAdmin(conn, req, method, path, query, body) {
 	if (path === '/admin/api/creds/delete' && method === 'POST') {
 		let j = parseJsonBody(body);
 		let id = '' + (j.id || '');
+
+		// 网页登录凭据：删除的是 token.json（账号本体），不是池条目。
+		// 早先这里直接拒绝并提示"请用「退出登录」清除"—— 那句提示是错的：
+		// 管理页的「退出」清的是 admin 会话 cookie，跟账号凭据毫无关系，
+		// 于是用户被引到一条死路上（账号根本无法删除）。现已改为真删除。
 		if (id === 'default') {
-			jsonResponse(conn, 400, { ok: false, error: '网页登录凭据请用「退出登录」清除' });
+			let r = deleteLegacyCred(cfg);
+			logInfo('admin deleted legacy credential -> ' + r.ok + (r.error ? (' (' + r.error + ')') : '') + who);
+			jsonResponse(conn, r.ok ? 200 : 400, {
+				ok: r.ok, id: 'default', legacy: true,
+				error: r.error || '',
+			});
 			return;
 		}
+
 		let ok = deletePoolCred(id);
-		logInfo('admin deleted pool credential ' + id + ' -> ' + ok);
+		logInfo('admin deleted pool credential ' + id + ' -> ' + ok + who);
 		jsonResponse(conn, ok ? 200 : 404, { ok: ok, error: ok ? '' : '凭据不存在' });
 		return;
 	}
@@ -3875,7 +5266,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 			jsonResponse(conn, 500, { ok: false, error: (r && r.error) || '无法发起登录' });
 			return;
 		}
-		logInfo('admin started web login');
+		logInfo('admin started web login' + who);
 		jsonResponse(conn, 200, { ok: true, authUrl: r.authUrl || '', already: !!r.alreadyRunning });
 		return;
 	}
@@ -3912,7 +5303,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 			jsonResponse(conn, 500, { ok: false, error: '写入密钥文件失败' });
 			return;
 		}
-		logInfo('admin added api key ' + r.id);
+		logInfo('admin added api key ' + r.id + who);
 		jsonResponse(conn, 200, { ok: true, id: r.id, key: r.key, name: r.name });
 		return;
 	}
@@ -3920,7 +5311,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 	if (path === '/admin/api/keys/delete' && method === 'POST') {
 		let j = parseJsonBody(body);
 		let ok = deleteApiKey('' + (j.id || ''));
-		logInfo('admin deleted api key ' + (j.id || '') + ' -> ' + ok);
+		logInfo('admin deleted api key ' + (j.id || '') + ' -> ' + ok + who);
 		jsonResponse(conn, ok ? 200 : 404, { ok: ok });
 		return;
 	}
@@ -3929,7 +5320,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 		let j = parseJsonBody(body);
 		let on = truthy(j.enabled);
 		let ok = toggleApiKey('' + (j.id || ''), on);
-		logInfo('admin toggled api key ' + (j.id || '') + ' -> ' + on);
+		logInfo('admin toggled api key ' + (j.id || '') + ' -> ' + on + who);
 		jsonResponse(conn, ok ? 200 : 404, { ok: ok, enabled: on });
 		return;
 	}
@@ -3948,7 +5339,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 			jsonResponse(conn, 400, { ok: false, error: r.error });
 			return;
 		}
-		logInfo('admin added upstream ' + r.upstream.prefix);
+		logInfo('admin added upstream ' + r.upstream.prefix + who);
 		jsonResponse(conn, 200, {
 			ok: true,
 			id: r.upstream.id,
@@ -3962,7 +5353,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 	if (path === '/admin/api/upstreams/delete' && method === 'POST') {
 		let j = parseJsonBody(body);
 		let ok = deleteUpstream('' + (j.id || ''));
-		logInfo('admin deleted upstream ' + (j.id || '') + ' -> ' + ok);
+		logInfo('admin deleted upstream ' + (j.id || '') + ' -> ' + ok + who);
 		jsonResponse(conn, ok ? 200 : 404, { ok: ok });
 		return;
 	}
@@ -3971,7 +5362,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 		let j = parseJsonBody(body);
 		let on = truthy(j.enabled);
 		let ok = toggleUpstream('' + (j.id || ''), on);
-		logInfo('admin toggled upstream ' + (j.id || '') + ' -> ' + on);
+		logInfo('admin toggled upstream ' + (j.id || '') + ' -> ' + on + who);
 		jsonResponse(conn, ok ? 200 : 404, { ok: ok, enabled: on });
 		return;
 	}
@@ -3983,7 +5374,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 			jsonResponse(conn, 400, { ok: false, error: r.error });
 			return;
 		}
-		logInfo('admin updated upstream keys ' + (j.id || '') + ' -> ' + r.count);
+		logInfo('admin updated upstream keys ' + (j.id || '') + ' -> ' + r.count + who);
 		jsonResponse(conn, 200, { ok: true, count: r.count });
 		return;
 	}
@@ -4086,7 +5477,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 				(cfg.wanAccess ? ' (wan:' + cfg.wanPort + ' -> lan:' + cfg.port + ')' : ''));
 		}
 
-		logInfo('admin saved config: ' + join(',', changed));
+		logInfo('admin saved config: ' + join(',', changed) + who);
 		jsonResponse(conn, 200, {
 			ok: true,
 			changed: changed,
@@ -4106,6 +5497,129 @@ function handleAdmin(conn, req, method, path, query, body) {
 
 // 用当前池中下一个凭据发起上游请求。
 // 失败（限流 / 鉴权失败 / 空响应）时自动换凭据重试，直到用完 tryLimit。
+// ---------- 指标快照（GET /metrics，v1.8.0） ----------
+//
+// 只读，不重置任何计数器（进程重启即清零；要看趋势请由外部定期抓取留存）。
+//
+// 分位数来自固定桶直方图，是**桶上界**而非精确值：p99=300 应读作
+// "99% 的样本 ≤300ms"，语义与 Prometheus 的 histogram_quantile 一致。
+// -1 表示落在溢出桶，即 >30000ms。
+function metricsSnapshot() {
+	let upsOut = [];
+	let all = loadUpstreams();
+	for (let u in all) {
+		let mu = metrics.up[u.id] || { ok: 0, fail: 0, rateLimited: 0, authFail: 0 };
+		let keysOut = [];
+		for (let k in u.keys) {
+			let mk = metrics.key[u.id + '|' + maskKey(k)];
+			let st = upState[u.id + '|' + k];
+			let cool = 0;
+			if (st && st.coolUntil > time()) cool = st.coolUntil - time();
+			push(keysOut, {
+				key: maskKey(k),
+				ok: mk ? mk.ok : 0,
+				fail: mk ? mk.fail : 0,
+				rateLimited: mk ? mk.rateLimited : 0,
+				authFail: mk ? mk.authFail : 0,
+				coolingSec: cool,
+				lastErr: (mk && mk.lastErr) ? mk.lastErr : ((st && st.lastErr) || ''),
+			});
+		}
+		let bb = upBrake[u.id] || { hits: 0, winStart: 0, openUntil: 0, trip: 0, waited: 0, rejected: 0 };
+		let bLeft = (bb.openUntil > time()) ? (bb.openUntil - time()) : 0;
+		push(upsOut, {
+			id: u.id, prefix: u.prefix, enabled: u.enabled,
+			ok: mu.ok, fail: mu.fail,
+			rateLimited: mu.rateLimited, authFail: mu.authFail,
+			inflight: upInflight['up:' + u.id] || 0,
+			// v1.8.1 限流刹车状态。open=true 表示此刻正在闭闸，
+			// trips 是历史闭闸次数 —— 与 rateLimited 一起看就能算出压缩比。
+			brake: {
+				enabled: cfg.brakeHits > 0,
+				open: bLeft > 0,
+				leftSec: bLeft,
+				hits: bb.hits,
+				trips: bb.trip,
+				waited: bb.waited,
+				rejected: bb.rejected,
+			},
+			keys: keysOut,
+		});
+	}
+
+	// 闸门键 -> 在途数。只列非零项，免得快照被一堆 0 撑满读不出重点。
+	let inflight = { wb: upInflight['wb'] || 0, total: 0 };
+	for (let k in upInflight) {
+		inflight.total += upInflight[k];
+		if (substr(k, 0, 3) === 'up:' && upInflight[k] > 0) inflight[k] = upInflight[k];
+	}
+
+	// 排队中的请求按上游分组，看清是谁在等谁
+	let waiting = { total: 0 };
+	for (let c in chatQueue) {
+		if (c.closed || c.gateHeld) continue;
+		let k = c.gateKey || '?';
+		waiting[k] = (waiting[k] || 0) + 1;
+		waiting.total++;
+	}
+
+	return {
+		ok: true,
+		service: 'luci-app-workbuddy',
+		version: APP_VERSION,
+		since: metrics.since,
+		uptimeSec: time() - metrics.since,
+		chat: {
+			total: metrics.chatTotal,
+			ok: metrics.chatOk,
+			fail: metrics.chatFail,
+			clientErr: metrics.chatClientErr,
+			rateLimited429: metrics.rateLimited429,
+		},
+		queue: {
+			inflight: inflight,
+			waiting: waiting,
+			queuedTotal: metrics.queued,
+			timeoutTotal: metrics.queueTimeout,
+			rejectedTotal: metrics.queueRejected,
+			maxDepth: cfg.queueMax,
+			timeoutSec: cfg.queueTimeout,
+		},
+		limits: {
+			upMaxInflight: cfg.upMaxInflight,
+			wbMaxInflight: cfg.wbMaxInflight,
+		},
+		// 直连 vs 池化：同一批上游、同一套口径，这两个数就是池化的净收益
+		ttfbMs: {
+			pool: metricStat(metrics.mode.pool.ttfb),
+			direct: metricStat(metrics.mode.direct.ttfb),
+		},
+		totalMs: {
+			pool: metricStat(metrics.mode.pool.total),
+			direct: metricStat(metrics.mode.direct.total),
+		},
+		pool: {
+			enabled: cfg.usePool,
+			usable: poolUsable(),
+			port: cfg.poolPort,
+			failCooldownSec: POOL_FAIL_COOLDOWN,
+			requests: metrics.pool.used,
+			fallbacks: metrics.pool.fallback,
+		},
+		// v1.8.1 上游限流刹车：配置 + 全局计数。每条上游的实时状态在 upstreams[].brake。
+		brake: {
+			enabled: cfg.brakeHits > 0,
+			hits: cfg.brakeHits,
+			windowSec: cfg.brakeWindow,
+			brakeSec: cfg.brakeSec,
+			maxRetryAfterSec: cfg.brakeMaxRa,
+			rejectedTotal: metrics.brakeRejected,
+			waitedTotal: metrics.brakeWaited,
+		},
+		upstreams: upsOut,
+	};
+}
+
 function dispatch(conn, head, body) {
 	let req = parseHead(head);
 	let method = req.method;
@@ -4113,6 +5627,17 @@ function dispatch(conn, head, body) {
 	let qIdx = index(req.path, '?');
 	let path = (qIdx >= 0) ? substr(req.path, 0, qIdx) : req.path;
 	let query = (qIdx >= 0) ? substr(req.path, qIdx + 1) : '';
+
+	// CORS 预检（v1.7.1）：外部浏览器/小程序跨域调用需要，204 直接放行。
+	if (method === 'OPTIONS') {
+		rawResponse(conn, 204, 'text/plain', '', {
+			'Access-Control-Allow-Origin': '*',
+			'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+			'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
+			'Access-Control-Max-Age': '86400',
+		});
+		return;
+	}
 
 	// /health 始终放行，便于探活与端口映射自检
 	let isHealth = (method === 'GET' && path === '/health');
@@ -4139,6 +5664,11 @@ function dispatch(conn, head, body) {
 	}
 
 	// GET /health
+	//
+	// 注意：本接口会调用 loadPool()。在 v1.7.5 之前，loadPool() 每个凭据要
+	// 解析 JWT 两次（credStatus 一次、取 sub 一次），在本机 ARMv8 上单次
+	// 解析 31ms，于是这个"轻量探活接口"实测要 66ms，而转发链路的同类开销
+	// 更高（130ms）。现已由 parseJwt 记忆化消除，本接口回到 3ms 量级。
 	if (isHealth) {
 		let pool = loadPool(cfg);
 		let ups = loadUpstreams();
@@ -4152,6 +5682,7 @@ function dispatch(conn, head, body) {
 			ok: true, service: 'luci-app-workbuddy',
 			hasToken: (length(pool) > 0),
 			credentials: length(pool),
+			credState: credSummary(pool),
 			authRequired: authRequired(cfg),
 			apiKeysDefined: apiKeysDefined(),
 			apiKeysActive: length(loadApiKeys()),
@@ -4164,6 +5695,15 @@ function dispatch(conn, head, body) {
 			upstreamKeys: upKeys,
 			version: APP_VERSION,
 		});
+		return;
+	}
+
+	// GET /metrics —— 可观测指标（v1.8.0）
+	//
+	// 与 /health 不同，这里**不绕过鉴权**：快照含每把 Key 的掩码、失败原因、
+	// 队列深度与流量规模，属运维信息，不该跟着 wan_access 一起暴露到公网。
+	if (method === 'GET' && path === '/metrics') {
+		jsonResponse(conn, 200, metricsSnapshot());
 		return;
 	}
 
@@ -4186,10 +5726,24 @@ function dispatch(conn, head, body) {
 		}
 
 		// 追加自定义上游的模型（逐个上游拉取其 /models）
+		//
+		// 实测：这一步原来每次都真去外呼上游，单个上游就要 1.66s —— 客户端每次
+		// 列模型都得干等，而模型列表几分钟内根本不变。改为按 TTL 缓存；管理页
+		// 改动上游会清缓存（见 saveUpstreamsFile），也可用 ?refresh=1 强制刷新。
+		let forceRefresh = (index(query, 'refresh=1') >= 0);
 		let ups = loadUpstreams();
 		for (let u in ups) {
 			if (!u.enabled) continue;
-			let remote = fetchUpstreamModels(u);
+			let ck = u.prefix + '|' + u.baseUrl + '|' + length(u.keys);
+			let ce = upModelCache[ck];
+			let remote;
+			if (!forceRefresh && ce && (time() - ce.at) < UP_MODEL_TTL) {
+				remote = ce.list;
+			} else {
+				remote = fetchUpstreamModels(u);
+				// 只在成功时写缓存：上游临时限流返回空列表时，别把它缓存 5 分钟
+				if (length(remote) > 0) upModelCache[ck] = { at: time(), list: remote };
+			}
 			for (let m in remote) {
 				push(data, {
 					id: u.prefix + '/' + m.id,
@@ -4338,6 +5892,75 @@ function onAccept(listenSock) {
 	conn.handle = uloop.handle(peer, () => onData(conn), uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
 }
 
+// ---------- 上游静默看门狗 ----------
+//
+// 目的：上游连接建立后长时间一个字节都不回（限流挂起、链路黑洞）时，主动断开
+// 并按既有重试链换 Key，而不是让客户端一直等到自己超时。
+//
+// 实测背景：修复前同一个聊天请求出现过 1.82s / 12.45s / 60s+（客户端 --max-time
+// 到点收 0 字节）三种结果，日志里是限流错误 + 固定 2 秒冷却导致的反复重试。
+//
+// 注意：uloop.timer 是一次性的（本文件 schedulePoll 也是每轮自己重排），
+// 所以每轮扫描结束必须再排一次。
+//
+// 分档逻辑（v1.8.2）：用 conn.attemptBytes 是否为空判断"还没收到过任何字节"。
+// attemptBytes 在每次尝试开始时清零（spawnUpstream / spawnUpstreamDirect），
+// 收到字节就累加，所以它天然就是"本次尝试是否已被上游受理"的标志位。
+//   - attemptBytes === 0：请求还没被受理 → 用 up_first_byte_sec（默认 12s）
+//   - attemptBytes > 0  ：流已建立、中途卡住 → 用 up_idle_sec（默认 60s）
+function watchdogTick() {
+	let now = time();
+	for (let c in connections) {
+		if (c.closed || !c.proc) continue;
+		let last = c.lastByteAt || 0;
+		if (last === 0) continue;
+		let idle = now - last;
+
+		// 首字节前 vs 流中，两档阈值与两套日志文案
+		let waitingFirstByte = !c.upstream || (c.attemptBytes || 0) === 0;
+		let limit, phase;
+		if (!c.upstream) {
+			limit = cfg.wbIdleSec;
+			phase = 'wb';
+		} else if (waitingFirstByte) {
+			limit = cfg.upFirstByteSec;
+			phase = '首字节';
+		} else {
+			limit = cfg.upIdleSec;
+			phase = '流中';
+		}
+		// 0 = 该档关闭
+		if (limit === 0 || idle < limit) continue;
+
+		// 日志区分两档：首字节档是"上游根本没受理"，流中档是"受理了但断流"，
+		// 排查时是完全不同的两个结论，不能混在一行里。
+		let which = (c.upstream ? (c.upTry || 0) : (c.tries || 0));
+		if (phase === '首字节') {
+			logErr(sprintf('upstream no first byte in %ds (>=%ds, key#%d, client %s), failover',
+				idle, limit, which, c.ip || '?'));
+		} else {
+			logErr(sprintf('upstream stalled %ds mid-stream (>=%ds, attempt %d, client %s), aborting',
+				idle, limit, which, c.ip || '?'));
+		}
+
+		// 先刷新计时，避免下一轮又对同一条连接重复触发
+		c.lastByteAt = now;
+
+		if (c.headersSent) {
+			// 已开始向客户端推流，无法回退重试，只能收尾
+			closeConn(c);
+			continue;
+		}
+		// 失败原因带上档位，冷却分档（isRateLimitReason）与事后统计都能看出来源
+		let why = (phase === '首字节')
+			? ('上游 ' + idle + 's 未返回首字节')
+			: ('上游流中静默 ' + idle + 's');
+		if (c.upstream) F.tryNextUpKey(c, why);
+		else F.tryNextCred(c, why);
+	}
+	idleTimer = uloop.timer(UP_IDLE_TICK_MS, () => watchdogTick());
+}
+
 // ---------- 启动 ----------
 
 function main() {
@@ -4359,7 +5982,9 @@ function main() {
 		logErr('bind failed on ' + cfg.host + ':' + cfg.port + ': ' + listenSock.error());
 		return;
 	}
-	if (!listenSock.listen(64)) {
+	// backlog 128：本服务对公网开了 18889（wan_access=1），默认 64 在突发时
+	// 会丢 SYN；内核 somaxconn 已是 4096，这里跟上即可。
+	if (!listenSock.listen(128)) {
 		logErr('listen failed: ' + listenSock.error());
 		return;
 	}
@@ -4386,6 +6011,26 @@ function main() {
 		availableModels(cfg);
 		logInfo('model cache warmed');
 	});
+
+	// 启动上游静默看门狗（自身按 UP_IDLE_TICK_MS 反复重排，句柄需持有）
+	idleTimer = uloop.timer(UP_IDLE_TICK_MS, () => watchdogTick());
+
+	// 启动排队超时扫描（同样自重置，句柄必须持有，否则定时器会被回收）
+	queueTimer = uloop.timer(UP_QUEUE_TICK_MS, () => queueTick());
+
+	logInfo(sprintf('forward tuning: idle=%ds/%ds first_byte=%ds rate_cool=%ds/%ds model_ttl=%ds backlog=128',
+		cfg.upIdleSec, cfg.wbIdleSec, cfg.upFirstByteSec, UP_RATE_COOL, UP_RATE_COOL_MAX, UP_MODEL_TTL));
+	// 上限为 0 是"不限流"而不是"闸门值 0"，日志里必须一眼看出这个区别
+	logInfo(sprintf('concurrency: up_inflight=%s wb_inflight=%s queue_max=%d queue_timeout=%ds',
+		cfg.upMaxInflight === 0 ? 'unlimited' : ('' + cfg.upMaxInflight),
+		cfg.wbMaxInflight === 0 ? 'unlimited' : ('' + cfg.wbMaxInflight),
+		cfg.queueMax, cfg.queueTimeout));
+	logInfo(sprintf('connection pool: %s (port=%d fail_cooldown=%ds)',
+		cfg.usePool ? 'on' : 'off', cfg.poolPort, POOL_FAIL_COOLDOWN));
+	// 刹车关闭时也要明确打出来，否则事后翻日志分不清"没触发"和"被关了"
+	logInfo(sprintf('rate-limit brake: %s (hits=%d/%ds -> brake %ds, retry_after max %ds)',
+		cfg.brakeHits > 0 ? 'on' : 'off',
+		cfg.brakeHits, cfg.brakeWindow, cfg.brakeSec, cfg.brakeMaxRa));
 
 	uloop.run();
 	uloop.done();
