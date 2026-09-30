@@ -999,6 +999,112 @@ v2.0 上线后做了一次深度审计与精简，**只删冗余、不改行为*
   上游错误（`NOT_FOUND`），转发链正常。
 
 
+## v2.1.0 可观测性与健壮性补强（10 项）
+
+v2.1.0 在 v2.0.1 精简版的基础上做了一轮可观测性与健壮性补强，
+每项改动都经过静态六项 + 单元测试 + `ucode -c`，并部署到真机
+完成 smoke / 并发 soak 验收。完整版本信息：
+
+| 项目 | 值 |
+|---|---|
+| APP_VERSION | `2.1.0` |
+| 文件 | `files/usr/share/ucode/workbuddy.uc` |
+| 字节 | 268465 |
+| MD5 | `5e95db867349d74e2da70b29f75537f8` |
+
+### ① 上游状态码捕获（`curl -D`）
+
+两条转发通道（池化 / 自定义上游）的 `curlArgs` 统一追加 `-D <每连接唯一
+响应头文件>`（`conn.hdrFile`）。失败路径（`tryNextCred` /
+`tryNextUpKey` / `onUpstreamEnd` / `onUpstreamDirectEnd`）通过
+`readUpstreamStatus(conn)` 读取该文件，拿到**真实的上游 HTTP 状态码**与
+`Retry-After` 响应头。池化路径同样生效（Go 池原样透传上游状态码与响应头）。
+
+### ② Retry-After 解析
+
+`readUpstreamStatus` 解析响应头文件中的 `Retry-After`（秒）。失败分类时：
+限流类失败且 `Retry-After > 0` 时，冷却时长取
+`max(基础冷却, min(Retry-After, MAX_RETRY_AFTER=300))`，不再盲目按固定值
+冷却；`markCredFail` 同样支持（仅当 `Retry-After > 60` 才覆盖其基础冷却）。
+
+### ③ 请求级关联 ID（`X-Request-Id`）
+
+`handleChat` / `handlePassthrough` 为每个连接生成 `conn.reqId`
+（12 位十六进制，熵源 `readRandom`）。上游请求追加 `X-Request-Id` 头，
+响应头（`jsonResponse` / `rawResponse` / `sseHeaders`）回带同一个
+`X-Request-Id`，客户端可用它关联日志与上游链路。
+
+### ④ 截断检测 + 补发 `event:error`
+
+流式累积时跟踪 `[DONE]`（`conn.sawDone`）。`notifyTruncation(conn)` 在满足
+「已发响应头且未发送 `[DONE]`」时补发 `event: error` 数据帧并计入
+`metrics.truncated`，然后关闭连接。触发点覆盖：`watchdogTick` 的
+`headersSent` 分支、`tryNextCred` / `tryNextUpKey` 的 `headersSent` 分支、
+`makeOnChunk` 的 `safeSend` 失败路径与读失败路径。正常结束不主动补发
+（`[DONE]` 并非所有上游都保证返回）。
+
+### ⑤ 退避加抖动（gRPC ±20% 口径）
+
+`jitterFactor()` 用 `readRandom` 读 1 字节映射到 `[0.8, 1.2)`，
+冷却时长 `cool = int(cool × jitter)` 且至少 1 秒。避免多把 Key 同时
+冷却结束时一起重试造成"同步 thundering herd"。
+
+### ⑥ 失败分类：429 不参与指数退避
+
+`markUpKeyFail` / `markCredFail` 现在按失败原因分类：
+限流类失败只累加 `probs`（观察用，/upstreams、/credentials、/metrics
+均展示），**不累加 `fails`、不参与指数退避**，冷却固定为
+`UP_RATE_COOL=5s`（或采信 `Retry-After`）；认证类失败冷却 60s 且
+`fails++`；其他软失败 2s 且 `fails++` 指数退避（×2，上限 20s）。
+这修复了原实现中"429 误伤最健康 Key"的问题（429 一多，健康 Key
+反而被退避到最久）。
+
+### ⑦ HTTP/1.1 连接复用 bug 修复
+
+原 `onData` 中 `conn.handle` 从不取消，同一 HTTP/1.1 连接上的第二个请求
+会在首个 SSE 流仍在飞行时**重入 `dispatch`**，覆盖 `conn.proc` /
+`sseBuf` / `upKeys`，使首个上游变孤儿。现在 `dispatch` 后立即取消读句柄
+并置 `null`（本服务响应一律 `Connection: close`，一条连接只服务一个请求），
+`closeConn` 仍安全（再次 `cancel` 被 `if (conn.handle)` 挡住）。
+
+### ⑧ send() 背压检查（`safeSend`）
+
+封装 `conn.sock.send()`：返回写入字节数小于 `length(data)` 或抛异常时
+计入 `metrics.sendFail` 并返回 `false`。替换全部 6 处裸 `send`（`sseHeaders`
+/ `makeOnChunk` / `jsonResponse` / `rawResponse` / `onUpstreamDirectEnd`
+两处）。写侧失败路径统一置 `conn.aborted = true` 并 `closeConn`，不再静默
+丢数据。
+
+### ⑨ 缓冲护栏（sseBuf / 请求体 413）
+
+非流式累积与首块错误嗅探路径的 `conn.sseBuf += chunk` 补上
+`MAX_SSE_BUF = 2MiB` 上限（此前仅流式路径有）；超限只记录不再增长。
+入站请求体新增 `MAX_BODY_BYTES = 8MiB` 上限：`Content-Length` 超限直接
+返回 `HTTP 413 {"error":{"message":"request body too large (>8MiB)"}}`，
+不再等待读满。
+
+### ⑩ abort 桶
+
+`onData` 检测到客户端断开（`recv` 异常 / null / 空）时置
+`conn.aborted = true`；`recordConnMetrics` 开头在
+`conn.aborted && conn.headersSent` 时计入 `metrics.chatAborted++`、
+`chatTotal++`、`histAdd total` 后直接返回（**不进 ok/fail**）。`/metrics`
+的 `chat` 快照新增 `aborted` / `truncated` / `sendFail` 三个字段。
+
+### 验收记录（真机，2026-10，`v2.1.0`）
+
+| 判据 | 结果 |
+|---|---|
+| 静态六项检查 | 全部 OK（顶层函数 218） |
+| 单元测试 | `==== ALL PASS ==== / UNIT_RC=0` |
+| `ucode -c` | RC=0 |
+| 非流式 smoke | `200`，正常返回 |
+| 流式 smoke | 45372 字节，含 `[DONE]`，`X-Request-Id` 回带 |
+| 并发 soak（10 并发 × 2 轮） | 全部 200 含 `[DONE]`，`truncated=0` |
+| 上游 429 分类 | 正确识别 `rate_limit_error`，`retry_after=8` 透传 |
+| `/metrics` | `aborted=0 / truncated=0 / sendFail=0`，per-key `probs` 展示 |
+| 9MB 请求体 | `HTTP 413` 正确返回 |
+
 ## 接入第三方客户端
 
 把「API 地址」填成 `http://<路由器IP或公网IP>:8789/v1`，密钥填上面生成的

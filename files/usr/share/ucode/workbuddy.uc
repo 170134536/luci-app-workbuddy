@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.0.1';
+const APP_VERSION = '2.1.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -113,6 +113,21 @@ function genApiKey() {
 	let h = sha256Hex(seed);
 	return 'wb-' + substr(h, 0, 8) + '-' + substr(h, 8, 4) + '-' +
 		substr(h, 12, 4) + '-' + substr(h, 16, 4) + '-' + substr(h, 20, 12);
+}
+
+// v2.1.0：生成请求级关联 ID（12 位 hex，随 X-Request-Id 透传上游并在日志/响应头出现）。
+// 熵源与 genApiKey 相同（时间戳 + 自增 + /dev/urandom），碰撞概率可忽略。
+function genReqId() {
+	let h = sha256Hex('' + time() + '.' + keySeq + readRandom(8));
+	return substr(h, 0, 12);
+}
+
+// v2.1.0：退避抖动因子，返回 [0.8, 1.2)。rand() 在本 ucode 构建不可用，
+// 用 clock() 的纳秒位做廉价伪随机 —— 对退避抖动足够（目的是打破多客户端
+// 同步重试，不需要密码学强度）。
+function jitterFactor() {
+	let ns = clock()[1];
+	return 0.8 + ((ns % 1000000) / 1000000.0) * 0.4;
 }
 
 // 原子写 JSON：先写临时文件再 rename，避免掉电/中断留下半截文件。
@@ -326,6 +341,12 @@ const UP_RATE_COOL = 5;         // 限流类：起始 5s，连续失败翻倍
 const UP_RATE_COOL_MAX = 20;    // 限流类冷却上限 20s
 const UP_AUTH_COOL = 60;        // 鉴权类：Key 疑似失效，最多避开 60s
 const UP_SOFT_COOL = 2;         // 空响应/网络抖动：短暂避让
+// v2.1.0：
+//   - 响应体/请求体上限（防极端大响应撑爆内存，见 makeOnChunk / onData）
+//   - Retry-After 解析后直接采信上游窗口时的上限（防恶意/异常大头把 Key 永久冷却）
+const MAX_SSE_BUF = 2097152;         // 2 MiB：所有响应体累积路径统一上限
+const MAX_BODY_BYTES = 8388608;      // 8 MiB：入站请求体 Content-Length 上限，超限回 413
+const MAX_RETRY_AFTER = 300;         // 5 分钟：直接采信 Retry-After 时的冷却上限
 //
 // 2) 上游静默看门狗。连接建立后连续 N 秒收不到任何字节即判定链路已死，
 //    主动断开并按既有逻辑换 Key —— 客户端不再干等到自己超时。
@@ -1018,21 +1039,37 @@ function usablePool(cfg) {
 	return ok;
 }
 
-// 标记凭据异常并进入冷却
-function markCredFail(cfg, id, reason) {
+// 标记凭据异常并进入冷却。retryAfter（秒）为上游响应头里的 Retry-After 窗口，
+// 仅在限流类失败时被采信（风控/鉴权类不采信 —— 那些是账号级问题，重试窗口没意义）。
+// rate 由调用方传入（isRateLimitReason 定义在本函数之后，ucode 不提升，不能在此调用）。
+function markCredFail(cfg, id, reason, rate, retryAfter) {
 	let now = time();
-	let st = credState[id] || { coolUntil: 0, fails: 0, lastErr: '' };
-	st.fails = (st.fails || 0) + 1;
+	let st = credState[id] || { coolUntil: 0, fails: 0, probs: 0, lastErr: '' };
+	let risk = isRiskControlReason(reason);
+	// v2.1.0：429/限流属于"暂时问题"（probs），不累计 fails —— fails 只反映
+	// 真正变冷的失败（风控/鉴权/网络），避免最健康的凭据因被限流而越排越后。
+	if (rate) st.probs = (st.probs || 0) + 1;
+	else st.fails = (st.fails || 0) + 1;
 	// 连续失败则指数退避，上限 10 分钟。
 	// 但"账号被风控"不是网络抖动，重试无意义 —— 直接给足 COOL_RISK
 	// 并跳过指数退避，让请求尽快落到池里其他账号上。
 	let cool;
-	if (isRiskControlReason(reason)) {
+	if (risk) {
 		cool = COOL_RISK;
 	} else {
 		cool = COOL_MS;
-		for (let i = 1; i < st.fails && cool < 600; i++) cool *= 2;
+		// v2.1.0：限流不再翻倍惩罚（有 Retry-After 时采信上游真实窗口）。
+		if (!rate) {
+			for (let i = 1; i < st.fails && cool < 600; i++) cool *= 2;
+		}
+		if (rate && retryAfter > cool) {
+			cool = retryAfter;
+			if (cool > MAX_RETRY_AFTER) cool = MAX_RETRY_AFTER;
+		}
 	}
+	// v2.1.0：退避加抖动，打破多客户端同步重试（gRPC 风格 ±20%）。
+	cool = int(cool * jitterFactor());
+	if (cool < 1) cool = 1;
 	st.coolUntil = now + cool;
 	st.lastErr = '' + reason;
 	credState[id] = st;
@@ -1042,6 +1079,7 @@ function markCredFail(cfg, id, reason) {
 function markCredOk(id) {
 	if (!credState[id]) return;
 	credState[id].fails = 0;
+	credState[id].probs = 0;
 	credState[id].coolUntil = 0;
 	credState[id].lastErr = '';
 }
@@ -1065,6 +1103,8 @@ function credSummary(pool) {
 			id: length(id) > 4 ? substr(id, length(id) - 4, 4) : id,
 			cooling: (st && st.coolUntil > now) ? (st.coolUntil - now) : 0,
 			fails: st ? (st.fails || 0) : 0,
+			// v2.1.0：429/限流类失败单独累计（不进 fails），这里单独暴露
+			probs: st ? (st.probs || 0) : 0,
 		};
 		if (st && st.lastErr) e.lastErr = st.lastErr;
 		push(out, e);
@@ -1321,6 +1361,11 @@ function initMetrics() {
 		chatFail: 0,        // 以 5xx 或 429 收尾
 		chatClientErr: 0,   // 以 4xx（非 429）收尾 —— 客户端问题，不算上游故障
 		rateLimited429: 0,  // 以 429 收尾（上游限流 + 本机排队超时/拒绝）
+		// v2.1.0：可观测性补齐 —— 客户端中途断开/写失败/截断流单独计数，
+		// 不再让"sseHeaders 一发出就记 chatOk"把取消/截断误算成成功。
+		chatAborted: 0,     // 客户端在响应完成前断开（写失败/读侧 EOF）
+		truncated: 0,       // 流式响应以非 [DONE] 终止（异常截断）次数
+		sendFail: 0,        // 向客户端写失败次数（短写/异常）
 		queued: 0,          // 曾经进过排队
 		queueTimeout: 0,    // 排队等到超时
 		queueRejected: 0,   // 队列已满被直接拒绝
@@ -1383,6 +1428,13 @@ function metricMode(conn) {
 function recordConnMetrics(conn) {
 	if (!conn.reqAt) return;   // 不是聊天请求（/health、/models、管理页等）
 	metrics.chatTotal++;
+	// v2.1.0：客户端在响应完成前断开（读侧 EOF / 写失败）单独记 abort 桶，
+	// 不再让 sseHeaders 先置的 httpStatus=200 把这类请求误算成成功。
+	if (conn.aborted) {
+		metrics.chatAborted++;
+		histAdd(metricMode(conn).total, nowMs() - conn.reqAt);
+		return;
+	}
 	let st = conn.httpStatus || 0;
 	if (st >= 200 && st < 300) metrics.chatOk++;
 	else if (st === 429) { metrics.rateLimited429++; metrics.chatFail++; }
@@ -1823,30 +1875,44 @@ function usableUpKeys(up, stickyFor) {
 	return out;
 }
 
-function markUpKeyFail(up, key, reason) {
+// 标记上游 Key 失败并进入冷却。retryAfter（秒）为上游响应头 Retry-After 窗口，
+// 仅在限流类失败时被采信（鉴权/瞬时错误不采信）。
+function markUpKeyFail(up, key, reason, retryAfter) {
 	let now = time();
 	let id = up.id + '|' + key;
-	let st = upState[id] || { coolUntil: 0, fails: 0, lastErr: '' };
-	st.fails = (st.fails || 0) + 1;
+	let st = upState[id] || { coolUntil: 0, fails: 0, probs: 0, lastErr: '' };
+
+	// v2.1.0：失败分类 —— 429/限流是"暂时问题"（probs），不累计 fails。
+	// 原实现把所有失败都累进 fails，限流也因此参与指数退避（5→10→20s），
+	// 最健康的 Key 反而因为被限流而越排越后（436faa3c B1）。
+	let rate = isRateLimitReason(reason);
+	let auth = isAuthReason(reason);
+	if (rate) st.probs = (st.probs || 0) + 1;
+	else st.fails = (st.fails || 0) + 1;
 
 	// 冷却时长按失败类型区分。
 	//
 	// 实测教训：这里曾固定冷却 2 秒。但上游限流是按 tpm/rpm 计的 —— 2 秒后该
 	// Key 又被选中、立刻再撞一次限流，一次客户端请求能在 4 个 Key 之间连撞多轮，
 	// 实测出现 12.45s 与 60s+ 的挂起。限流必须指数退避。
-	let rate = isRateLimitReason(reason);
-	let auth = isAuthReason(reason);
-
+	// v2.1.0 调整：限流不再指数翻倍（probs 不参与退避），改为固定基础冷却或
+	// 直接采信上游 Retry-After（更贴近真实窗口）；指数退避只保留给非限流失败。
 	let cool;
 	if (rate) {
 		cool = UP_RATE_COOL;
-		for (let i = 1; i < st.fails && cool < UP_RATE_COOL_MAX; i++) cool *= 2;
-		if (cool > UP_RATE_COOL_MAX) cool = UP_RATE_COOL_MAX;
+		if (retryAfter > cool) {
+			cool = retryAfter;
+			if (cool > MAX_RETRY_AFTER) cool = MAX_RETRY_AFTER;
+		}
 	} else if (auth) {
 		cool = UP_AUTH_COOL;
 	} else {
 		cool = UP_SOFT_COOL;
 	}
+
+	// v2.1.0：退避加抖动，打破多客户端同步重试（gRPC 风格 ±20%）。
+	cool = int(cool * jitterFactor());
+	if (cool < 1) cool = 1;
 
 	st.coolUntil = now + cool;
 	st.lastErr = '' + reason;
@@ -1897,6 +1963,7 @@ function markUpKeyOk(up, key) {
 	let id = up.id + '|' + key;
 	if (!upState[id]) return;
 	upState[id].fails = 0;
+	upState[id].probs = 0;
 	upState[id].coolUntil = 0;
 	upState[id].lastErr = '';
 }
@@ -2769,8 +2836,26 @@ function bridgeStart() {
 	logInfo('upstream bridge listening on 127.0.0.1:' + cfg.bridgePort);
 }
 
+// v2.1.0：流式截断检测。已向客户端推流但流未以 [DONE] 正常结束（看门狗 abort、
+// 换 Key 中断、上游缺失终止符等）时，补发一个 event:error 帧并计数 truncated，
+// 让客户端知道流不完整，而不是把半截流当成完整回答。
+// 注意 [DONE] 并非所有 SSE 上游的规范保证 —— 主上游 sensenova（OpenAI 兼容）
+// 会发送；若接入不发 [DONE] 的上游，此计数会偏高但仅补发 error 事件，不影响语义。
+function notifyTruncation(conn) {
+	if (!conn || conn.closed) return;
+	if (!conn.headersSent || conn.wantNonStream) return;
+	if (conn.sawDone) return;
+	metrics.truncated++;
+	if (conn.writeBroken) return;   // 写侧已坏（客户端断开），补发无意义
+	try {
+		conn.sock.send('event: error\r\n' +
+			'data: {"error":{"message":"stream ended without [DONE]","type":"stream_truncated"}}\r\n\r\n');
+	} catch (e) { }
+}
+
 function closeConn(conn) {
 	if (conn.closed) return;
+	notifyTruncation(conn);
 	conn.closed = true;
 	try {
 		if (conn.handle) conn.handle.cancel();
@@ -2784,6 +2869,10 @@ function closeConn(conn) {
 	bridgeRelease(conn);
 	try {
 		if (conn.tmpFile) unlink(conn.tmpFile);
+	} catch (e) { }
+	// v2.1.0：清理 curl -D 落盘的上游响应头文件。
+	try {
+		if (conn.hdrFile) unlink(conn.hdrFile);
 	} catch (e) { }
 
 	// 从在途连接表摘除并释放缓冲。
@@ -2818,6 +2907,47 @@ function closeConn(conn) {
 	}
 }
 
+// v2.1.0：带写侧检查的 send。ucode 的 Socket.send() 返回实际写入的字节数且总带
+// MSG_NOSIGNAL —— 客户端慢/断开会表现为短写（返回 n < length）而不是抛异常。
+// 所有面向客户端的写都必须经过这里：短写/异常即判定连接已不可用，记一次
+// sendFail 并返回 false（调用方负责 closeConn）。
+// 必须定义在 jsonResponse/rawResponse/sseHeaders/makeOnChunk 之前（ucode 不提升）。
+function safeSend(conn, data) {
+	if (conn.closed) return false;
+	try {
+		let n = conn.sock.send(data);
+		if (n === null || n !== length(data)) {
+			metrics.sendFail++;
+			conn.writeBroken = true;
+			return false;
+		}
+		return true;
+	} catch (e) {
+		metrics.sendFail++;
+		conn.writeBroken = true;
+		return false;
+	}
+}
+
+// v2.1.0：读取 curl -D 落盘的上游响应头文件，解析状态码与 Retry-After。
+// 返回 { status, retryAfter }（retryAfter 为秒数，无则为 0），文件不存在/不可读返回 null。
+// 池化路径同样有效：Go 池会原样透传上游状态码与全部非 hop 响应头（pool/main.go:405-413）。
+function readUpstreamStatus(conn) {
+	if (!conn || !conn.hdrFile) return null;
+	let raw = '';
+	try { raw = readfile(conn.hdrFile) || ''; } catch (e) { return null; }
+	if (length(raw) === 0) return null;
+	let status = 0;
+	let retryAfter = 0;
+	// 头文件第一行形如 "HTTP/1.1 429 Too Many Requests\r\n..."
+	let m = match(raw, /HTTP\/1\.[01] ([0-9]{3})/);
+	if (m) status = +m[1];
+	let ra = match(raw, /Retry-After:\s*([0-9]+)/i);
+	if (ra) retryAfter = +ra[1];
+	if (status === 0) return null;
+	return { status: status, retryAfter: retryAfter };
+}
+
 function jsonResponse(conn, status, obj, extraHeaders) {
 	if (conn.closed) return;
 	conn.httpStatus = status;   // 供 /metrics 判定结局，见 recordConnMetrics()
@@ -2827,6 +2957,8 @@ function jsonResponse(conn, status, obj, extraHeaders) {
 		for (let k in extraHeaders)
 			extra += k + ': ' + extraHeaders[k] + '\r\n';
 	}
+	// v2.1.0：回显请求级关联 ID，让客户端能按同一 ID 对账日志与响应。
+	let rid = conn.reqId ? ('X-Request-Id: ' + conn.reqId + '\r\n') : '';
 	let head = sprintf(
 		'HTTP/1.1 %d %s\r\n' +
 		'Content-Type: application/json\r\n' +
@@ -2834,11 +2966,11 @@ function jsonResponse(conn, status, obj, extraHeaders) {
 		'Connection: close\r\n' +
 		'Access-Control-Allow-Origin: *\r\n' +
 		'Access-Control-Allow-Headers: *\r\n' +
-		'%s' +
+		'%s%s' +
 		'\r\n',
-		status, httpStatusText(status), length(body), extra
+		status, httpStatusText(status), length(body), rid, extra
 	);
-	conn.sock.send(head + body);
+	if (!safeSend(conn, head + body)) conn.aborted = true;
 	closeConn(conn);
 }
 
@@ -2854,6 +2986,8 @@ function rawResponse(conn, status, ctype, body, extraHeaders) {
 		for (let k in extraHeaders)
 			extra += k + ': ' + extraHeaders[k] + '\r\n';
 	}
+	// v2.1.0：回显请求级关联 ID。
+	let rid = conn.reqId ? ('X-Request-Id: ' + conn.reqId + '\r\n') : '';
 	let head = sprintf(
 		'HTTP/1.1 %d %s\r\n' +
 		'Content-Type: %s\r\n' +
@@ -2861,11 +2995,11 @@ function rawResponse(conn, status, ctype, body, extraHeaders) {
 		'Connection: close\r\n' +
 		'Cache-Control: no-store\r\n' +
 		'X-Content-Type-Options: nosniff\r\n' +
-		'%s' +
+		'%s%s' +
 		'\r\n',
-		status, httpStatusText(status), ctype, length(body), extra
+		status, httpStatusText(status), ctype, length(body), rid, extra
 	);
-	conn.sock.send(head + body);
+	if (!safeSend(conn, head + body)) conn.aborted = true;
 	closeConn(conn);
 }
 
@@ -2877,6 +3011,8 @@ function textResponse(conn, status, title, body) {
 function sseHeaders(conn) {
 	if (conn.closed || conn.headersSent) return;
 	conn.httpStatus = 200;      // 已经开始推流即视为成功，见 recordConnMetrics()
+	// v2.1.0：回显请求级关联 ID。
+	let rid = conn.reqId ? ('X-Request-Id: ' + conn.reqId + '\r\n') : '';
 	let head =
 		'HTTP/1.1 200 OK\r\n' +
 		'Content-Type: text/event-stream\r\n' +
@@ -2886,8 +3022,13 @@ function sseHeaders(conn) {
 		'X-Accel-Buffering: no\r\n' +
 		'Connection: close\r\n' +
 		'Access-Control-Allow-Origin: *\r\n' +
+		rid +
 		'\r\n';
-	conn.sock.send(head);
+	if (!safeSend(conn, head)) {
+		conn.aborted = true;
+		closeConn(conn);
+		return;
+	}
 	conn.headersSent = true;
 }
 
@@ -3353,6 +3494,7 @@ function poolFallback(conn) {
 function beginAttempt(conn) {
 	conn.sseBuf = '';
 	conn.headersSent = false;
+	conn.sawDone = false;       // v2.1.0：每次尝试独立跟踪 [DONE]（截断检测）
 	// 本次尝试的计时与池化决策。这三个字段同时服务指标与回退判定，
 	// 每次尝试都必须清零 —— 否则上一轮的首字节时间会被算进这一轮的 TTFB。
 	conn.firstByteAt = 0;
@@ -3415,6 +3557,16 @@ function curlArgs(conn, o) {
 		push(args, shquote('-H'));
 		push(args, shquote('X-WB-Target: ' + o.target));
 	}
+	// v2.1.0：请求级关联 ID 透传上游。池化路径由 Go 池原样转发该头。
+	push(args, shquote('-H'));
+	push(args, shquote('X-Request-Id: ' + (conn.reqId || '')));
+	// v2.1.0：把上游响应头（状态行 + Retry-After 等）落盘到独立文件，供失败
+	// 路径解析真实状态码与限流窗口（readUpstreamStatus）。-D 只写头，不影响
+	// stdout 的 SSE body 逐字节透传。
+	if (conn.hdrFile) {
+		push(args, '-D');
+		push(args, shquote(conn.hdrFile));
+	}
 	push(args, shquote('--data-binary'));
 	push(args, shquote('@' + conn.tmpFile));
 	push(args, shquote(conn.usedPool
@@ -3452,7 +3604,9 @@ function makeOnChunk(conn, onFail, onEnd) {
 		}
 
 		if (conn.wantNonStream) {
-			conn.sseBuf += chunk;
+			// v2.1.0：非流式累积也加 MAX_SSE_BUF 上限（原无上限，极端大响应
+			// 会撑爆内存）。超限后不再累积但继续转发，收尾时按已攒内容合并。
+			if (length(conn.sseBuf) < MAX_SSE_BUF) conn.sseBuf += chunk;
 			return;
 		}
 
@@ -3462,21 +3616,23 @@ function makeOnChunk(conn, onFail, onEnd) {
 			let c = substr(t, 0, 1);
 			// 以 { 开头且没有 SSE 帧，或以 < 开头（网关 HTML 错误页）：
 			// 都可能是错误体，先攒着，等结束时判断是否要换凭据
+			// v2.1.0：错误嗅探累积同样加 MAX_SSE_BUF 上限。
 			if ((c === '{' || c === '<') && index(chunk, 'data:') < 0) {
-				conn.sseBuf += chunk;
+				if (length(conn.sseBuf) < MAX_SSE_BUF) conn.sseBuf += chunk;
 				return;
 			}
 			sseHeaders(conn);
 		}
-		try {
-			conn.sock.send(chunk);
-		} catch (e) {
+		// v2.1.0：写侧检查 —— 客户端慢/断开会短写，send 不再静默失败。
+		if (!safeSend(conn, chunk)) {
+			conn.aborted = true;
 			closeConn(conn);
 			return;
 		}
-		// v2.0：流式也累积响应体（上限 2MB，防极端大响应撑爆内存），
-		// 供收尾时提取 usage 做用量统计。
-		if (length(conn.sseBuf) < 2097152) conn.sseBuf += chunk;
+		// v2.0：流式也累积响应体（上限 MAX_SSE_BUF，防极端大响应撑爆内存），
+		// 供收尾时提取 usage 做用量统计。v2.1.0：顺带跟踪 [DONE] 用于截断检测。
+		if (index(chunk, '[DONE]') >= 0) conn.sawDone = true;
+		if (length(conn.sseBuf) < MAX_SSE_BUF) conn.sseBuf += chunk;
 	};
 }
 
@@ -3488,8 +3644,8 @@ function spawnUpstream(conn) {
 	conn.credId = cred.id;
 	beginAttempt(conn);
 
-	logInfo(sprintf('chat via credential %s (attempt %d/%d)',
-		cred.id, conn.tries, conn.tryLimit));
+	logInfo(sprintf('chat via credential %s (attempt %d/%d) req=%s',
+		cred.id, conn.tries, conn.tryLimit, conn.reqId || '?'));
 
 	// 带上客户端版本：上游目前不校验版本，但统一的 UA 更贴近真实客户端，
 	// 也便于日后上游若启用版本门禁时不必再改代码。
@@ -3551,10 +3707,16 @@ function tryNextCred(conn, reason) {
 	if (poolFallback(conn)) return;
 
 	if (reason) {
-		markCredFail(cfg, conn.credId, reason);
+		// v2.1.0：读取 curl -D 落盘的上游状态码与 Retry-After，让冷却窗口贴近
+		// 上游真实限流时长，而不是全靠本地猜测。
+		let hdr = readUpstreamStatus(conn);
+		let rate = isRateLimitReason(reason);
+		// 状态码为 429 但响应体没匹配到限流关键词时，以状态码为准（Anthropic
+		// spend-cap 429 与普通限流 error type 相同，只能靠 Retry-After 区分）。
+		if (hdr && hdr.status === 429 && !rate) rate = true;
+		markCredFail(cfg, conn.credId, reason, rate, hdr ? hdr.retryAfter : 0);
 		metricFail('wb', conn.credId,
-			isRateLimitReason(reason) ? 'rate'
-				: (isAuthReason(reason) ? 'auth' : ''), reason);
+			rate ? 'rate' : (isAuthReason(reason) ? 'auth' : ''), reason);
 	}
 
 	if (conn.headersSent) {
@@ -3657,22 +3819,12 @@ function spawnUpstreamDirect(conn) {
 
 	let key = conn.upKeys[conn.upTry];
 	conn.upTry++;
-	conn.sseBuf = '';
-	conn.headersSent = false;
-	// 本次尝试的计时与池化决策 —— 同 spawnUpstream，每轮必须清零，
-	// 否则上一轮的首字节时间会被算进这一轮 TTFB。
-	conn.firstByteAt = 0;
-	conn.attemptBytes = 0;
-	conn.attemptAt = nowMs();
-	conn.usedPool = poolUsable();
-	if (!conn.modeCounted) {
-		conn.modeCounted = true;
-		metricMode(conn).req++;
-		if (conn.usedPool) metrics.pool.used++;
-	}
+	// v2.0.1 抽取遗漏修复：与 spawnUpstream 相同的复位逻辑统一走 beginAttempt，
+	// 避免这份手写副本与 beginAttempt 在演进中分叉（原 v2.0.1 曾漏改这里）。
+	beginAttempt(conn);
 
-	logInfo(sprintf('chat via upstream %s key %s (attempt %d/%d)',
-		up.prefix, maskKey(key), conn.upTry, length(conn.upKeys)));
+	logInfo(sprintf('chat via upstream %s key %s (attempt %d/%d) req=%s',
+		up.prefix, maskKey(key), conn.upTry, length(conn.upKeys), conn.reqId || '?'));
 
 	// Accept 头必须跟着 body 的 stream 字段走。
 	// 自定义上游（sensenova 等）看到 Accept: text/event-stream 就会返回 SSE，
@@ -3773,8 +3925,11 @@ function tryNextUpKey(conn, reason) {
 		return;
 	}
 
-	if (reason && conn.upKeyInUse)
-		markUpKeyFail(conn.upstream, conn.upKeyInUse, reason);
+	if (reason && conn.upKeyInUse) {
+		// v2.1.0：读取真实状态码与 Retry-After，冷却贴近上游真实限流窗口。
+		let hdr = readUpstreamStatus(conn);
+		markUpKeyFail(conn.upstream, conn.upKeyInUse, reason, hdr ? hdr.retryAfter : 0);
+	}
 
 	// 记住最后一次失败原因：全部 Key 都用尽时，把它连同 Retry-After 一起返回给客户端
 	if (reason) conn.lastFailReason = '' + reason;
@@ -3837,7 +3992,7 @@ function onUpstreamDirectEnd(conn) {
 				rawResponse(conn, 200, 'application/json', raw, null);
 			} else {
 				sseHeaders(conn);
-				try { conn.sock.send(raw); } catch (e) { }
+				if (!safeSend(conn, raw)) conn.aborted = true;
 				closeConn(conn);
 			}
 			return;
@@ -3856,7 +4011,7 @@ function onUpstreamDirectEnd(conn) {
 		}
 		// 流式但上游没给 SSE：直接透传原始内容
 		sseHeaders(conn);
-		try { conn.sock.send(raw); } catch (e) { }
+		if (!safeSend(conn, raw)) conn.aborted = true;
 		closeConn(conn);
 		return;
 	}
@@ -4210,8 +4365,14 @@ function handleChat(conn, bodyRaw) {
 	}
 
 	conn.tmpFile = tmp;
+	// v2.1.0：curl -D 落盘的上游响应头文件 + 请求级关联 ID。
+	//   - 头文件供失败路径解析真实状态码与 Retry-After（readUpstreamStatus）
+	//   - reqId 随 X-Request-Id 透传上游，并在响应头回显，日志据此串起一次请求
+	conn.hdrFile = sprintf('/tmp/wb-hdr-%d-%d.txt', time(), clock()[1]);
+	conn.reqId = genReqId();
 	conn.wantNonStream = adapted.wantNonStream;
 	conn.sseBuf = '';
+	conn.sawDone = false;       // v2.1.0：流式是否已见 [DONE]（截断检测）
 	conn.tries = 0;
 	// 指标计时起点：从"确定要转发"算起，不含解析请求体的时间。
 	// 这个字段同时是"这是一条聊天请求"的标记 —— recordConnMetrics 靠它把
@@ -4349,8 +4510,14 @@ function handlePassthrough(conn, bodyRaw, path) {
 		return;
 	}
 	conn.tmpFile = tmp;
+	// v2.1.0：curl -D 落盘的上游响应头文件 + 请求级关联 ID。
+	//   - 头文件供失败路径解析真实状态码与 Retry-After（readUpstreamStatus）
+	//   - reqId 随 X-Request-Id 透传上游，并在响应头回显，日志据此串起一次请求
+	conn.hdrFile = sprintf('/tmp/wb-hdr-%d-%d.txt', time(), clock()[1]);
+	conn.reqId = genReqId();
 	conn.wantNonStream = adapted.wantNonStream;
 	conn.sseBuf = '';
+	conn.sawDone = false;       // v2.1.0：流式是否已见 [DONE]（截断检测）
 	conn.tries = 0;
 	conn.reqAt = nowMs();
 	conn.reqClient = conn.apiKeyName || conn.ip || '';
@@ -6065,6 +6232,8 @@ function metricsSnapshot() {
 				rateLimited: mk ? mk.rateLimited : 0,
 				authFail: mk ? mk.authFail : 0,
 				coolingSec: cool,
+				// v2.1.0：429/限流类失败次数（失败分类后与 fails 分开展示）
+				probs: st ? (st.probs || 0) : 0,
 				lastErr: (mk && mk.lastErr) ? mk.lastErr : ((st && st.lastErr) || ''),
 			});
 		}
@@ -6121,6 +6290,10 @@ function metricsSnapshot() {
 			fail: metrics.chatFail,
 			clientErr: metrics.chatClientErr,
 			rateLimited429: metrics.rateLimited429,
+			// v2.1.0：客户端断开 / 截断流 / 写失败单独成桶，不再混在 ok 里。
+			aborted: metrics.chatAborted,
+			truncated: metrics.truncated,
+			sendFail: metrics.sendFail,
 		},
 		queue: {
 			inflight: inflight,
@@ -6389,15 +6562,15 @@ function onData(conn) {
 	try {
 		chunk = conn.sock.recv(8192);
 	} catch (e) {
+		// v2.1.0：客户端断开是"abort"，单独计数，不再被误记为成功。
+		conn.aborted = true;
 		closeConn(conn);
 		return;
 	}
 
-	if (chunk === null) {
-		closeConn(conn);
-		return;
-	}
-	if (length(chunk) === 0) {
+	if (chunk === null || length(chunk) === 0) {
+		// v2.1.0：同上 —— recv 返回 null/空即对端关闭或连接已断。
+		conn.aborted = true;
 		closeConn(conn);
 		return;
 	}
@@ -6416,6 +6589,11 @@ function onData(conn) {
 		conn.head = head;
 		let cl = match(head, /\r\nContent-Length:\s*([0-9]+)/i);
 		conn.bodyLen = cl ? +cl[1] : 0;
+		// v2.1.0：入站请求体上限 —— 超大 Content-Length 直接 413，不等待读满。
+		if (conn.bodyLen > MAX_BODY_BYTES) {
+			jsonResponse(conn, 413, { error: { message: 'request body too large (>8MiB)' } });
+			return;
+		}
 	}
 
 	let got = length(conn.buf) - conn.headerEnd;
@@ -6424,6 +6602,12 @@ function onData(conn) {
 	let body = substr(conn.buf, conn.headerEnd, conn.bodyLen);
 	try {
 		dispatch(conn, conn.head, body);
+		// v2.1.0：HTTP/1.1 连接复用 bug 修复 —— 本服务响应一律 Connection: close，
+		// 一条连接只服务一个请求。若不在此取消读句柄，同一连接上的第二个请求
+		// 会在首个 SSE 流仍在飞行时重入 dispatch，覆盖 conn.proc/sseBuf/upKeys，
+		// 使首个上游变孤儿。取消后 closeConn 仍会安全地再次 cancel（已置 null）。
+		try { if (conn.handle) conn.handle.cancel(); } catch (e) { }
+		conn.handle = null;
 	} catch (e) {
 		logErr('dispatch error: ' + e);
 		jsonResponse(conn, 500, { error: { message: '' + e } });
@@ -6447,6 +6631,13 @@ function onAccept(listenSock) {
 		bodyLen: 0,
 		headerEnd: -1,
 		ip: (addr && addr.address) ? addr.address : '?',
+		// v2.1.0：新连接默认字段 —— abort 标记（客户端断开/写失败）、
+		// 截断检测与请求级关联 ID（由 handleChat/handlePassthrough 填充）。
+		aborted: false,
+		writeBroken: false,
+		sawDone: false,
+		reqId: '',
+		hdrFile: null,
 	};
 	push(connections, conn);
 
