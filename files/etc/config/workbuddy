@@ -170,5 +170,20 @@ config workbuddy 'main'
 	# 关闭后 v1.8.2 的静默截断缺陷会重新出现，仅用于诊断对比与紧急回退。
 	option bridge_port '8791'
 
+	# ---------- v2.0：会话粘性 / 内网上游 / 上游缓存 ----------
+	#
+	# 会话粘性（session affinity，借鉴 gpt-load / sub2api 的同一会话粘同一 Key）：
+	# 同一客户端（按 API Key 名，未鉴权时按来源 IP）在窗口期内始终命中同一把
+	# Key，避免多轮对话在 4 把 Key 之间乱跳导致上下文缓存（prompt caching）
+	# 完全失效 —— 同一 Key 连续提问才能吃到上游的缓存命中，既省钱又省 TTFB。
+	# 窗口到期或该 Key 冷却后自然失效，重新按权重轮询。
+	option up_sticky_sec '900'
+
+	# 是否允许自定义上游指向内网/本机地址（1 允许 / 0 禁止）。
+	# 禁止后 baseUrl 不能是 localhost、127.*、10.*、192.168.*、172.16-31.*、
+	# ::1、fc00::/7、fe80::/10 —— 防止有人把中转当跳板打内网（SSRF 防护）。
+	# 本机自己的凭据池通道（workbuddy/ 前缀）不受此限制。
+	option allow_private_upstream '1'
+
 	# 调试日志（1 输出更多信息）
 	option debug '0'

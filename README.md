@@ -840,6 +840,105 @@ ucode 的 **`popen()` 管道 + uloop 读循环在并发下会丢可读事件**�
 - 对比 v1.8.1 的 TTFB `2.25 / 31.82 / 34.03 s`：**每条请求都是 30 s 级的长尾被彻底消掉**。
 
 
+## v2.0 重大升级（转发速度 + 转发能力）
+
+v2.0 在 v1.8.4 的稳定性地基上做了**能力升级**，共 9 项，全部已通过
+单元测试、静态检查、`ucode -c`、真机 60 并发 soak 验收：
+
+### ① 会话粘性（session affinity）
+
+同一客户端（按 API 密钥名；未鉴权时按来源 IP）在 **`up_sticky_sec`（默认 900s）**
+窗口内始终命中同一把上游 Key，避免多轮对话在 4 把 Key 之间乱跳导致
+上游的 prompt caching 完全失效 —— 同一把 Key 连续提问才能吃到缓存命中，
+既省钱又省 TTFB。
+
+- 实现：`usableUpKeys()` 把粘性 Key 提到最前；`markUpKeyOk()`/`markUpKeyFail()`
+  写入 `upSticky`；窗口到期或该 Key 冷却后自然失效，重新按权重轮询。
+- 关闭：`option up_sticky_sec '0'`。
+
+### ② 每 Key 权重（weighted rotate）
+
+管理页粘贴 Key 时支持 `key|权重` 格式（权重为 ≥1 的整数，默认 1）。
+`sk-aaaa|3` 表示这把 Key 的被选中概率是普通 Key 的 3 倍（按权重取模轮询，
+不是简单随机）。权重只影响**健康 Key 内部**的轮询分布；失效 Key 仍走冷却与跳过。
+全部 Key 权重为 1 时退化为普通轮询，且不会把权重字段写进旧格式的
+`upstreams.json`（保持旧文件兼容）。
+
+### ③ 上游列表 TTL 缓存
+
+`loadUpstreams()` 的结果带 **2 秒 TTL 缓存**（`UPSTREAM_CACHE_TTL=2`），
+避免每个请求都重新读盘解析 `upstreams.json`。保存/编辑上游时显式失效缓存。
+
+### ④ Token 用量统计
+
+每次成功请求后从上游响应的 `usage` 字段提取 `prompt/completion/total`，
+按 **上游 / 上游+Key / 客户端** 三个维度累计，并实时反映在：
+
+- `/metrics` 顶层的 `usage` 段（含 `text` 缩写，如 `2.8k/4.0k/6.7k`）
+- 每个 upstream / 每把 Key 的 `usage` 与 `usageText` 字段
+- 管理页「服务器管理」卡片上的「用量」行，以及 Key 徽标的 tooltip
+
+### ⑤ 通用端点透传（passthrough）
+
+不再只支持 `/v1/chat/completions` 与 `/v1/models` —— **任意端点**
+（`/v1/embeddings`、`/v1/responses`、`/v1/audio/transcriptions` 等）都会原样
+透传给对应上游：`/v1/embeddings` 交给上游的 `/v1/embeddings`，
+未知前缀返回 400 `unknown upstream prefix: <prefix>`。
+
+- 自定义上游：请求路径拼在 baseUrl 之后（Go 连接池 `joinPath` 已支持任意端点）。
+- WorkBuddy 内置通道：`workbuddy/` 前缀走凭据池，池空时返回 502
+  `WorkBuddy credentials unavailable`。
+- 鉴权、刹车、静默看门狗、回环桥等既有能力对透传请求同样生效。
+
+### ⑥ SSRF 防护：`allow_private_upstream`
+
+默认 **允许**自定义上游指向内网/本机地址（`allow_private_upstream '1'`）。
+设为 `'0'` 后，`baseUrl` 不能是 `localhost`、`127.*`、`10.*`、`192.168.*`、
+`172.16-31.*`、`::1`、`fc00::/7`、`fe80::/10`，防止把中转当跳板打内网。
+本机自己的凭据池通道（`workbuddy/` 前缀）不受此限制。
+
+### ⑦ `X-Accel-Buffering: no`
+
+流式响应头新增 `X-Accel-Buffering: no`，避免中间层（nginx、LuCI 的
+proxy 插件等）缓冲 SSE 流导致首字节延迟。
+
+### ⑧ 管理页展示权重与用量
+
+- 服务器卡片上，权重 >1 的 Key 显示 `×N` 徽标，tooltip 显示
+  「权重 N，用量 x/y/z tokens」。
+- 卡片新增「用量」行，展示该上游累计的 prompt/completion/total。
+- 「改 Key」弹窗明确说明 `key|权重` 格式。
+
+### ⑨ UCI 新增配置项
+
+```uci
+# 会话粘性时长（秒），0=关闭粘性
+option up_sticky_sec '900'
+# 是否允许自定义上游指向内网/本机地址（SSRF 防护）
+option allow_private_upstream '1'
+```
+
+### v2.0 验收记录（真机 soak，12 批 × 5 = 60 并发，长回复流式）
+
+| 判据 | 结果 |
+|---|---|
+| 客户端状态码 | **24× `200`** / 36× `429` / 0× `000` |
+| 流式 body 完整（含 `[DONE]`） | **24 / 24** |
+| `TRUNCATED (no [DONE])` | **0** |
+| `size == 16384` 恰好 / 16384 整数倍 | **0 / 0** |
+| `no finish_reason` | **0** |
+| ucode 进程存活 | **pid 14774 全程未变** |
+| 客户端 TTFB p50 / p90 / p99 / max | **0.23 / 1.84 / 4.07 / 4.07 s** |
+| ≥20s 请求 | **0** |
+| 池复用率 | **0.945** |
+| 桥连接采样（每批 3s） | 9 → 86，随批内并发单调变化 |
+
+- 36 个 `429` 全是上游限流（rpm exhausted / tpm 超限）被刹车正确拦截的
+  JSON 错误体，与配额波动一致，没有 `code=000`。
+- 用量统计在 soak 后准确累计：`usage {prompt:2763, completion:3969,
+  total:6732}`，且按 3 把实际命中的 Key 正确拆分（`byKey`）。
+
+
 ## 接入第三方客户端
 
 把「API 地址」填成 `http://<路由器IP或公网IP>:8789/v1`，密钥填上面生成的

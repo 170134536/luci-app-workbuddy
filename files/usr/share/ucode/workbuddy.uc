@@ -35,7 +35,7 @@ function logErr(msg) { logMsg('error', msg); }
 // ---------- 常量 ----------
 
 const LOG_TAG = 'workbuddy';
-const APP_VERSION = '1.8.4';
+const APP_VERSION = '2.0.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -427,6 +427,19 @@ const POOL_CONNECT_TIMEOUT = 3;      // 走回环时连接超时要短，才能�
 const BRIDGE_PORT_DEFAULT = 8791;
 const NC_PATH = '/usr/bin/nc';
 
+// ---------- v2.0：能力扩展 ----------
+//
+// 1) 上游列表缓存。loadUpstreams() 现在带 TTL 缓存（外部直接编辑
+//    /etc/workbuddy/upstreams.json 后最多 UPSTREAM_CACHE_TTL 秒生效；
+//    管理页保存路径会主动失效缓存，不受此延迟影响）。
+const UPSTREAM_CACHE_TTL = 2;
+
+// 2) 会话粘性（session affinity）。同一客户端（API Key 名或 IP）在
+//    up_sticky_sec 内优先复用同一把上游 Key，降低多 Key 轮询导致同一会话
+//    上下文在多个账号间跳变、进而触发上游多账号风控的几率。
+//    默认 900 秒（15 分钟）；配 0 关闭粘性，退回纯轮询。
+const UP_STICKY_SEC_DEFAULT = 900;
+
 //
 // 6) 上游限流刹车（v1.8.1）。
 //
@@ -582,6 +595,9 @@ function loadConfig() {
 		up_idle_sec: '25',       // 首字节之后的流中静默上限，0=关闭该档
 		up_first_byte_sec: '12', // 首字节等待上限，0=关闭该档
 		wb_idle_sec: '75',       // WorkBuddy 通道静默上限，0=关闭该档
+		// ---------- v2.0 ----------
+		up_sticky_sec: '900',        // 会话粘性时长（秒），0=关闭粘性
+		allow_private_upstream: '1', // 是否允许自定义上游指向内网/本机地址
 	};
 
 	let ctx = uci.cursor();
@@ -655,6 +671,11 @@ function loadConfig() {
 	// ---------- v1.8.3：上游响应回环桥 ----------
 	// 0 = 关闭回环桥，退回直接 popen 读取（保留 v1.8.2 行为）。
 	cfg.bridgePort = numOr(cfg.bridge_port, BRIDGE_PORT_DEFAULT, 0, 65535);
+
+	// ---------- v2.0：会话粘性 / 私有上游 ----------
+	cfg.upStickySec = numOr(cfg.up_sticky_sec, UP_STICKY_SEC_DEFAULT, 0, 86400);
+	// 公网只允许显式写 '0' 才算关闭，避免历史配置缺项被误判成禁止。
+	cfg.allowPrivateUpstream = (('' + cfg.allow_private_upstream) !== '0');
 
 	return cfg;
 }
@@ -1324,6 +1345,11 @@ function initMetrics() {
 		// 全是 waited 说明闭闸时长设得偏长（每次都能等到）。
 		brakeRejected: 0,
 		brakeWaited: 0,
+		// v2.0：token 用量统计。来自上游响应的 usage 字段（SSE 流取末块）。
+		usage: { prompt: 0, completion: 0, total: 0 },
+		usageByUp: {},      // upstreamId -> usage
+		usageByKey: {},     // upstreamId|maskedKey -> usage
+		usageByClient: {},  // apiKeyName|ip -> usage
 	};
 }
 
@@ -1374,10 +1400,23 @@ function recordConnMetrics(conn) {
 }
 
 // 读取上游配置。返回数组，每条形如：
-//   { id, name, prefix, baseUrl, keys: [...], enabled, createdAt }
+//   { id, name, prefix, baseUrl, keys: [...], weights: {...}, enabled, createdAt }
+// v2.0：loadUpstreams 的 TTL 缓存：{ at, list }
+// 必须声明在 loadUpstreams() 之前（ucode 不提升声明，见下）。
+let upstreamCache = { at: 0, list: null };
+
 function loadUpstreams() {
+	// v2.0：TTL 缓存。管理页保存路径会主动失效（见 saveUpstreamsFile），
+	// 外部直接编辑文件最多延迟 UPSTREAM_CACHE_TTL 秒生效。
+	let now = time();
+	if (upstreamCache.list !== null && (now - upstreamCache.at) < UPSTREAM_CACHE_TTL)
+		return upstreamCache.list;
+
 	let j = readJsonFile(UPSTREAM_FILE);
-	if (!j || type(j.upstreams) !== 'array') return [];
+	if (!j || type(j.upstreams) !== 'array') {
+		upstreamCache = { at: now, list: [] };
+		return [];
+	}
 	let out = [];
 	for (let u in j.upstreams) {
 		if (type(u) !== 'object' || u === null) continue;
@@ -1401,16 +1440,28 @@ function loadUpstreams() {
 			}
 		}
 
+		// v2.0：权重表 { key: 权重 }。只保留 >=1 的数值，其余忽略。
+		let weights = {};
+		if (type(u.weights) === 'object' && u.weights !== null) {
+			for (let wk in u.weights) {
+				let wt = +u.weights[wk];
+				if (!(wt >= 1)) continue;
+				weights[wk] = wt;
+			}
+		}
+
 		push(out, {
 			id: id,
 			name: '' + (u.name || prefix),
 			prefix: prefix,
 			baseUrl: baseUrl,
 			keys: keys,
+			weights: weights,
 			enabled: (u.enabled !== false),
 			createdAt: +u.createdAt || 0,
 		});
 	}
+	upstreamCache = { at: now, list: out };
 	return out;
 }
 
@@ -1418,6 +1469,8 @@ function loadUpstreams() {
 let upState = {};
 // v1.8.1 上游级限流刹车状态：upId -> { hits, winStart, openUntil, trip, waited, rejected }
 let upBrake = {};
+// v2.0：会话粘性表：upId|client -> { key, until }（client 为 API Key 名或客户端 IP）
+let upSticky = {};
 
 // 【提前声明，勿删】v1.8.1：cfg 原本只在「连接处理」区 `let cfg = loadConfig();`（约 2842 行），
 // 但 brakeNoteRateLimit() / brakeLeft() 定义在 1471 / 1460 行、需要读 cfg.brakeHits 等。
@@ -1618,7 +1671,32 @@ function saveUpstreamsFile(j) {
 	// 上游配置变了（增删 / 改 Key / 停用），模型列表缓存必须作废，
 	// 否则管理页改完还要等 TTL 到期才看得到新模型。
 	upModelCache = {};
+	// v2.0：loadUpstreams 的 TTL 缓存同样立即失效。
+	upstreamCache = { at: 0, list: null };
 	return true;
+}
+
+// v2.0：判断主机名/地址是否属于内网或本机。allow_private_upstream=0 时
+// 不允许自定义上游指向这些地址，防止管理面被攻破后借本机做内网跳板。
+function isPrivateHost(host) {
+	let h = lc('' + (host || ''));
+	if (h === 'localhost') return true;
+	// IPv4 私网/回环段
+	let m = match(h, /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+	if (m) {
+		let a = +m[1];
+		let b = +m[2];
+		if (a === 10) return true;
+		if (a === 127) return true;
+		if (a === 192 && b === 168) return true;
+		if (a === 172 && b >= 16 && b <= 31) return true;
+		return false;
+	}
+	// IPv6 回环 / ULA / link-local（尽力匹配；路由器上上游地址几乎都是 IPv4）
+	if (h === '::1') return true;
+	if (substr(h, 0, 2) === 'fc' || substr(h, 0, 2) === 'fd') return true;
+	if (substr(h, 0, 5) === 'fe80:') return true;
+	return false;
 }
 
 // 校验上游地址：只允许 http/https，且必须以 /v1 之类路径结尾。
@@ -1630,6 +1708,13 @@ function normalizeBaseUrl(raw) {
 
 	let low = lc(u);
 	if (substr(low, 0, 7) !== 'http://' && substr(low, 0, 8) !== 'https://') return null;
+
+	// v2.0：allow_private_upstream=0 时拒绝内网/本机地址（见 isPrivateHost）。
+	if (cfg && cfg.allowPrivateUpstream === false) {
+		let hm = match(low, /^https?:\/\/([^\/:]+)/);
+		let host = hm ? lc('' + hm[1]) : '';
+		if (length(host) > 0 && isPrivateHost(host)) return null;
+	}
 
 	// 去掉结尾斜杠，避免拼出 //v1/chat/completions
 	while (length(u) > 0 && substr(u, length(u) - 1, 1) === '/')
@@ -1666,7 +1751,35 @@ function normalizePrefix(raw) {
 //
 // 为什么健康 Key 优先且轮询：正常流量在 Key 之间均摊（负载均衡），
 // 刚失败的 Key 不会被新流量立刻再撞一次，但它**仍然排在队里**、随时可被尝试。
-function usableUpKeys(up) {
+// v2.0 增强：支持 per-Key 权重（weightedRotate）与会话粘性（upSticky）。
+// 权重只影响"健康 Key"内部的轮询分布；粘性只对同一客户端（apiKeyName 或 IP）
+// 生效：若该客户端上次成功用的 Key 仍然健康，就把它排在最前。
+function weightedRotate(up, keys) {
+	let n = length(keys);
+	let w = [];
+	let total = 0;
+	for (let i = 0; i < n; i++) {
+		let wt = (up.weights && up.weights[keys[i]]) || 1;
+		if (!(wt >= 1)) wt = 1;
+		w[i] = wt;
+		total += wt;
+	}
+	// 游标按权重取模定位首个键；权重全为 1 时退化为普通轮询。
+	let start = upCursor[up.id] || 0;
+	upCursor[up.id] = start + 1;
+	let pos = start % total;
+	let first = 0;
+	let acc = 0;
+	for (let i = 0; i < n; i++) {
+		acc += w[i];
+		if (pos < acc) { first = i; break; }
+	}
+	let out = [];
+	for (let i = 0; i < n; i++) push(out, keys[(first + i) % n]);
+	return out;
+}
+
+function usableUpKeys(up, stickyFor) {
 	let clean = [];
 	let rec = [];
 	for (let k in up.keys) {
@@ -1674,14 +1787,26 @@ function usableUpKeys(up) {
 		if (st && st.fails > 0) push(rec, k); else push(clean, k);
 	}
 
-	// 健康 Key 之间严格轮播（沿用 upCursor），避免单把 Key 过载。
+	// 健康 Key 之间按权重轮播（weightedRotate），避免单把 Key 过载。
 	let n = length(clean);
-	if (n > 1) {
-		let start = (upCursor[up.id] || 0) % n;
-		let rot = [];
-		for (let i = 0; i < n; i++) push(rot, clean[(start + i) % n]);
-		upCursor[up.id] = (start + 1) % n;
-		clean = rot;
+	if (n > 1) clean = weightedRotate(up, clean);
+
+	// v2.0 会话粘性：同一客户端上次成功用的 Key 若仍健康，排到最前。
+	if (length(stickyFor) > 0 && length(clean) > 1) {
+		let s = upSticky[up.id + '|' + stickyFor];
+		let stickyKey = (s && s.key && s.until > time()) ? s.key : '';
+		if (length(stickyKey) > 0) {
+			let si = -1;
+			for (let i = 0; i < length(clean); i++)
+				if (clean[i] === stickyKey) { si = i; break; }
+			if (si > 0) {
+				let rot = [];
+				push(rot, stickyKey);
+				for (let i = 0; i < length(clean); i++)
+					if (i !== si) push(rot, clean[i]);
+				clean = rot;
+			}
+		}
 	}
 
 	// 恢复中的 Key：冷却结束早的排前面（先试最可能已恢复的那把）。
@@ -1793,6 +1918,97 @@ function markUpKeyOk(up, key) {
 	upState[id].lastErr = '';
 }
 
+// ---------- v2.0：成功收尾 / token 用量统计 ----------
+
+// 上游 Key 成功时统一记录：成功计数 + 会话粘性绑定。
+// onUpstreamDirectEnd 的两个成功分支都调它，保证计数与粘性同步。
+function noteUpstreamSuccess(conn) {
+	if (conn.upstream && conn.upKeyInUse) {
+		markUpKeyOk(conn.upstream, conn.upKeyInUse);
+		if (length(conn.stickyFor) > 0 && cfg.upStickySec > 0)
+			upSticky[conn.upstream.id + '|' + conn.stickyFor] = {
+				key: conn.upKeyInUse,
+				until: time() + cfg.upStickySec,
+			};
+	}
+}
+
+// 从上游响应文本提取 usage。支持两种形态：
+//   1) 非流式：整个 body 就是 JSON，直接取 .usage；
+//   2) 流式 SSE：最后一个非 [DONE] 的 `data:` 块通常带 usage，取该块 JSON 的 .usage。
+// 解析不到返回 null（不计数 —— 不能让错误/空响应当成功用量算进去）。
+function extractUsage(text) {
+	if (type(text) !== 'string' || length(text) === 0) return null;
+	let t = trim(text);
+	let obj = null;
+	if (substr(t, 0, 1) === '{') {
+		try { obj = json(t); } catch (e) { obj = null; }
+	} else {
+		let lines = split(t, '\n');
+		for (let i = length(lines) - 1; i >= 0; i--) {
+			let ln = trim(lines[i]);
+			if (substr(ln, 0, 5) !== 'data:') continue;
+			let payload = trim(substr(ln, 5));
+			if (payload === '[DONE]') continue;
+			try { obj = json(payload); } catch (e) { obj = null; }
+			break;
+		}
+	}
+	if (type(obj) !== 'object' || obj === null) return null;
+	let u = obj.usage;
+	if (type(u) !== 'object' || u === null) return null;
+	let prompt = +u.prompt_tokens || 0;
+	let completion = +u.completion_tokens || 0;
+	let total = +u.total_tokens || (prompt + completion);
+	if (total <= 0 && prompt <= 0 && completion <= 0) return null;
+	return { prompt: prompt, completion: completion, total: total };
+}
+
+// 成功请求收尾时累加 token 用量到全局 / 上游 / Key / 客户端四个维度。
+function recordUsage(conn, usage) {
+	if (!conn || !usage) return;
+	metrics.usage.prompt += usage.prompt;
+	metrics.usage.completion += usage.completion;
+	metrics.usage.total += usage.total;
+
+	let upId = conn.upstream ? conn.upstream.id : (conn.credId ? 'wb:' + conn.credId : '');
+	if (length(upId) > 0) {
+		let uu = metrics.usageByUp[upId] || { prompt: 0, completion: 0, total: 0 };
+		uu.prompt += usage.prompt;
+		uu.completion += usage.completion;
+		uu.total += usage.total;
+		metrics.usageByUp[upId] = uu;
+	}
+	if (conn.upKeyInUse) {
+		let kid = upId + '|' + maskKey(conn.upKeyInUse);
+		let uk = metrics.usageByKey[kid] || { prompt: 0, completion: 0, total: 0 };
+		uk.prompt += usage.prompt;
+		uk.completion += usage.completion;
+		uk.total += usage.total;
+		metrics.usageByKey[kid] = uk;
+	}
+	if (length(conn.reqClient) > 0) {
+		let uc = metrics.usageByClient[conn.reqClient] || { prompt: 0, completion: 0, total: 0 };
+		uc.prompt += usage.prompt;
+		uc.completion += usage.completion;
+		uc.total += usage.total;
+		metrics.usageByClient[conn.reqClient] = uc;
+	}
+}
+
+// 把 usage 对象格式化成 "prompt/completion/total"，如 "1.2k/3.4k/4.6k"。
+function fmtUsage(u) {
+	if (!u) return '';
+	let fmt = function(n) {
+		// 注意用 /1000.0 而不是 /1000：ucode 里两个整数相除是整除（10/3=3），
+		// 1.2M 会被截成 1M。除一个浮点字面量才能得到真正的浮点商。
+		if (n >= 1000000) return sprintf('%.1fM', n / 1000000.0);
+		if (n >= 1000) return sprintf('%.1fk', n / 1000.0);
+		return sprintf('%d', n);
+	};
+	return fmt(u.prompt) + '/' + fmt(u.completion) + '/' + fmt(u.total);
+}
+
 // 按前缀查找已启用的自定义上游
 function findUpstreamByPrefix(prefix) {
 	let list = loadUpstreams();
@@ -1872,6 +2088,37 @@ function splitModelRef(model) {
 	return { prefix: prefix, model: rest };
 }
 
+// v2.0：解析管理页粘贴的 Key 文本。每行一把 Key，支持可选权重：
+//   sk-xxx
+//   sk-yyyy|3
+// 返回 { keys: [...], weights: { key: 权重 } }。权重缺省为 1；重复项去重
+// （首个出现的权重优先）。全部为空返回空数组。
+function parseKeysText(keysText) {
+	let keys = [];
+	let weights = {};
+	let seen = {};
+	// split(subject, separator) —— 顺序不能反，见 addUpstream 的说明
+	let lines = split('' + (keysText || ''), '\n');
+	for (let ln in lines) {
+		let t = trim(ln);
+		if (length(t) === 0) continue;
+		let key = t;
+		let wt = 1;
+		let bar = index(t, '|');
+		if (bar >= 0) {
+			key = trim(substr(t, 0, bar));
+			let w = +trim(substr(t, bar + 1));
+			if (w >= 1) wt = w;
+		}
+		if (length(key) === 0) continue;
+		if (seen[key]) continue;
+		seen[key] = true;
+		push(keys, key);
+		if (wt !== 1) weights[key] = wt;
+	}
+	return { keys: keys, weights: weights };
+}
+
 function addUpstream(name, prefix, baseUrl, keysText) {
 	let j = readJsonFile(UPSTREAM_FILE);
 	if (!j || type(j.upstreams) !== 'array') j = { upstreams: [] };
@@ -1881,7 +2128,7 @@ function addUpstream(name, prefix, baseUrl, keysText) {
 	let url = normalizeBaseUrl(baseUrl);
 
 	if (pf === null) return { ok: false, error: '前缀非法：只能用小写字母/数字/-/_，长度 2-32' };
-	if (url === null) return { ok: false, error: 'API 地址非法：必须是 http:// 或 https:// 开头' };
+	if (url === null) return { ok: false, error: 'API 地址非法：必须是 http(s):// 开头，且不允许指向内网/本机地址（allow_private_upstream=0）' };
 
 	// 前缀不能与已有上游重复，否则路由会有歧义
 	for (let u in j.upstreams) {
@@ -1889,20 +2136,9 @@ function addUpstream(name, prefix, baseUrl, keysText) {
 			return { ok: false, error: '前缀「' + pf + '」已被占用' };
 	}
 
-	// Key 按行拆分（与 dsh-free-models-hub 的粘贴方式一致）。
-	// 注意：ucode 的签名是 split(subject, separator)，与 JS 的 str.split(sep)
-	// 方向相反。写成 split('\n', text) 会按字面字符 'n' 切分并返回单元素数组，
-	// 表现为"粘了一堆 Key 却提示至少需要一条"（踩坑记录 #13）。
-	let keys = [];
-	let seen = {};
-	let lines = split('' + (keysText || ''), '\n');
-	for (let ln in lines) {
-		let t = trim(ln);
-		if (length(t) === 0) continue;
-		if (seen[t]) continue;
-		seen[t] = true;
-		push(keys, t);
-	}
+	// v2.0：Key 按行拆分，支持 `sk-xxx|权重` 格式（见 parseKeysText）。
+	let parsed = parseKeysText(keysText);
+	let keys = parsed.keys;
 	if (length(keys) === 0) return { ok: false, error: '至少需要一条 Key' };
 
 	let base = 'u' + time();
@@ -1921,6 +2157,8 @@ function addUpstream(name, prefix, baseUrl, keysText) {
 		enabled: true,
 		createdAt: time(),
 	};
+	// 权重非默认（存在 >1 的项）时才写入文件，保持旧文件格式不变。
+	if (length(parsed.weights) > 0) entry.weights = parsed.weights;
 	push(j.upstreams, entry);
 	if (!saveUpstreamsFile(j)) return { ok: false, error: '写入失败' };
 	logInfo(sprintf('upstream added: %s -> %s (%d keys)', pf, url, length(keys)));
@@ -1973,23 +2211,17 @@ function setUpstreamKeys(id, keysText) {
 	let j = readJsonFile(UPSTREAM_FILE);
 	if (!j || type(j.upstreams) !== 'array') return { ok: false, error: '无上游配置' };
 
-	let keys = [];
-	let seen = {};
-	// split(subject, separator) —— 顺序不能反，见 addUpstream 的说明
-	let lines = split('' + (keysText || ''), '\n');
-	for (let ln in lines) {
-		let t = trim(ln);
-		if (length(t) === 0) continue;
-		if (seen[t]) continue;
-		seen[t] = true;
-		push(keys, t);
-	}
+	// v2.0：支持 `sk-xxx|权重` 格式（见 parseKeysText）。
+	let parsed = parseKeysText(keysText);
+	let keys = parsed.keys;
 	if (length(keys) === 0) return { ok: false, error: '至少需要一条 Key' };
 
 	let hit = false;
 	for (let u in j.upstreams) {
 		if (type(u) === 'object' && u !== null && ('' + (u.id || '')) === ('' + id)) {
 			u.keys = keys;
+			// 权重随新文本整体替换：没写权重的 Key 一律回到 1。
+			u.weights = length(parsed.weights) > 0 ? parsed.weights : {};
 			hit = true;
 		}
 	}
@@ -2006,15 +2238,20 @@ function upstreamStatus() {
 	for (let u in list) {
 		let keys = [];
 		let usable = 0;
+		let upUsage = metrics.usageByUp[u.id] || { prompt: 0, completion: 0, total: 0 };
 		for (let k in u.keys) {
 			let st = upState[u.id + '|' + k];
 			let cool = (st && st.coolUntil > now) ? (st.coolUntil - now) : 0;
 			if (cool === 0) usable++;
+			let keyUsage = metrics.usageByKey[u.id + '|' + maskKey(k)] || { prompt: 0, completion: 0, total: 0 };
 			push(keys, {
 				masked: maskKey(k),
+				weight: (u.weights && +u.weights[k] >= 1) ? +u.weights[k] : 1,
 				cooling: cool,
 				fails: st ? (st.fails || 0) : 0,
 				lastErr: st ? (st.lastErr || '') : '',
+				usage: keyUsage,
+				usageText: fmtUsage(keyUsage),
 			});
 		}
 		push(out, {
@@ -2026,6 +2263,8 @@ function upstreamStatus() {
 			keyCount: length(u.keys),
 			keyUsable: usable,
 			keys: keys,
+			usage: upUsage,
+			usageText: fmtUsage(upUsage),
 		});
 	}
 	return out;
@@ -2660,6 +2899,9 @@ function sseHeaders(conn) {
 		'HTTP/1.1 200 OK\r\n' +
 		'Content-Type: text/event-stream\r\n' +
 		'Cache-Control: no-cache\r\n' +
+		// v2.0：显式告知中间反代不要缓冲 SSE（nginx 默认 proxy_buffering on
+		// 会把事件流攒成批再发；X-Accel-Buffering: no 是 nginx 的原生开关）。
+		'X-Accel-Buffering: no\r\n' +
 		'Connection: close\r\n' +
 		'Access-Control-Allow-Origin: *\r\n' +
 		'\r\n';
@@ -3209,9 +3451,11 @@ function spawnUpstream(conn) {
 	}
 	push(args, shquote('--data-binary'));
 	push(args, shquote('@' + conn.tmpFile));
+	// v2.0：透传端点时用 conn.targetPath（如 /v1/embeddings），
+	// 否则保持原 /v2/chat/completions。
 	push(args, shquote(conn.usedPool
-		? (cfg.poolBase + '/v2/chat/completions')
-		: (cfg.endpoint + '/v2/chat/completions')));
+		? (cfg.poolBase + (conn.targetPath || '/v2/chat/completions'))
+		: (cfg.endpoint + (conn.targetPath || '/v2/chat/completions'))));
 	let cmdline = join(' ', args);
 
 	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
@@ -3258,7 +3502,11 @@ function spawnUpstream(conn) {
 			conn.sock.send(chunk);
 		} catch (e) {
 			closeConn(conn);
+			return;
 		}
+		// v2.0：流式也累积响应体（上限 2MB，防极端大响应撑爆内存），
+		// 供收尾时提取 usage 做用量统计。
+		if (length(conn.sseBuf) < 2097152) conn.sseBuf += chunk;
 	};
 	conn.chunkFn = onChunk;
 
@@ -3474,8 +3722,8 @@ function spawnUpstreamDirect(conn) {
 	push(args, q('--data-binary'));
 	push(args, q('@' + conn.tmpFile));
 	push(args, q(conn.usedPool
-		? (cfg.poolBase + '/chat/completions')
-		: (up.baseUrl + '/chat/completions')));
+		? (cfg.poolBase + (conn.targetPath || '/chat/completions'))
+		: (up.baseUrl + (conn.targetPath || '/chat/completions'))));
 	let cmdline = join(' ', args);
 
 	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
@@ -3519,7 +3767,10 @@ function spawnUpstreamDirect(conn) {
 			conn.sock.send(chunk);
 		} catch (e) {
 			closeConn(conn);
+			return;
 		}
+		// v2.0：流式也累积响应体，供收尾时提取 usage 做用量统计。
+		if (length(conn.sseBuf) < 2097152) conn.sseBuf += chunk;
 	};
 	conn.chunkFn = onChunk;
 
@@ -3660,8 +3911,23 @@ function onUpstreamDirectEnd(conn) {
 		//   (2) fails/coolUntil 也需要在成功时归零，否则一把偶发失败过的 Key
 		//       会一直带着 fails>0，在 usableUpKeys() 的排序里永远排在健康 Key 之后。
 		// 放在 fail 判定**之后**：失败路径已经在 tryNextUpKey 里记过失败了。
+		// v2.0：成功回报统一走 noteUpstreamSuccess（markUpKeyOk + 会话粘性写入）。
 		if (conn.upstream && conn.upKeyInUse)
-			markUpKeyOk(conn.upstream, conn.upKeyInUse);
+			noteUpstreamSuccess(conn);
+		// v2.0：用量统计：从响应体提取 usage 并累加。
+		let usage = extractUsage(raw);
+		if (usage) recordUsage(conn, usage);
+		// v2.0：通用端点透传：不做 chat 语义重写，上游返回什么就原样回传。
+		if (conn.passthrough) {
+			if (conn.wantNonStream) {
+				rawResponse(conn, 200, 'application/json', raw, null);
+			} else {
+				sseHeaders(conn);
+				try { conn.sock.send(raw); } catch (e) { }
+				closeConn(conn);
+			}
+			return;
+		}
 		if (conn.wantNonStream) {
 			// 上游遵守了 stream:false，直接回完整 JSON；
 			// 若它仍然返回 SSE（少数上游无视 stream 字段），再本地合并。
@@ -3684,10 +3950,19 @@ function onUpstreamDirectEnd(conn) {
 	// 走到这里说明 headersSent 已为真：这条流的开头是真内容，已经透传给客户端了，
 	// 同样是一次成功的尝试 —— 与上面 !headersSent 分支保持一致的账本，
 	// 否则"流式成功"这一类请求在上游 ok 指标里永远不出现、也不参与合闸。
+	// v2.0：成功回报统一走 noteUpstreamSuccess（markUpKeyOk + 会话粘性写入）。
 	if (conn.upstream && conn.upKeyInUse)
-		markUpKeyOk(conn.upstream, conn.upKeyInUse);
+		noteUpstreamSuccess(conn);
+	// v2.0：用量统计：流式场景从累积的 sseBuf 里提取最后一个 usage。
+	let usage = extractUsage(conn.sseBuf);
+	if (usage) recordUsage(conn, usage);
 
 	if (conn.wantNonStream) {
+		// v2.0：透传端点不做合并，原样回传累积内容。
+		if (conn.passthrough) {
+			rawResponse(conn, 200, 'application/json', conn.sseBuf, null);
+			return;
+		}
 		let merged = mergeChunks(conn.sseBuf);
 		jsonResponse(conn, 200, merged);
 		return;
@@ -3768,8 +4043,16 @@ function onUpstreamEnd(conn) {
 	markCredOk(conn.credId);
 	// 顺带把这次实际用成功、且上游接受的版本记下来，作为自校准依据
 	if (conn.usedVersion) noteAcceptedVersion(cfg, conn.usedVersion);
+	// v2.0：用量统计：非流式用 sseBuf（已含完整 JSON），流式从 SSE 尾部提取。
+	let usage = extractUsage(conn.sseBuf);
+	if (usage) recordUsage(conn, usage);
 
 	if (conn.wantNonStream) {
+		// v2.0：透传端点不做合并，原样回传累积内容。
+		if (conn.passthrough) {
+			rawResponse(conn, 200, 'application/json', conn.sseBuf, null);
+			return;
+		}
 		jsonResponse(conn, 200, mergeChunks(conn.sseBuf));
 		return;
 	}
@@ -4021,6 +4304,13 @@ function handleChat(conn, bodyRaw) {
 	// /health、/models、管理页这些也走 closeConn 的请求排除在转发指标之外。
 	conn.reqAt = nowMs();
 
+	// v2.0：用量统计与会话粘性的客户端标识。authRequired 关闭时 apiKeyName 为空，
+	// 退化为客户端 IP。
+	conn.reqClient = conn.apiKeyName || conn.ip || '';
+	// v2.0：会话粘性（up_sticky_sec>0 时启用）：同一客户端优先复用上次成功
+	// 的那把上游 Key。无鉴权时退化为按 IP 粘性。
+	conn.stickyFor = (cfg.upStickySec > 0) ? conn.reqClient : '';
+
 	// 自定义上游：不走凭据池，改用该上游自己的 Key 轮询
 	if (customUp !== null) {
 		let up = null;
@@ -4037,7 +4327,7 @@ function handleChat(conn, bodyRaw) {
 		// 客户端据此退避近 10 分钟。现在一律进入转发链，
 		// 由 usableUpKeys 按"健康的先轮询、失败的排后面"给出顺序，
 		// 不通就换下一个，全部试完才报错。
-		let keys = usableUpKeys(up);
+		let keys = usableUpKeys(up, conn.stickyFor);
 		if (length(keys) === 0) {
 			jsonResponse(conn, 503, { error: { message: 'upstream has no key configured' } });
 			return;
@@ -4073,6 +4363,122 @@ F.upstreamLooksFailed = upstreamLooksFailed;
 // 文件很靠前的位置，只能走这张前向引用表。
 F.releaseGate = releaseGate;
 F.pumpQueue = pumpQueue;
+
+// ---------- v2.0：通用端点透传 ----------
+//
+// 在 /v1/chat/completions（及 /chat/completions）之外的 OpenAI 兼容端点启用
+// 同一转发链：/v1/embeddings、/v1/responses、/v1/images/generations 等。
+// 与 chat 路径的区别（routePassthrough）：
+//   * 不插 system 消息、不强制 stream=true、不做 onlyFree 检查；
+//   * 只做模型前缀路由（workbuddy/xxx -> 池通道裸模型名；供应商前缀 -> 自定义上游）；
+//   * 响应原样透传，不做 SSE 合并（非流式且上游返回纯 JSON 时原样回传，
+//     上游返回 SSE 时也原样透传，客户端自己处理）。
+//
+// 为什么仍复用转发链而不是直接 curl：并发闸门、上游 Key 冷却/换 Key、
+// 刹车、连接池、回环桥、看门狗、指标与用量统计全部继承，行为与 chat 一致。
+
+function routePassthrough(body, path) {
+	if (type(body) !== 'object' || body === null)
+		return { error: 'invalid JSON body' };
+	let upstreamId = null;
+	if (type(body.model) === 'string' && length(body.model) > 0) {
+		let ref = splitModelRef(body.model);
+		if (ref !== null) {
+			if (ref.prefix === WB_PREFIX) {
+				// workbuddy/xxx -> 走本机凭据池，去掉前缀即可
+				body.model = ref.model;
+			} else {
+				let up = findUpstreamByPrefix(ref.prefix);
+				if (up === null)
+					return { error: 'unknown upstream prefix: ' + ref.prefix };
+				upstreamId = up.id;
+				body.model = ref.model;
+			}
+		}
+	}
+	// 非流式判定：显式 stream=true 才是流式；其余（含 stream:false 或缺省）
+	// 一律按非流式透传（上游返回什么就回什么，不强制改造成 SSE）。
+	let wantNonStream = (body.stream !== true);
+	return {
+		text: sprintf('%.J', body),
+		wantNonStream: wantNonStream,
+		upstreamId: upstreamId,
+	};
+}
+
+// 透传入口：与 handleChat 相同的准备（临时文件/路由/闸门），但 body 不改造。
+function handlePassthrough(conn, bodyRaw, path) {
+	let body = null;
+	try {
+		body = json(bodyRaw);
+	} catch (e) {
+		body = null;
+	}
+	let adapted = routePassthrough(body, path);
+	if (adapted === null) {
+		jsonResponse(conn, 400, { error: { message: 'invalid JSON body' } });
+		return;
+	}
+	if (adapted.error) {
+		jsonResponse(conn, 400, { error: { message: adapted.error } });
+		return;
+	}
+
+	let customUp = adapted.upstreamId;
+
+	// 准备阶段与 handleChat 共用：临时文件、计时起点、粘性/用量标识。
+	let tmp = sprintf('/tmp/wb-req-%d-%d.json', time(), clock()[1]);
+	try {
+		writefile(tmp, adapted.text);
+	} catch (e) {
+		jsonResponse(conn, 502, { error: { message: 'temp file write failed: ' + e } });
+		return;
+	}
+	conn.tmpFile = tmp;
+	conn.wantNonStream = adapted.wantNonStream;
+	conn.sseBuf = '';
+	conn.tries = 0;
+	conn.reqAt = nowMs();
+	conn.reqClient = conn.apiKeyName || conn.ip || '';
+	conn.stickyFor = (cfg.upStickySec > 0) ? conn.reqClient : '';
+	// v2.0：透传标记。转发链据此：
+	//   1) URL 用 conn.targetPath（默认 /chat/completions）代替写死的路径；
+	//   2) 收尾时原样透传（不 mergeChunks）。
+	conn.passthrough = true;
+	conn.targetPath = path;
+
+	if (customUp !== null) {
+		let up = null;
+		let all = loadUpstreams();
+		for (let u in all) if (u.id === customUp) { up = u; break; }
+		if (up === null) {
+			jsonResponse(conn, 404, { error: { message: 'upstream not found' } });
+			return;
+		}
+		let keys = usableUpKeys(up, conn.stickyFor);
+		if (length(keys) === 0) {
+			jsonResponse(conn, 503, { error: { message: 'upstream has no key configured' } });
+			return;
+		}
+		conn.upstream = up;
+		conn.upKeys = keys;
+		conn.upTry = 0;
+		gateStart(conn, 'direct');
+		return;
+	}
+
+	// 池通道：与 handleChat 相同的凭据池 + 闸门。
+	// 注意：usablePool 必须传 cfg（loadPool 会经 getToken 访问 cfg.token_file），
+	// 漏传会在 tokenPath 里对 null 取属性，直接抛 "left-hand side expression is null"。
+	let pool = usablePool(cfg);
+	if (length(pool) === 0) {
+		jsonResponse(conn, 502, { error: { message: 'WorkBuddy credentials unavailable' } });
+		return;
+	}
+	conn.tryLimit = (length(pool) < MAX_TRY) ? length(pool) : MAX_TRY;
+	conn.pool = pool;
+	gateStart(conn, 'wb');
+}
 
 // ---------- 管理页 ----------
 //
@@ -4676,20 +5082,26 @@ function renderUpstreams(d) {
     h += '<div class="uprow"><span class="lbl">模型前缀</span><code>' + esc(u.prefix) + '/</code></div>';
     h += '<div class="uprow"><span class="lbl">服务器</span><code>' + esc(u.baseUrl) + '</code></div>';
 
-    // Key 明细（掩码）
+    // Key 明细（掩码）+ v2.0 权重/用量
     if (u.keys && u.keys.length) {
       h += '<div class="uprow"><span class="lbl">Key 池</span><span>';
       for (var j = 0; j < u.keys.length; j++) {
         var k = u.keys[j];
+        var kTip = '权重 ' + k.weight + (k.usageText ? '，用量 ' + k.usageText : '');
         if (k.cooling > 0) {
           h += '<span class="badge warn" title="' + esc(k.lastErr || '') + '">' +
                esc(k.masked) + ' 冷却 ' + k.cooling + 's</span> ';
         } else {
-          h += '<span class="badge ok">' + esc(k.masked) + '</span> ';
+          h += '<span class="badge ok" title="' + esc(kTip) + '">' +
+               esc(k.masked) + (k.weight > 1 ? ' ×' + k.weight : '') + '</span> ';
         }
       }
       h += '</span></div>';
     }
+
+    // v2.0：上游累计用量
+    h += '<div class="uprow"><span class="lbl">用量</span><code>' +
+         esc(u.usageText || '0/0/0') + ' tokens</code></div>';
 
     h += '<div class="uprow"><span class="lbl">操作</span><span style="white-space:nowrap">';
     h += '<button onclick="testUp(\\'' + esc(u.id) + '\\')">测试</button> ';
@@ -4740,8 +5152,10 @@ function editUpKeys(id) {
     '<p class="hint" style="margin-top:0">当前 ' + cur.length + ' 条：' +
       esc(cur.join('、')) + '</p>' +
     '<p class="hint">粘贴新的 Key 列表，每行一条。<strong>会覆盖原有全部 Key。</strong>' +
-      '每行的前后空格会自动去掉，重复项自动去重。</p>' +
-    '<textarea id="mKeysEdit" rows="8" placeholder="sk-xxxxxxxx&#10;sk-yyyyyyyy"></textarea>' +
+      '每行的前后空格会自动去掉，重复项自动去重。' +
+      'v2.0 支持权重：每行可写成 <code>key|权重</code>（权重 ≥1 的整数，默认 1），' +
+      '例如 <code>sk-aaaa|3</code> 表示这把 Key 的被选中概率是普通 Key 的 3 倍。</p>' +
+    '<textarea id="mKeysEdit" rows="8" placeholder="sk-xxxxxxxx&#10;sk-yyyyyyyy|3&#10;sk-zzzzzzzz"></textarea>' +
     '<div class="modal-foot">' +
       '<button onclick="closeModal()">取消</button>' +
       '<button class="primary" onclick="saveUpKeys(\\'' + esc(id) + '\\')">保存</button>' +
@@ -5728,6 +6142,10 @@ function metricsSnapshot() {
 			if (st && st.coolUntil > time()) cool = st.coolUntil - time();
 			push(keysOut, {
 				key: maskKey(k),
+				// v2.0：per-Key 权重与用量（管理页展示用）
+				weight: (u.weights && +u.weights[k] >= 1) ? +u.weights[k] : 1,
+				usage: metrics.usageByKey[u.id + '|' + maskKey(k)] || { prompt: 0, completion: 0, total: 0 },
+				usageText: fmtUsage(metrics.usageByKey[u.id + '|' + maskKey(k)]),
 				ok: mk ? mk.ok : 0,
 				fail: mk ? mk.fail : 0,
 				rateLimited: mk ? mk.rateLimited : 0,
@@ -5742,6 +6160,9 @@ function metricsSnapshot() {
 			id: u.id, prefix: u.prefix, enabled: u.enabled,
 			ok: mu.ok, fail: mu.fail,
 			rateLimited: mu.rateLimited, authFail: mu.authFail,
+			// v2.0：该上游的累计 token 用量（管理页展示用）
+			usage: metrics.usageByUp[u.id] || { prompt: 0, completion: 0, total: 0 },
+			usageText: fmtUsage(metrics.usageByUp[u.id]),
 			inflight: upInflight['up:' + u.id] || 0,
 			// v1.8.1 限流刹车状态。open=true 表示此刻正在闭闸，
 			// trips 是历史闭闸次数 —— 与 rateLimited 一起看就能算出压缩比。
@@ -5826,6 +6247,16 @@ function metricsSnapshot() {
 			maxRetryAfterSec: cfg.brakeMaxRa,
 			rejectedTotal: metrics.brakeRejected,
 			waitedTotal: metrics.brakeWaited,
+		},
+		// v2.0：token 用量统计（累计，进程重启即清零）
+		usage: {
+			prompt: metrics.usage.prompt,
+			completion: metrics.usage.completion,
+			total: metrics.usage.total,
+			text: fmtUsage(metrics.usage),
+			byUp: metrics.usageByUp,
+			byKey: metrics.usageByKey,
+			byClient: metrics.usageByClient,
 		},
 		upstreams: upsOut,
 	};
@@ -6020,6 +6451,13 @@ function dispatch(conn, head, body) {
 
 	if (method !== 'POST') {
 		jsonResponse(conn, 405, { error: { message: 'method not allowed' } });
+		return;
+	}
+
+	// v2.0：只有 chat/completions 走完整适配链（插 system/强制流式/onlyFree）。
+	// 其余 OpenAI 兼容端点（/v1/embeddings、/v1/responses 等）原样透传。
+	if (path !== '/v1/chat/completions' && path !== '/chat/completions') {
+		handlePassthrough(conn, body, path);
 		return;
 	}
 

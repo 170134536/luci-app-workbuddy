@@ -53,6 +53,10 @@ uci -q get workbuddy.main.wb_idle_sec       >/dev/null 2>&1 || uci -q set workbu
 # 同样必须补写：老用户升级后要能看到并关掉它（bridge_port='0' 回退旧读法）。
 uci -q get workbuddy.main.bridge_port >/dev/null 2>&1 || uci -q set workbuddy.main.bridge_port='8791'
 
+# v2.0：会话粘性 / 内网上游白名单。
+uci -q get workbuddy.main.up_sticky_sec        >/dev/null 2>&1 || uci -q set workbuddy.main.up_sticky_sec='900'
+uci -q get workbuddy.main.allow_private_upstream >/dev/null 2>&1 || uci -q set workbuddy.main.allow_private_upstream='1'
+
 # ---------- 端口转发规则 ----------
 #
 # 为「公网访问」预建一条端口转发规则（默认禁用，需在
