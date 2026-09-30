@@ -35,7 +35,7 @@ function logErr(msg) { logMsg('error', msg); }
 // ---------- 常量 ----------
 
 const LOG_TAG = 'workbuddy';
-const APP_VERSION = '1.8.2';
+const APP_VERSION = '1.8.4';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -344,17 +344,25 @@ const UP_SOFT_COOL = 2;         // 空响应/网络抖动：短暂避让
 //    p99 2.0~2.5s，给 12s 已是 5 倍余量。
 //
 //    首字节后：流已经建立，模型在流中途"思考"（reasoning）时确实会长时间不吐字，
-//    这是正常现象，误杀会让客户端白等一场。故放宽到 60s。
+//    这是正常现象，误杀会让客户端白等一场。故阈值要大于"正常的最长思考停顿"。
 //
 //    实测依据（v1.8.1，60 请求 × 3 档并发）：13 个慢请求（≥5s）**全部成功**，
 //    而客户端 p90 高达 30s —— 32 次看门狗中止全部发生在 25~29s（即首字节档），
 //    慢的根因正是首字节前干等到 25s 才换 Key。把首字节档压到 12s，
 //    是把这条尾巴砍掉的关键。
 //
+//    流中档的取值依据（v1.8.2，up_idle_sec 扫 60/30/25，各 60 请求）：
+//    客户端 p90/p99/max ≈ up_idle_sec + UP_IDLE_TICK_MS —— 也就是说，**尾延迟
+//    就是这一档本身**（超时那一刻才中止）。60s 档 p90 65.1s / 放大 1.08×，
+//    25s 档 p90 28.9s / 放大 1.02×，成功率 58.3% vs 65.0% 在配额波动范围内
+//    不可区分。故默认值取 25s：把"上游确实死了"的最坏等待从 65s 砍到 30s，
+//    而以 SSE 逐字吐字的性质，25s 内一个字节都没有基本等于链路已断。
+//    （真正需要长静默的上游请单独调大 up_idle_sec，或配 0 关闭该档。）
+//
 //    WorkBuddy 是 agent 上游，可能在静默工作，独立保持 75s。
 //    任一档配 0 表示**关闭该档看门狗**（诊断链路时用）。
 const UP_FIRST_BYTE_SEC_DEFAULT = 12;  // 首字节等待上限（未受理即换 Key）
-const UP_IDLE_SEC_DEFAULT = 60;        // 首字节之后的流中静默上限
+const UP_IDLE_SEC_DEFAULT = 25;        // 首字节之后的流中静默上限
 const WB_IDLE_SEC_DEFAULT = 75;        // WorkBuddy agent 路径静默上限
 const UP_IDLE_TICK_MS = 5000;          // 看门狗扫描间隔
 //
@@ -392,6 +400,32 @@ const UP_QUEUE_TICK_MS = 1000;       // 排队超时扫描间隔
 //    下次池化尝试成功即自动恢复 —— 不引入额外定时探活，不占单线程事件循环。
 const POOL_FAIL_COOLDOWN = 30;       // 判定池挂掉后强制直连的时长（秒）
 const POOL_CONNECT_TIMEOUT = 3;      // 走回环时连接超时要短，才能快速暴露池挂了
+
+// ---------- v1.8.3：上游响应回环桥 ----------
+//
+// 背景：本 ucode 版本的 popen() 管道 + uloop 读循环在并发流式转发时会丢数据——
+// 要么在 16384 读缓冲边界提前收 EOF（静默截断），要么可读事件丢失导致流永不收尾
+// （probe2/probe3/probe6/probe7 离线复现）。根治办法是不再从 popen 管道读上游响应
+// 体，而是让子进程把 stdout 经 nc 回环到一个本地 TCP socket，改由 socket 读路径
+// （probe10 证明并发下字节精确、EOF 可靠）转发给客户端。
+//
+// bridge_port=0 关闭回环桥，退回直接 popen 读取（保留 v1.8.2 行为，诊断/回退用）。
+//
+// 【` &` 是桥的一部分，不是性能优化】bridgeWrap() 必须在管道尾部追加 ` &`。
+// v1.8.3 漏了它，上线后 60 并发直接把服务打死：popen() 的直接子进程是那个 sh，
+// 整条 `{ …; } | nc …` 管道在整个响应流期间都活着，于是任何一次 proc.close()
+// （= pclose()/waitpid()）都要等管道退出才返回；单线程事件循环被钉在 do_wait，
+// 40s 内一轮都没转（diag183：Recv-Q 固定 87423、/health 无响应、56/60 请求
+// code=000）。加 ` &` 后 sh 立刻退出，pclose() 收的是已死子进程，实测 2 ms 返回，
+// 事件循环 maxGap 502ms，5 并发 × 200200 字节逐字节精确、无串流
+// （probe15 shape B FIX_OK；probe16 BG=1 3/3 ALL GOOD ↔ BG=0 20s 内 HUNG）。
+//
+// 【提前声明，勿删】loadConfig()（约 620 行，本文件最靠前的函数之一）要读
+// BRIDGE_PORT_DEFAULT，而本文件 **不提升声明**：函数按定义时的词法作用域解析
+// 标识符，声明若留在后面的常量区就会抛 `access to undeclared variable`。
+// v1.8.1 的 cfg 崩溃（见下方 cfg 声明处的长注释）就是这一类问题，故这里必须前置。
+const BRIDGE_PORT_DEFAULT = 8791;
+const NC_PATH = '/usr/bin/nc';
 
 //
 // 6) 上游限流刹车（v1.8.1）。
@@ -545,7 +579,7 @@ function loadConfig() {
 		use_pool: '1',           // 是否走本机连接池（pool/ 目录的常驻进程）
 		pool_port: '8790',       // 连接池监听端口（仅回环）
 		// ---------- v1.8.2 ----------
-		up_idle_sec: '60',       // 首字节之后的流中静默上限，0=关闭该档
+		up_idle_sec: '25',       // 首字节之后的流中静默上限，0=关闭该档
 		up_first_byte_sec: '12', // 首字节等待上限，0=关闭该档
 		wb_idle_sec: '75',       // WorkBuddy 通道静默上限，0=关闭该档
 	};
@@ -617,6 +651,10 @@ function loadConfig() {
 		cfg.upFirstByteSec = UP_FIRST_BYTE_SEC_DEFAULT;
 		cfg.upIdleSec = UP_IDLE_SEC_DEFAULT;
 	}
+
+	// ---------- v1.8.3：上游响应回环桥 ----------
+	// 0 = 关闭回环桥，退回直接 popen 读取（保留 v1.8.2 行为）。
+	cfg.bridgePort = numOr(cfg.bridge_port, BRIDGE_PORT_DEFAULT, 0, 65535);
 
 	return cfg;
 }
@@ -1391,6 +1429,15 @@ let upBrake = {};
 // 因此按本文件既有做法（connections 同样被提前到头部）把**声明**挪到这里，
 // 真正的赋值仍留在 2842 行 —— 那行才是"读盘"发生的时刻，顺序不能动。
 let cfg = {};
+
+// ---------- 上游响应回环桥（v1.8.3）的状态 ----------
+//
+// 机制与背景见文件头部（约 396 行）的 v1.8.3 常量块：BRIDGE_PORT_DEFAULT /
+// NC_PATH 已在那里提前声明（loadConfig() 要读，本文件不提升声明）。这里只放
+// 桥自身的运行时状态 —— 它们被 2390 行之后的 bridge* 函数引用，声明必须靠前。
+let bridgeListen = null;   // 本地回环监听 socket
+let bridgePending = {};    // 请求 id -> conn
+let bridgeSeq = 0;
 
 // 判定失败原因是否属于"上游限流"（tpm/rpm 配额、429、too many requests）。
 //
@@ -2367,6 +2414,140 @@ function httpStatusText(code) {
 
 // truthy() 定义在文件顶部基础工具区。
 
+// ---------- 上游响应回环桥实现（v1.8.3） ----------
+
+// 回环桥是否可用：配置开启、nc 存在、监听已建立。
+function bridgeUse() {
+	return (cfg.bridgePort > 0) && (bridgeListen !== null);
+}
+
+// 回环桥：为一次上游请求分配 id 并登记挂起映射（必须在 popen 之前调用，否则
+// 子进程可能在登记前就连上并把首行 id 发到 accept，查不到 conn 就被丢弃）。
+function bridgeRegister(conn) {
+	if (!bridgeUse()) return null;
+	bridgeSeq++;
+	let id = '' + bridgeSeq;
+	bridgePending[id] = conn;
+	conn.bridgeId = id;
+	return id;
+}
+
+// 回环桥：把 curl 命令包成「先打印请求 id 一行，再跑 curl，整段经 nc 回环到本地端口」。
+//
+// 末尾的 ` &` 是必需的，不是优化：popen() 的直接子进程是那个 sh，而整条
+// `{ …; } | nc …` 管道在响应流期间一直活着。若前台运行，任何一次
+// proc.close()（= pclose()/waitpid()）都要等整条管道退出才返回 —— 事件循环
+// 是单线程的，于是被无限期钉在 do_wait 上，Recv-Q 堆积、/health 无响应、
+// 全站瘫痪（v1.8.3 实测）。加了 ` &` 之后 sh 立刻退出，pclose() 收的是已死
+// 子进程，实测 2 ms 返回，而数据仍逐字节完整送达（probe15 shape B / probe16）。
+// 子进程被 init 收养并在 curl 结束后自然退出；我们关桥 socket 会让 nc 读到
+// EOF 而退出，进而 SIGPIPE 掉 curl，不会留下残留。
+function bridgeWrap(id, cmdline) {
+	return '{ printf "' + id + '\\n"; ' + cmdline + '; } | nc 127.0.0.1 ' + cfg.bridgePort + ' &';
+}
+
+// 回环桥：从已接入的连接读一块数据。桥接走 socket（可靠），未桥接走 popen 管道（旧路径）。
+function readChunk(conn, n) {
+	if (conn.bridgeSock) {
+		if (conn.bridgePrebuf && length(conn.bridgePrebuf) > 0) {
+			let out = substr(conn.bridgePrebuf, 0, n);
+			conn.bridgePrebuf = (length(conn.bridgePrebuf) > n) ? substr(conn.bridgePrebuf, n, length(conn.bridgePrebuf) - n) : '';
+			return out;
+		}
+		return conn.bridgeSock.recv(n);
+	}
+	return conn.proc.read(n);
+}
+
+// 回环桥：释放一次请求持有的桥资源（幂等，可安全重复调用）。
+function bridgeRelease(conn) {
+	try { if (conn.bridgeHandle) conn.bridgeHandle.cancel(); } catch (e) { }
+	conn.bridgeHandle = null;
+	try { if (conn.bridgeSock) conn.bridgeSock.close(); } catch (e) { }
+	conn.bridgeSock = null;
+	if (conn.bridgeId) { bridgePending[conn.bridgeId] = null; conn.bridgeId = null; }
+}
+
+// 回环桥：首行握手失败或无用连接，直接丢弃。
+// 【顺序】定义必须排在 bridgeReady 之前 —— 本文件不提升函数声明，
+// 后向直接调用会抛未声明变量错误，这也是静态检查 FORWARD REF 拦的东西。
+function bridgeDrop(b) {
+	try { if (b.handle) b.handle.cancel(); } catch (e) { }
+	try { b.sock.close(); } catch (e) { }
+}
+
+// 回环桥：一条桥连接的全生命周期回调。
+//
+// 关键设计：**每条桥连接只注册一个 uloop 句柄**，握手与后续转发共用它。
+// 不要写成「握手用句柄 A，收到 id 后 cancel A、给同一个 fd 注册句柄 B」——
+// 同一 fd 上取消与重新注册落在同一个事件循环轮次里，epoll 侧会出现
+// 重复注册/陈旧句柄的竞态（libubox 对同一 fd 的 epoll_ctl(ADD) 会返回 EEXIST），
+// 严重时陈旧句柄会再触发一次握手，把真实数据的首行当成 id 吃掉。
+// 句柄只在两处消失：bridgeRelease()（请求收尾）与 bridgeDrop()（握手失败）。
+function bridgeReady(b) {
+	// 已完成握手：此后本连接就是该请求的响应流
+	if (b.conn) { b.conn.chunkFn(b.conn); return; }
+
+	let chunk;
+	try { chunk = b.sock.recv(512); } catch (e) { chunk = null; }
+	if (chunk === null || length(chunk) === 0) { bridgeDrop(b); return; }
+	b.buf += chunk;
+	let nl = index(b.buf, '\n');
+	if (nl < 0) {
+		// 首行 id 很短；超过 256 字节还没换行说明对面不是本服务的子进程
+		if (length(b.buf) > 256) bridgeDrop(b);
+		return;
+	}
+	let id = trim(substr(b.buf, 0, nl));
+	let rest = substr(b.buf, nl + 1);
+	let conn = bridgePending[id] || null;
+	if (!conn || conn.closed || !conn.chunkFn) { bridgeDrop(b); return; }
+	bridgePending[id] = null;
+
+	// 交棒：句柄所有权由 b 转给 conn，之后不再 cancel/重注册
+	b.conn = conn;
+	conn.bridgeSock = b.sock;
+	conn.bridgeHandle = b.handle;
+
+	// 首行之后的同包残余字节不能丢（curl 的响应常常和 id 行挤在同一个报文里），
+	// 先塞进预读缓冲，再立刻手动触发一次块处理。
+	if (length(rest) > 0) {
+		conn.bridgePrebuf = rest;
+		conn.chunkFn(conn);
+	}
+}
+
+// 回环桥：accept 循环入口。每个新连接先做「首行 id」握手（见 bridgeReady）。
+function bridgeAccept() {
+	let addr = {};
+	let peer = bridgeListen.accept(addr, socket.SOCK_CLOEXEC);
+	if (!peer) return;
+	try { peer.setopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, true); } catch (e) { }
+	let b = { sock: peer, buf: '', conn: null, handle: null };
+	b.handle = uloop.handle(peer, () => bridgeReady(b), uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+}
+
+// 回环桥：启动本地监听。nc 缺失或监听失败时回退到直接 popen 读取。
+function bridgeStart() {
+	if (!(cfg.bridgePort > 0)) return;
+	if (!access(NC_PATH, 'x')) {
+		logErr('bridge: nc not found at ' + NC_PATH + ', falling back to direct popen reads');
+		cfg.bridgePort = 0;
+		return;
+	}
+	let s = socket.create(socket.AF_INET, socket.SOCK_STREAM, 0);
+	try { s.setopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); } catch (e) { }
+	if (!s.bind('127.0.0.1:' + cfg.bridgePort) || !s.listen(64)) {
+		logErr('bridge: listen failed on 127.0.0.1:' + cfg.bridgePort + ', falling back to direct popen reads');
+		cfg.bridgePort = 0;
+		try { s.close(); } catch (e) { }
+		return;
+	}
+	bridgeListen = s;
+	uloop.handle(s, () => bridgeAccept(), uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+	logInfo('upstream bridge listening on 127.0.0.1:' + cfg.bridgePort);
+}
+
 function closeConn(conn) {
 	if (conn.closed) return;
 	conn.closed = true;
@@ -2379,6 +2560,7 @@ function closeConn(conn) {
 	try {
 		if (conn.proc) conn.proc.close();
 	} catch (e) { }
+	bridgeRelease(conn);
 	try {
 		if (conn.tmpFile) unlink(conn.tmpFile);
 	} catch (e) { }
@@ -3032,26 +3214,11 @@ function spawnUpstream(conn) {
 		: (cfg.endpoint + '/v2/chat/completions')));
 	let cmdline = join(' ', args);
 
-	let proc;
-	try {
-		proc = popen(cmdline, 'r');
-	} catch (e) {
-		F.tryNextCred(conn, 'curl spawn failed: ' + e);
-		return;
-	}
-	if (!proc) {
-		F.tryNextCred(conn, 'curl spawn failed: ' + error());
-		return;
-	}
-
-	conn.proc = proc;
-	// 静默看门狗计时起点（两档阈值见 cfg.upFirstByteSec / cfg.upIdleSec 与 watchdogTick）
-	conn.lastByteAt = time();
-
-	conn.procHandle = uloop.handle(proc, () => {
+	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
+	let onChunk = () => {
 		let chunk;
 		try {
-			chunk = proc.read(16384);
+			chunk = readChunk(conn, 16384);
 		} catch (e) {
 			F.tryNextCred(conn, 'read failed: ' + e);
 			return;
@@ -3092,7 +3259,35 @@ function spawnUpstream(conn) {
 		} catch (e) {
 			closeConn(conn);
 		}
-	}, uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+	};
+	conn.chunkFn = onChunk;
+
+	let bridged = bridgeUse();
+	let bridgedId = null;
+	if (bridged) bridgedId = bridgeRegister(conn);
+	if (bridged && bridgedId) cmdline = bridgeWrap(bridgedId, cmdline);
+
+	let proc;
+	try {
+		proc = popen(cmdline, 'r');
+	} catch (e) {
+		bridgeRelease(conn);
+		F.tryNextCred(conn, 'curl spawn failed: ' + e);
+		return;
+	}
+	if (!proc) {
+		bridgeRelease(conn);
+		F.tryNextCred(conn, 'curl spawn failed: ' + error());
+		return;
+	}
+
+	conn.proc = proc;
+	// 静默看门狗计时起点（两档阈值见 cfg.upFirstByteSec / cfg.upIdleSec 与 watchdogTick）
+	conn.lastByteAt = time();
+
+	if (!bridged) {
+		conn.procHandle = uloop.handle(proc, onChunk, uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+	}
 }
 
 // 结束当前凭据的尝试：释放进程与句柄，决定重试还是收尾
@@ -3103,6 +3298,7 @@ function tryNextCred(conn, reason) {
 	try { if (conn.proc) conn.proc.close(); } catch (e) { }
 	conn.procHandle = null;
 	conn.proc = null;
+	bridgeRelease(conn);
 
 	// 池化尝试零字节收场：先判是不是池本身挂了。是的话就地直连重发，
 	// 并且**不记这次凭据失败** —— 见 poolFallback 的说明。
@@ -3282,27 +3478,11 @@ function spawnUpstreamDirect(conn) {
 		: (up.baseUrl + '/chat/completions')));
 	let cmdline = join(' ', args);
 
-	let proc;
-	try {
-		proc = popen(cmdline, 'r');
-	} catch (e) {
-		F.tryNextUpKey(conn, 'curl spawn failed: ' + e);
-		return;
-	}
-	if (!proc) {
-		F.tryNextUpKey(conn, 'curl spawn failed: ' + error());
-		return;
-	}
-
-	conn.proc = proc;
-	conn.upKeyInUse = key;
-	// 静默看门狗计时起点
-	conn.lastByteAt = time();
-
-	conn.procHandle = uloop.handle(proc, () => {
+	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
+	let onChunk = () => {
 		let chunk;
 		try {
-			chunk = proc.read(16384);
+			chunk = readChunk(conn, 16384);
 		} catch (e) {
 			F.tryNextUpKey(conn, 'read failed: ' + e);
 			return;
@@ -3340,7 +3520,36 @@ function spawnUpstreamDirect(conn) {
 		} catch (e) {
 			closeConn(conn);
 		}
-	}, uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+	};
+	conn.chunkFn = onChunk;
+
+	let bridged = bridgeUse();
+	let bridgedId = null;
+	if (bridged) bridgedId = bridgeRegister(conn);
+	if (bridged && bridgedId) cmdline = bridgeWrap(bridgedId, cmdline);
+
+	let proc;
+	try {
+		proc = popen(cmdline, 'r');
+	} catch (e) {
+		bridgeRelease(conn);
+		F.tryNextUpKey(conn, 'curl spawn failed: ' + e);
+		return;
+	}
+	if (!proc) {
+		bridgeRelease(conn);
+		F.tryNextUpKey(conn, 'curl spawn failed: ' + error());
+		return;
+	}
+
+	conn.proc = proc;
+	conn.upKeyInUse = key;
+	// 静默看门狗计时起点
+	conn.lastByteAt = time();
+
+	if (!bridged) {
+		conn.procHandle = uloop.handle(proc, onChunk, uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
+	}
 }
 
 // 换下一条 Key 重试
@@ -3351,6 +3560,7 @@ function tryNextUpKey(conn, reason) {
 	try { if (conn.proc) conn.proc.close(); } catch (e) { }
 	conn.procHandle = null;
 	conn.proc = null;
+	bridgeRelease(conn);
 
 	// 池化尝试零字节收场：先判是不是池本身挂了。是的话就地直连重发同一把 Key，
 	// 并且不把它算作这把 Key 的失败（否则池一挂就会连坐冷却掉一批好 Key）。
@@ -3427,6 +3637,7 @@ function onUpstreamDirectEnd(conn) {
 	try { if (conn.proc) conn.proc.close(); } catch (e) { }
 	conn.procHandle = null;
 	conn.proc = null;
+	bridgeRelease(conn);
 
 	// 未推流就结束：要么是错误体，要么是空响应
 	if (!conn.headersSent) {
@@ -5907,7 +6118,7 @@ function onAccept(listenSock) {
 // attemptBytes 在每次尝试开始时清零（spawnUpstream / spawnUpstreamDirect），
 // 收到字节就累加，所以它天然就是"本次尝试是否已被上游受理"的标志位。
 //   - attemptBytes === 0：请求还没被受理 → 用 up_first_byte_sec（默认 12s）
-//   - attemptBytes > 0  ：流已建立、中途卡住 → 用 up_idle_sec（默认 60s）
+//   - attemptBytes > 0  ：流已建立、中途卡住 → 用 up_idle_sec（默认 25s）
 function watchdogTick() {
 	let now = time();
 	for (let c in connections) {
@@ -5991,6 +6202,10 @@ function main() {
 
 	uloop.handle(listenSock, () => onAccept(listenSock), uloop.ULOOP_READ | uloop.ULOOP_BLOCKING);
 
+	// v1.8.3 上游响应回环桥：让 curl 的 stdout 经 nc 回环到本地 socket，
+	// 规避 popen 管道并发读丢数据。监听失败会自动回退并打日志。
+	bridgeStart();
+
 	let pool = loadPool(cfg);
 	let keys = loadApiKeys();
 	logInfo(sprintf('listening on %s:%d -> %s (credentials=%d, apikeys=%d, auth=%s)',
@@ -6027,6 +6242,8 @@ function main() {
 		cfg.queueMax, cfg.queueTimeout));
 	logInfo(sprintf('connection pool: %s (port=%d fail_cooldown=%ds)',
 		cfg.usePool ? 'on' : 'off', cfg.poolPort, POOL_FAIL_COOLDOWN));
+	logInfo(sprintf('upstream bridge: %s (port=%d)',
+		cfg.bridgePort > 0 ? 'on' : 'off', cfg.bridgePort));
 	// 刹车关闭时也要明确打出来，否则事后翻日志分不清"没触发"和"被关了"
 	logInfo(sprintf('rate-limit brake: %s (hits=%d/%ds -> brake %ds, retry_after max %ds)',
 		cfg.brakeHits > 0 ? 'on' : 'off',

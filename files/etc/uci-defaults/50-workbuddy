@@ -41,8 +41,17 @@ uci -q get workbuddy.main.rl_brake_max_ra   >/dev/null 2>&1 || uci -q set workbu
 # 必须补写而不是只靠 ucode 内置默认值：老用户升级后如果这两项在 UCI 里
 # 不存在，就看不到也调不了；而首字节档正是 v1.8.2 解决客户端长尾的关键旋钮。
 uci -q get workbuddy.main.up_first_byte_sec >/dev/null 2>&1 || uci -q set workbuddy.main.up_first_byte_sec='12'
-uci -q get workbuddy.main.up_idle_sec       >/dev/null 2>&1 || uci -q set workbuddy.main.up_idle_sec='60'
+uci -q get workbuddy.main.up_idle_sec       >/dev/null 2>&1 || uci -q set workbuddy.main.up_idle_sec='25'
 uci -q get workbuddy.main.wb_idle_sec       >/dev/null 2>&1 || uci -q set workbuddy.main.wb_idle_sec='75'
+
+# v1.8.3：上游响应回环桥（v1.8.4 修好）。
+#
+# 修的是一个只在并发下暴露的静默截断缺陷（ucode 的 popen 管道 + uloop 读循环
+# 会丢可读事件，响应在 16384 字节整数倍处被当成流结束），详见 ucode 里的长注释。
+# v1.8.3 的桥漏了管道尾部的 ` &`，导致 proc.close() 阻塞单线程事件循环、
+# 60 并发即全站瘫痪；v1.8.4 已在 bridgeWrap() 里补上，故这里仍默认开启。
+# 同样必须补写：老用户升级后要能看到并关掉它（bridge_port='0' 回退旧读法）。
+uci -q get workbuddy.main.bridge_port >/dev/null 2>&1 || uci -q set workbuddy.main.bridge_port='8791'
 
 # ---------- 端口转发规则 ----------
 #
