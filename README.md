@@ -938,6 +938,66 @@ option allow_private_upstream '1'
 - 用量统计在 soak 后准确累计：`usage {prompt:2763, completion:3969,
   total:6732}`，且按 3 把实际命中的 Key 正确拆分（`byKey`）。
 
+## v2.0.1 轻量化精简（无用代码清理 + 公共逻辑抽取）
+
+v2.0 上线后做了一次深度审计与精简，**只删冗余、不改行为**。审计手段：
+调用图 BFS（从 `main()` 出发找不可达函数）+ 注释引用交叉核对 + 静态六项
+脚本与单元测试全程护航；每批改动都复跑 `.check-forward.ps1` 与
+`run-ucunit.ps1`，最后在真机重跑完整验收。
+
+### 删除的死代码
+
+- `b64Index()` —— 旧 base64 实现遗留。实际查表早已内联，该函数无任何调用点。
+- `authorized()` —— `matchApiKey` 的薄包装，全仓库无调用点。
+- `q()` 与 `shquote()` 重复定义 —— 两个函数**完全同体**
+  （`"'" + replace('' + s, "'", "'\\''") + "'"`），只因 ucode 函数不提升，
+  早期在调用点附近复制了一份。统一保留一份 `shquote`，并前移到所有调用点
+  之前（踩坑记录 #12：ucode 函数不提升）。
+- 常量 `LOG_TAG`（`logMsg` 里硬编码 `'[workbuddy]'`）与 `UP_COOL_SEC`
+  （无任何引用）。
+
+### 抽取的公共逻辑（消除重复）
+
+- `beginAttempt(conn)` —— 每次转发尝试的复位块
+  （`sseBuf`/`headersSent`/`firstByteAt`/`attemptBytes`/`attemptAt`/
+  `usedPool`/模式计数），`spawnUpstream` 与 `spawnUpstreamDirect` 共用。
+- `curlArgs(conn, o)` —— 两份几乎相同的 curl 参数表
+  （超时档位、鉴权、Accept、UA、目标路径）收敛为一份。
+- `makeOnChunk(conn, onFail, onEnd)` —— 两条转发链里完全相同的
+  `onChunk` 闭包。
+- `releaseAttempt(conn)` —— 三条重试/收尾路径里相同的 `proc` 清理
+  （`cancel()` + `close()` + 置空 + `bridgeRelease`）。
+
+### 结果与验收
+
+| 指标 | 精简前（v2.0.0） | 精简后（v2.0.1） |
+|---|---|---|
+| 行数 | 6694 | **6608（−86）** |
+| 字节 | 259707 | **257270（−2437，−0.9%）** |
+| 顶层函数 | 213 | **213**（删 4 个死函数 + 1 个重复定义，加 4 个辅助函数） |
+| git diff | — | **+102 / −188** |
+
+- 静态六项检查：全部 OK。
+- 单元测试：`==== ALL PASS ==== / UNIT_RC=0`（90+ 断言）。
+- `ucode -c`：RC=0（语法通过）。
+- 真机 soak（12 批 × 5 = 60 并发，长回复流式，`v2.0.1`）：
+
+| 判据 | 结果 |
+|---|---|
+| 客户端状态码 | **19× `200`** / 41× `429` / 0× `000` |
+| 流式 body 完整（含 `[DONE]`） | **19 / 19** |
+| `TRUNCATED` / `size==16384` / 16384 整数倍 / `no finish_reason` | **0 / 0 / 0 / 0** |
+| ucode 进程存活 | **pid 18280 全程未变** |
+| 客户端 TTFB p50 / p90 / p99 / max | **0.19 / 1.99 / 2.89 / 2.89 s** |
+| ≥20s 请求 | **0** |
+| 池复用率 | **0.959** |
+| 桥连接采样（每批 3s） | 27 → 80，随批内并发单调变化 |
+
+- 41 个 `429` 全是上游限流（rpm exhausted / tpm 超限）被刹车正确拦截。
+- `/metrics` 用量统计在 soak 后正常累计（`byKey` 按实际命中的 3 把 Key 拆分）。
+- 透传链路复测：`POST /v1/embeddings` 透传到 sensenova 上游并原样返回
+  上游错误（`NOT_FOUND`），转发链正常。
+
 
 ## 接入第三方客户端
 

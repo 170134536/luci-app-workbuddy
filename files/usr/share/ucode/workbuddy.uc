@@ -34,8 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const LOG_TAG = 'workbuddy';
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.0.1';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -170,16 +169,11 @@ let b64Table = {};
 for (let i = 0; i < length(B64_CHARS); i++)
 	b64Table[substr(B64_CHARS, i, 1)] = i;
 
-function b64Index(ch) {
-	let v = b64Table[ch];
-	return (type(v) === 'int') ? v : -1;
-}
-
 // base64url 解码为字符串。忽略 padding 与非法字符。
 // 只用于解析 JWT 头部与 payload（都是 UTF-8 JSON），够用即可。
 //
 // 性能说明：本机是 ARMv8（BogoMIPS 48）+ 解释执行的 ucode，任何"逐字符
-// 调一次函数"的写法都要付真实代价 —— 原来的实现（逐字符 substr + b64Index()
+// 调一次函数"的写法都要付真实代价 —— 最初实现（逐字符 substr + 查表函数
 // 调用）解码 843 字符的 payload 要 18–21ms。改为「每 4 字符一组、组内直接
 // 查表、结果累积到数组再 join」后降到 11ms。
 // 真正的开销大头不在这里，而在 parseJwt 的记忆化（见下）。
@@ -1237,8 +1231,6 @@ function toggleApiKey(id, enabled) {
 // 为什么不复用凭据池：凭据池是"WorkBuddy 账号 token"，轮询的是账号；
 // 上游池轮询的是不同厂商的 key，冷却与失败语义都不同，混在一起会互相污染。
 const UPSTREAM_FILE = '/etc/workbuddy/upstreams.json';
-// 自定义上游 Key 的冷却时长（秒）
-const UP_COOL_SEC = 60;
 
 // 上游池轮询游标：按上游分别记录，避免多上游互相打乱节奏
 let upCursor = {};
@@ -1550,18 +1542,15 @@ function isModelRejectReason(reason) {
 		(index(low, 'not available in the current token plan') >= 0);
 }
 
-// 判定失败原因是否属于"上游不接受这次的**请求体**"（与 Key 无关）。
-//
-// 实测依据（2026-09-28 生产日志）：
-//   `inference request is invalid` —— 请求参数不被上游接受。
-// 这类同样是**确定性**失败：换任何一把 Key 结果都一样，
-// 所以不该冷却 Key、不该换 Key、更不该报"所有 Key 均失败"。
-//
-// ⚠️ 措辞要挑准，**别用 `'exceeds'`** —— 它会撞上
-// `inference exceeds tpm/rpm limit`（那是限流，必须走冷却+换 Key 那条路）。
-function isRequestRejectReason(reason) {
+// 客户端错误总判定：模型层面 + 请求体层面，两者都指向"请求本身有问题"，
+// 不是 Key 的问题（所以不该冷却 Key、不该换 Key、更不该报"所有 Key 均失败"）。
+// 实测依据（2026-09-28 生产日志）：`inference request is invalid` 等。
+// ⚠️ 措辞要挑准，**别用 'exceeds'** —— 它会撞上 `inference exceeds tpm/rpm limit`
+// （那是限流，必须走冷却+换 Key 那条路）。
+function isClientErrorReason(reason) {
 	let low = lc('' + (reason || ''));
-	return (index(low, 'request is invalid') >= 0) ||
+	return isModelRejectReason(reason) ||
+		(index(low, 'request is invalid') >= 0) ||
 		(index(low, 'invalid request') >= 0) ||
 		(index(low, 'bad request') >= 0) ||
 		(index(low, 'malformed') >= 0) ||
@@ -1570,12 +1559,6 @@ function isRequestRejectReason(reason) {
 		(index(low, 'maximum context') >= 0) ||
 		(index(low, 'payload too large') >= 0) ||
 		(index(low, 'request too large') >= 0);
-}
-
-// 客户端错误总判定：模型层面 + 请求体层面。
-// 两者都指向"请求本身有问题"，不是 Key 的问题。
-function isClientErrorReason(reason) {
-	return isModelRejectReason(reason) || isRequestRejectReason(reason);
 }
 
 // ---------- v1.8.1：上游限流刹车 ----------
@@ -2018,17 +2001,16 @@ function findUpstreamByPrefix(prefix) {
 	return null;
 }
 
-// 拉取某个自定义上游的模型列表。
-// 返回 [{ id }]；失败返回空数组（不让一个挂掉的上游拖垮整个 /v1/models）。
-//
-// 注意：这里不能调用 shquote() —— 它定义在本文件靠后的位置（约第 1682 行），
-// 而 ucode 函数不提升，此处调用会抛
-// "Reference error: access to undeclared variable"（踩坑记录 #12）。
-// 因此就近定义一个等价的私有引号函数。
-function q(s) {
+// 单引号 shell 转义：' -> '\''
+// 本版本 ucode 的 popen() 不支持数组参数形式（数组会返回 null + "Invalid argument"），
+// 只能传命令字符串，因此所有外部数据必须经过本函数转义后再拼入命令行。
+// 必须定义在这里（任何调用点之前）：ucode 函数不提升（踩坑记录 #12）。
+function shquote(s) {
 	return "'" + replace('' + s, "'", "'\\''") + "'";
 }
 
+// 拉取某个自定义上游的模型列表。
+// 返回 [{ id }]；失败返回空数组（不让一个挂掉的上游拖垮整个 /v1/models）。
 function fetchUpstreamModels(up) {
 	let keys = usableUpKeys(up);
 	if (length(keys) === 0) return [];
@@ -2036,8 +2018,8 @@ function fetchUpstreamModels(up) {
 	let key = keys[0];
 	let cmd = join(' ', [
 		'curl', '-sS', '-m', '12', '-4',
-		'-H', q('Authorization: Bearer ' + key),
-		q(up.baseUrl + '/models'),
+		'-H', shquote('Authorization: Bearer ' + key),
+		shquote(up.baseUrl + '/models'),
 	]);
 
 	let body = '';
@@ -3047,14 +3029,6 @@ function mergeChunks(sse) {
 	return out;
 }
 
-// ---------- 鉴权 ----------
-// 实际校验在 matchApiKey()，这里只判断是否需要鉴权。
-// 单参数保留是为了兼容可能的旧调用点。
-
-function authorized(cfg, headers) {
-	return matchApiKey(cfg, headers, null) !== null;
-}
-
 // ---------- 模型列表 ----------
 
 function fallbackModels() {
@@ -3106,13 +3080,6 @@ function modelsFromConfig(conf, freeOnly) {
 
 // ---------- curl 执行 ----------
 // 注意：这些函数必须定义在 fetchModelsSync / 登录流程之前（ucode 无函数提升）。
-
-// 单引号 shell 转义：' -> '\''
-// 本版本 ucode 的 popen() 不支持数组参数形式（数组会返回 null + "Invalid argument"），
-// 只能传命令字符串，因此所有外部数据必须经过本函数转义后再拼入命令行。
-function shquote(s) {
-	return "'" + replace('' + s, "'", "'\\''") + "'";
-}
 
 // 执行 curl（字符串形式）并返回 stdout；失败返回 null
 function runCurlStr(cmdline) {
@@ -3381,12 +3348,9 @@ function poolFallback(conn) {
 	return true;
 }
 
-function spawnUpstream(conn) {
-	if (conn.closed) return;
-
-	let cred = conn.pool[conn.tries];
-	conn.tries++;
-	conn.credId = cred.id;
+// 每次尝试的公共复位：清空累积状态、重置计时、并只计一次池化模式请求数。
+// 必须定义在 spawnUpstream / spawnUpstreamDirect 之前（ucode 函数不提升）。
+function beginAttempt(conn) {
 	conn.sseBuf = '';
 	conn.headersSent = false;
 	// 本次尝试的计时与池化决策。这三个字段同时服务指标与回退判定，
@@ -3402,19 +3366,23 @@ function spawnUpstream(conn) {
 		metricMode(conn).req++;
 		if (conn.usedPool) metrics.pool.used++;
 	}
+}
 
-	logInfo(sprintf('chat via credential %s (attempt %d/%d)',
-		cred.id, conn.tries, conn.tryLimit));
+// 释放当前尝试占用的进程、uloop 句柄与桥连接。换凭据/换 Key/正常收尾共用。
+// 必须定义在 tryNextCred 等调用点之前（ucode 函数不提升）。
+function releaseAttempt(conn) {
+	try { if (conn.procHandle) conn.procHandle.cancel(); } catch (e) { }
+	try { if (conn.proc) conn.proc.close(); } catch (e) { }
+	conn.procHandle = null;
+	conn.proc = null;
+	bridgeRelease(conn);
+}
 
-	// 带上客户端版本：上游目前不校验版本，但统一的 UA 更贴近真实客户端，
-	// 也便于日后上游若启用版本门禁时不必再改代码。
-	let ua = clientVersion(cfg);
-	conn.usedVersion = ua;
-
-	// 连接方式不同，curl 参数也不同，所以这里逐个 push 而不是写数组字面量：
-	//   * 回环是明文 HTTP/1.1，-4 / --http2 / --tcp-fastopen 全是无意义的开销；
-	//   * 连接超时压到 POOL_CONNECT_TIMEOUT：池要是挂了要尽快暴露并回退，
-	//     而不是让客户端先白等 5 秒连接超时。
+// 组装转发用的 curl 参数（WorkBuddy 池通道与自定义上游通道共用）。
+// 差异项（超时档位/鉴权/Accept/UA/目标/默认路径）由 o 传入，避免两份几乎
+// 相同的参数表在演进中悄悄分叉。回环是明文 HTTP/1.1（--http2/--tcp-fastopen
+// 无意义），且连接超时要压到 POOL_CONNECT_TIMEOUT，好让池挂掉时尽快暴露并回退。
+function curlArgs(conn, o) {
 	let args = ['curl', '-sS', '-N', '-X', 'POST'];
 	if (conn.usedPool) {
 		push(args, '--connect-timeout');
@@ -3424,51 +3392,53 @@ function spawnUpstream(conn) {
 		push(args, '--http2');
 		push(args, '--tcp-fastopen');
 		push(args, '--connect-timeout');
-		push(args, '5');
+		push(args, o.connectTimeout);
 	}
-	// 静默兜底：curl 侧 90 秒无字节即断开（75s 看门狗通常会先触发，
-	// 这层是看门狗万一失效时的最后保险）；--max-time 防连接无限占用。
 	push(args, '--speed-limit');
 	push(args, '1');
 	push(args, '--speed-time');
-	push(args, '90');
+	push(args, o.speedTime);
 	push(args, '--max-time');
-	push(args, '1800');
+	push(args, o.maxTime);
 	push(args, '--keepalive-time');
 	push(args, '30');
 	push(args, shquote('-H'));
 	push(args, shquote('Content-Type: application/json'));
 	push(args, shquote('-H'));
-	push(args, shquote('Authorization: Bearer ' + cred.token));
+	push(args, shquote('Authorization: Bearer ' + o.auth));
 	push(args, shquote('-H'));
-	push(args, shquote('Accept: text/event-stream'));
+	push(args, shquote('Accept: ' + o.accept));
 	push(args, shquote('-H'));
-	push(args, shquote('User-Agent: WorkBuddy/' + ua));
+	push(args, shquote('User-Agent: ' + o.ua));
 	if (conn.usedPool) {
 		// 池的协议约定：curl 连的是 127.0.0.1，真正的上游由 X-WB-Target 指定
 		push(args, shquote('-H'));
-		push(args, shquote('X-WB-Target: ' + cfg.endpoint));
+		push(args, shquote('X-WB-Target: ' + o.target));
 	}
 	push(args, shquote('--data-binary'));
 	push(args, shquote('@' + conn.tmpFile));
-	// v2.0：透传端点时用 conn.targetPath（如 /v1/embeddings），
-	// 否则保持原 /v2/chat/completions。
 	push(args, shquote(conn.usedPool
-		? (cfg.poolBase + (conn.targetPath || '/v2/chat/completions'))
-		: (cfg.endpoint + (conn.targetPath || '/v2/chat/completions'))));
-	let cmdline = join(' ', args);
+		? (cfg.poolBase + (conn.targetPath || o.defaultPath))
+		: (o.target + (conn.targetPath || o.defaultPath))));
+	return args;
+}
 
-	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
-	let onChunk = () => {
+// 创建块处理回调（WorkBuddy 池通道与自定义上游通道共用）。两个通道的差异
+// 只有失败/结束的收尾函数（F.tryNextCred/F.onUpstreamEnd vs
+// F.tryNextUpKey/F.onUpstreamDirectEnd），其余读块、计时、TTFB、SSE 判断、
+// 转发与响应体累积逻辑完全相同 —— 抽成一份，避免两处逻辑悄然分叉。
+// 必须定义在 spawnUpstream 之前（ucode 函数不提升）。
+function makeOnChunk(conn, onFail, onEnd) {
+	return () => {
 		let chunk;
 		try {
 			chunk = readChunk(conn, 16384);
 		} catch (e) {
-			F.tryNextCred(conn, 'read failed: ' + e);
+			onFail(conn, 'read failed: ' + e);
 			return;
 		}
 		if (chunk === null || length(chunk) === 0) {
-			F.onUpstreamEnd(conn);
+			onEnd(conn);
 			return;
 		}
 		// 有字节回来即刷新静默计时
@@ -3508,6 +3478,38 @@ function spawnUpstream(conn) {
 		// 供收尾时提取 usage 做用量统计。
 		if (length(conn.sseBuf) < 2097152) conn.sseBuf += chunk;
 	};
+}
+
+function spawnUpstream(conn) {
+	if (conn.closed) return;
+
+	let cred = conn.pool[conn.tries];
+	conn.tries++;
+	conn.credId = cred.id;
+	beginAttempt(conn);
+
+	logInfo(sprintf('chat via credential %s (attempt %d/%d)',
+		cred.id, conn.tries, conn.tryLimit));
+
+	// 带上客户端版本：上游目前不校验版本，但统一的 UA 更贴近真实客户端，
+	// 也便于日后上游若启用版本门禁时不必再改代码。
+	let ua = clientVersion(cfg);
+	conn.usedVersion = ua;
+
+	// 静默兜底：curl 侧 90 秒无字节即断开（75s 看门狗通常会先触发，
+	// 这层是看门狗万一失效时的最后保险）；--max-time 防连接无限占用。
+	let args = curlArgs(conn, {
+		speedTime: '90', maxTime: '1800', connectTimeout: '5',
+		accept: 'text/event-stream',
+		auth: cred.token,
+		ua: 'WorkBuddy/' + ua,
+		target: cfg.endpoint,
+		defaultPath: '/v2/chat/completions',
+	});
+	let cmdline = join(' ', args);
+
+	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
+	let onChunk = makeOnChunk(conn, F.tryNextCred, F.onUpstreamEnd);
 	conn.chunkFn = onChunk;
 
 	let bridged = bridgeUse();
@@ -3542,11 +3544,7 @@ function spawnUpstream(conn) {
 function tryNextCred(conn, reason) {
 	if (conn.closed) return;
 
-	try { if (conn.procHandle) conn.procHandle.cancel(); } catch (e) { }
-	try { if (conn.proc) conn.proc.close(); } catch (e) { }
-	conn.procHandle = null;
-	conn.proc = null;
-	bridgeRelease(conn);
+	releaseAttempt(conn);
 
 	// 池化尝试零字节收场：先判是不是池本身挂了。是的话就地直连重发，
 	// 并且**不记这次凭据失败** —— 见 poolFallback 的说明。
@@ -3682,96 +3680,20 @@ function spawnUpstreamDirect(conn) {
 	// 表现为"请求了非流式却拿到流"。踩坑记录 #14。
 	let accept = conn.wantNonStream ? 'application/json' : 'text/event-stream';
 
-	// 连接方式不同则参数不同，逐个 push 而不是数组字面量：
-	// 回环是明文 HTTP/1.1（--http2 / --tcp-fastopen 无意义），且连接超时要压到
-	// POOL_CONNECT_TIMEOUT，好让池挂掉时尽快暴露并回退直连。
-	let args = ['curl', '-sS', '-N', '-X', 'POST'];
-	if (conn.usedPool) {
-		push(args, '--connect-timeout');
-		push(args, '' + POOL_CONNECT_TIMEOUT);
-	} else {
-		push(args, '--http2');
-		push(args, '--tcp-fastopen');
-		push(args, '--connect-timeout');
-		push(args, '8');
-		push(args, '-4');
-	}
 	// 自定义上游通常直接返回 JSON/SSE，静默 30 秒即可判死（25s 看门狗通常是
 	// 先触发的那一道，这层是兜底）；--max-time 防无限占用。
-	push(args, '--speed-limit');
-	push(args, '1');
-	push(args, '--speed-time');
-	push(args, '30');
-	push(args, '--max-time');
-	push(args, '900');
-	push(args, '--keepalive-time');
-	push(args, '30');
-	push(args, q('-H'));
-	push(args, q('Content-Type: application/json'));
-	push(args, q('-H'));
-	push(args, q('Authorization: Bearer ' + key));
-	push(args, q('-H'));
-	push(args, q('Accept: ' + accept));
-	push(args, q('-H'));
-	push(args, q('User-Agent: ai-gateway/' + APP_VERSION));
-	if (conn.usedPool) {
-		// 池的协议约定：curl 连的是 127.0.0.1，真正的上游由 X-WB-Target 指定
-		push(args, q('-H'));
-		push(args, q('X-WB-Target: ' + up.baseUrl));
-	}
-	push(args, q('--data-binary'));
-	push(args, q('@' + conn.tmpFile));
-	push(args, q(conn.usedPool
-		? (cfg.poolBase + (conn.targetPath || '/chat/completions'))
-		: (up.baseUrl + (conn.targetPath || '/chat/completions'))));
+	let args = curlArgs(conn, {
+		speedTime: '30', maxTime: '900', connectTimeout: '8',
+		accept: accept,
+		auth: key,
+		ua: 'ai-gateway/' + APP_VERSION,
+		target: up.baseUrl,
+		defaultPath: '/chat/completions',
+	});
 	let cmdline = join(' ', args);
 
 	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
-	let onChunk = () => {
-		let chunk;
-		try {
-			chunk = readChunk(conn, 16384);
-		} catch (e) {
-			F.tryNextUpKey(conn, 'read failed: ' + e);
-			return;
-		}
-		if (chunk === null || length(chunk) === 0) {
-			F.onUpstreamDirectEnd(conn);
-			return;
-		}
-		// 有字节回来即刷新静默计时
-		conn.lastByteAt = time();
-		conn.attemptBytes += length(chunk);
-		// 首字节即 TTFB（含 DNS/TCP/TLS/上游排队），池化收益就看这个量
-		if (conn.firstByteAt === 0) {
-			conn.firstByteAt = nowMs();
-			histAdd(metricMode(conn).ttfb, conn.firstByteAt - conn.attemptAt);
-		}
-
-		if (conn.wantNonStream) {
-			conn.sseBuf += chunk;
-			return;
-		}
-
-		// 与 WorkBuddy 通道相同的判断：首块可能是错误体，先攒着
-		if (!conn.headersSent) {
-			let t = trim(chunk);
-			let c = substr(t, 0, 1);
-			if ((c === '{' || c === '<') && index(chunk, 'data:') < 0) {
-				conn.sseBuf += chunk;
-				return;
-			}
-			sseHeaders(conn);
-		}
-		try {
-			conn.sock.send(chunk);
-		} catch (e) {
-			closeConn(conn);
-			return;
-		}
-		// v2.0：流式也累积响应体，供收尾时提取 usage 做用量统计。
-		if (length(conn.sseBuf) < 2097152) conn.sseBuf += chunk;
-	};
+	let onChunk = makeOnChunk(conn, F.tryNextUpKey, F.onUpstreamDirectEnd);
 	conn.chunkFn = onChunk;
 
 	let bridged = bridgeUse();
@@ -3807,11 +3729,7 @@ function spawnUpstreamDirect(conn) {
 function tryNextUpKey(conn, reason) {
 	if (conn.closed) return;
 
-	try { if (conn.procHandle) conn.procHandle.cancel(); } catch (e) { }
-	try { if (conn.proc) conn.proc.close(); } catch (e) { }
-	conn.procHandle = null;
-	conn.proc = null;
-	bridgeRelease(conn);
+	releaseAttempt(conn);
 
 	// 池化尝试零字节收场：先判是不是池本身挂了。是的话就地直连重发同一把 Key，
 	// 并且不把它算作这把 Key 的失败（否则池一挂就会连坐冷却掉一批好 Key）。
@@ -3884,11 +3802,7 @@ function tryNextUpKey(conn, reason) {
 function onUpstreamDirectEnd(conn) {
 	if (conn.closed) return;
 
-	try { if (conn.procHandle) conn.procHandle.cancel(); } catch (e) { }
-	try { if (conn.proc) conn.proc.close(); } catch (e) { }
-	conn.procHandle = null;
-	conn.proc = null;
-	bridgeRelease(conn);
+	releaseAttempt(conn);
 
 	// 未推流就结束：要么是错误体，要么是空响应
 	if (!conn.headersSent) {
