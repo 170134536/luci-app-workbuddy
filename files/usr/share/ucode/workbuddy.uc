@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.3.0';
+const APP_VERSION = '2.4.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -319,6 +319,7 @@ const TOKEN_POOL_FILE = '/etc/workbuddy/pool.json';
 //   需要长期留存时由外部 syslog 收集，本模块只负责"最近 N 条 + 累计聚合"。
 const RELAY_LOG_MAX = 200;        // 环缓冲保留的最近事件条数
 const RELAY_MIN_SAMPLES = 3;     // 成功率权重的最小样本量：少于此数视为"无数据"，权重退回 1
+const RELAY_RECENT_MIN = 3;      // v2.4.0：近期健康度窗口——看该账号最近几次选中（与账号矩阵的「近期」列一致）
 
 // 中转事件类型。用短字符串而非数字：日志要给人看，也要能被 grep。
 //   pick     选中某个账号开始尝试
@@ -963,7 +964,43 @@ function relayFail(id, ev, why, extra) {
 	if (ev !== 'pick') relayTotals.pick++;
 }
 
-// v2.3.0：根据中转日志的历史成功率计算动态权重。
+// v2.4.0：该账号"近期表现"的窗口统计 —— 只扫描环缓冲里的最近若干次选中。
+//
+// 为什么需要它：relayAgg 是进程生命周期内的累计，冷启动期的失败会永远
+// 拉低成功率（v2.3.0 真机出现过"41 次选中、12% 成功率、仍大量被选"）。
+// 而轮换要降错误率，靠的是"最近到底行不行"：刚恢复的账号要尽快重新多接
+// 流量，正在连续失败的账号要立刻少接 —— 只有近期窗口能提供这个信号。
+//
+// 实现：从 relayEvents（环缓冲，最多 RELAY_LOG_MAX 条）**倒序**扫描，
+// 只统计该 id 的「选中相关」事件（pick/ok/rate/risk/auth/client/net），
+// 直到收集满 maxPicks 次 'pick' 为止。返回 { attempts, ok }：
+//   attempts = 收集到的 pick 次数（= 近期被选中的次数）
+//   ok       = 同期收集到的成功次数
+// 成功率 = ok / attempts。attempts=0（缓冲里没有该 id）表示"近期无数据"。
+//
+// 为什么按"次数"而非"秒数"开窗：环缓冲只有 200 条，高负载下可能只覆盖
+// 几分钟，低负载下覆盖数小时。按次数开窗随负载自适应 —— 高频时看最近
+// 几分钟、低频时看最近几次，语义始终是"该账号最近 N 次选中的表现"。
+// 轻微乐观偏差：倒序扫描到第 maxPicks 个 pick 时，可能把第 maxPicks+1
+// 个 pick 的 ok 也带进来（ok 紧跟在 pick 之后）。影响很小且偏向乐观，
+// 恢复中的账号因此能更快拉高权重，是可接受的。
+function relayRecentStats(id, maxPicks) {
+	let attempts = 0;
+	let ok = 0;
+	for (let i = length(relayEvents) - 1; i >= 0; i--) {
+		let e = relayEvents[i];
+		if (e.id !== id) continue;
+		if (e.ev === 'pick') attempts++;
+		else if (e.ev === 'ok') ok++;
+		else if (e.ev === 'rate' || e.ev === 'risk' || e.ev === 'auth'
+			|| e.ev === 'client' || e.ev === 'net') { /* 失败结果，不单独计数 */ }
+		else continue;
+		if (attempts >= maxPicks) break;
+	}
+	return { attempts: attempts, ok: ok };
+}
+
+// v2.3.0 + v2.4.0：根据中转日志计算动态权重。
 //
 // 返回值 ≥ 1，用于加权轮询（weightedRotate / poolWeightedRotate）：
 //   · 样本不足（< RELAY_MIN_SAMPLES）→ 1（冷启动，不偏置）
@@ -971,6 +1008,13 @@ function relayFail(id, ev, why, extra) {
 //   · 成功率 50%  → 5
 //   · 成功率 10%  → 1（几乎不倾斜，但仍给最低流量以便恢复后重新积累）
 //   · 成功率  0%  → 1（不绝杀：冷却恢复后仍给机会试）
+//
+// v2.4.0 起，权重 =「累计成功率」与「近期成功率」的混合。
+// 近期窗口固定为最近 RELAY_RECENT_MIN=3 次选中（与账号矩阵的「近期」列一致）：
+//   · 近期样本不足（< RELAY_RECENT_MIN 次选中）→ 只信累计历史；
+//   · 最近 3 次选中全部失败 → 权重压到 1（别让新流量撞正在连败的账号）；
+//   · 否则 7 成信近期、3 成信累计 —— 刚恢复的账号几天内就能重新拿回高权重，
+//     正在变差的账号几天内就会被压低（这就是"智能转换降错误率"的核心）。
 //
 // 为什么不绝杀 0% 的账号：relayAgg 是进程生命周期内的累计，早期的失败
 // 会一直拉低均分。给 weight=1 而非 0，让它在冷却结束后仍能被试到，
@@ -983,7 +1027,19 @@ function relayWeight(id) {
 		+ (a.auth || 0) + (a.client || 0) + (a.net || 0);
 	if (picks < RELAY_MIN_SAMPLES) return 1;
 	// ucode 整数除法：2/3==0，必须先乘后除（与 relayAccounts 的 okRate 同一手法）。
-	let w = int((a.ok || 0) * 10 / picks);   // 0..10
+	let life = int((a.ok || 0) * 10 / picks);   // 累计成功率权重 0..10
+	let w = life;
+	let rs = relayRecentStats(id, RELAY_RECENT_MIN);
+	if (rs.attempts >= RELAY_RECENT_MIN) {
+		// 近期连续失败：不管累计多好，先压到最低 —— 它正在烧流量。
+		if ((rs.ok || 0) === 0) {
+			w = 1;
+		} else {
+			// 7:3 偏近期 —— 恢复快、变差也快（ucode 整数除法，先乘后除）。
+			let rec = int((rs.ok || 0) * 10 / rs.attempts);
+			w = int((life * 3 + rec * 7) / 10);
+		}
+	}
 	if (w < 1) w = 1;
 	return w;
 }
@@ -1051,6 +1107,8 @@ function relayAccounts(upSec) {
 		// 健康矩阵的「成功率」分母偏小，把 11% 的账号显示成 50%。
 		let picks = (a.pick || 0) + (a.rate || 0) + (a.risk || 0)
 			+ (a.auth || 0) + (a.client || 0) + (a.net || 0);
+		// v2.4.0：近期窗口统计（最近 RELAY_RECENT_MIN 次选中，与 relayWeight 同窗）
+		let rs = relayRecentStats(key, RELAY_RECENT_MIN);
 		push(out, {
 			id: key,
 			kind: isUp ? 'up' : 'cred',
@@ -1072,6 +1130,12 @@ function relayAccounts(upSec) {
 			coolingSec: relayCoolingSec(isUp, key),
 			lastErr: relayLastErr(isUp, key),
 			weight: relayWeight(key),     // v2.3.0：当前轮询权重（1=无数据/最低，10=100%成功率）
+			// v2.4.0：近期窗口（最近 RELAY_RECENT_MIN=3 次选中）的独立读数。
+			// 累计成功率会把冷启动期的失败永远带在身上，近期读数才是
+			// "当前是否值得选它"的直接依据 —— 前端据此显示「近期 x/y」。
+			recentPick: rs.attempts,
+			recentOk: rs.ok,
+			recentOkRate: rs.attempts > 0 ? int((rs.ok || 0) * 100 / rs.attempts) : -1,
 		});
 	}
 	return out;
@@ -3372,8 +3436,14 @@ function notifyTruncation(conn) {
 	if (!conn || conn.closed) return;
 	if (!conn.headersSent || conn.wantNonStream) return;
 	if (conn.sawDone) return;
+	// v2.4.0 修正：客户端中途断开（读侧 EOF / 写失败）已由 recordConnMetrics 记入 abort 桶，
+	// 这里必须直接返回，不能计入 truncated。原实现把自增放在 writeBroken 早退**之前**，
+	// 于是一次"用户点停止"会同时进 abort 和 truncated（实测 A/B：客户端 curl -m 2 掐断后
+	// chat.aborted 与 chat.truncated 各 +1，而 relay 侧正确记 abort、trunc=0）。
+	// truncated 的含义是"代理或上游把流截断了"，被客户端取消污染后就失去告警价值。
+	// 看门狗中途 abort（watchdogTick 走 closeConn，不置 aborted）属于真截断，仍会计数。
+	if (conn.aborted || conn.writeBroken) return;   // 写侧已坏，补发也无意义
 	metrics.truncated++;
-	if (conn.writeBroken) return;   // 写侧已坏（客户端断开），补发无意义
 	try {
 		conn.sock.send('event: error\r\n' +
 			'data: {"error":{"message":"stream ended without [DONE]","type":"stream_truncated"}}\r\n\r\n');
@@ -6023,7 +6093,7 @@ function renderRelay(d) {
     var t2 = '<h3 style="margin:16px 0 8px">' + title + '</h3>';
     t2 += '<table><thead><tr>' +
           '<th>账号 / Key</th><th>权重</th><th>选中</th><th>成功</th><th>成功率</th>' +
-          '<th>限流</th><th>限流率</th><th>风控</th><th>鉴权</th><th>网络</th>' +
+          '<th>近期</th><th>限流</th><th>限流率</th><th>风控</th><th>鉴权</th><th>网络</th>' +
           '<th>冷却次数</th><th>冷却占比</th><th>当前冷却</th><th>最近错误</th>' +
           '</tr></thead><tbody>';
     for (var i = 0; i < list.length; i++) {
@@ -6031,12 +6101,22 @@ function renderRelay(d) {
       var cooling = a.coolingSec > 0
         ? '<span style="color:var(--warn)">' + a.coolingSec + 's</span>'
         : '<span style="opacity:.4">—</span>';
+      // 近期窗口：后端 relayRecentStats 统计最近 RELAY_RECENT_MIN=3 次选中。
+      // 3 次全失败（recentOk=0）标红：与 relayWeight 压到 1 的条件完全一致；3 次全成标绿。
+      var recentTxt = (a.recentPick > 0)
+        ? (a.recentOk + '/' + a.recentPick)
+        : '<span style="opacity:.4">—</span>';
+      if (a.recentPick >= 3 && (a.recentOk || 0) === 0)
+        recentTxt = '<span style="color:var(--err)" title="近期连续失败，权重已被压低">' + recentTxt + '</span>';
+      else if (a.recentPick >= 3 && a.recentOk === a.recentPick)
+        recentTxt = '<span style="color:var(--ok)" title="近期全成">' + recentTxt + '</span>';
       t2 += '<tr>' +
            '<td><code>' + esc(a.id) + '</code></td>' +
            '<td><span class="badge" style="' + (a.weight > 1 ? 'background:var(--accent2)' : '') + '">' + a.weight + '</span></td>' +
            '<td>' + a.pick + '</td>' +
            '<td>' + a.ok + '</td>' +
            '<td>' + pctCell(a.okRate, null, null) + '</td>' +
+           '<td>' + recentTxt + '</td>' +
            '<td>' + a.rate + '</td>' +
            '<td>' + pctCell(a.rateRate, 30, 60) + '</td>' +
            '<td>' + (a.risk || 0) + '</td>' +
@@ -6055,12 +6135,13 @@ function renderRelay(d) {
   }
 
   h += matrix(creds, '凭据池账号',
-    '成功率＝成功 / 选中。权重由成功率自动计算（100%→10，50%→5，10%→1），' +
-    '权重≥2 标蓝。限流率超过 30% 标黄、60% 标红，说明该账号额度紧张，' +
-    '应考虑降低它的使用频率；冷却占比接近 100% 表示它基本不可用。');
+    '成功率＝成功 / 选中。权重由「累计成功率 + 近期成功率」混合自动计算' +
+    '（v2.4.0 起 7 成信近期，100%→10，50%→5，10%→1），权重≥2 标蓝。' +
+    '「近期」列是最近 3 次选中的成败比，3 次全失败会标红并把权重压到 1。' +
+    '限流率超过 30% 标黄、60% 标红，说明该账号额度紧张；冷却占比接近 100% 表示它基本不可用。');
   h += matrix(ups, '自定义上游 Key',
     '这些是「自定义上游」里配置的 Key，与凭据池账号无关。' +
-    '权重＝max(配置权重, relay成功率权重)。限流率高的 Key 会自动获得低权重。');
+    '权重＝max(配置权重, relay成功率权重)，同样混入近期表现。限流率高的 Key 会自动获得低权重。');
 
   if (!accs.length) {
     h += '<p class="hint" style="margin-top:12px">还没有中转记录。发几个请求就会出现。</p>';
