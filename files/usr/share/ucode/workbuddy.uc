@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.2.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -300,6 +300,39 @@ function credStatus(token, now) {
 // 凭据池文件：单个 JSON 保存多条凭据
 // 注意：ucode 没有 opendir/readdir，无法遍历目录，因此池必须放在一个文件里。
 const TOKEN_POOL_FILE = '/etc/workbuddy/pool.json';
+
+// ---------- v2.2.0：中转决策日志 ----------
+//
+// 目的：把"每个请求走了哪个账号、为什么换、换了多久、结尾成不成"记成
+// 结构化事件，供后续**用数据调轮换规则**，而不是靠猜。
+//
+// 为什么不用 printf 日志了事：轮换规则要优化，需要回答的是统计问题 ——
+//   · 哪个账号在什么时段最容易被限流？
+//   · 429 之后换号，下一个账号成功的概率是多少？
+//   · 冷却 5s 够不够？有多少请求是"等冷却"等掉的？
+//   · 同一账号连续失败几次才真的坏？
+// 这些靠翻 syslog 全文根本算不出来，必须落成定长环缓冲 + 聚合计数器，
+// 由 /admin 与 /metrics 直接读。
+//
+// 存储形态：内存环缓冲（重启即失），不落盘 ——
+//   /overlay 只有 32MB 可用，写盘日志会拖累闪存寿命且迟早写满；
+//   需要长期留存时由外部 syslog 收集，本模块只负责"最近 N 条 + 累计聚合"。
+const RELAY_LOG_MAX = 200;        // 环缓冲保留的最近事件条数
+
+// 中转事件类型。用短字符串而非数字：日志要给人看，也要能被 grep。
+//   pick     选中某个账号开始尝试
+//   ok       该账号这次成功了
+//   rate     被限流（429 / tpm/rpm）
+//   risk     账号被风控（11140 等）
+//   auth     鉴权失败（401/403）
+//   client   客户端错误（请求本身有问题，换号无意义）
+//   net      网络/上游 5xx 等
+//   cool     账号进入冷却
+//   switch   因上一个账号失败而换到下一个
+//   exhaust  所有账号试完仍未成功
+//   abort    客户端中途断开
+//   trunc    流式被截断（未收到 [DONE]）
+
 // API 密钥文件：由 LuCI 通过 rpcd 维护
 const APIKEY_FILE = '/etc/workbuddy/apikeys.json';
 // WorkBuddy 自身上游在模型列表里的供应商前缀。
@@ -712,6 +745,20 @@ function getToken(cfg) {
 	return t;
 }
 
+// v2.2.0：网页登录**追加**到凭据池，而不是覆盖单槽。
+//
+// 旧行为（v2.1.0 及以前）：saveToken() 直接 writeJsonFile(token.json)，
+// 整个文件被新账号覆盖 —— 于是"登录并添加账号"每点一次就顶掉上一个账号，
+// 用户永远只能有一个账号可轮换，与"多个账号轮流中转"的设计意图相反。
+//
+// 新行为：
+//   1) 账号写进 pool.json（与手动添加的 token 同一个池），已有条目一律保留；
+//   2) 同一账号（JWT sub 相同）再次登录视为"刷新",只就地更新 token 与时间，
+//      不新增条目、也不影响其他账号；
+//   3) token.json 仍然写，作为**最近一次登录**的镜像，兼容旧读取方
+//      （getToken() 与老版本外部脚本），但它不再代表"唯一账号"。
+//
+// 返回值沿用布尔语义，另附 { added, updated, id } 供调用方写日志。
 function saveToken(cfg, accessToken, refreshToken) {
 	let payload = {
 		accessToken: accessToken,
@@ -719,11 +766,29 @@ function saveToken(cfg, accessToken, refreshToken) {
 	};
 	if (refreshToken) payload.refreshToken = refreshToken;
 
+	// 1) 追加/更新池条目 —— 这是账号真正被保存的地方。
+	// 走 F 前向引用表：addWebLoginCred 定义在 readPoolRaw/savePoolRaw 之后，
+	// 而 ucode 不提升函数声明，直接调用会抛 undeclared variable。
+	let r = F.addWebLoginCred(cfg, accessToken);
+	if (!r.ok) {
+		// 池写入失败时**仍**回写 token.json：宁可退化成旧版单账号行为，
+		// 也不能让用户刚完成的授权白费（否则还得重扫一次二维码）。
+		logErr('weblogin pool append failed: ' + (r.error || '?') + ' -> falling back to token.json only');
+	}
+
+	// 2) token.json 作为最近一次登录的镜像
 	if (!writeJsonFile(tokenPath(cfg), payload)) {
 		logErr('token save failed');
-		return false;
+		// 镜像写失败不算致命：只要池里已经存下这次登录，轮换就照常工作。
+		return r.ok;
 	}
-	logInfo('token saved to ' + tokenPath(cfg));
+
+	if (r.ok) {
+		logInfo(sprintf('weblogin credential %s in pool: %s (%s)',
+			r.updated ? 'updated' : 'added', r.id, r.name));
+	} else {
+		logInfo('token saved to ' + tokenPath(cfg) + ' (pool append failed)');
+	}
 	return true;
 }
 
@@ -742,6 +807,264 @@ function saveToken(cfg, accessToken, refreshToken) {
 let credState = {};   // id -> { coolUntil: <ts>, fails: <n>, lastErr: <str> }
 let credCursor = 0;   // 轮询游标
 
+// ---------- v2.2.0：中转决策日志（内存环缓冲 + 聚合计数） ----------
+//
+// 两部分缺一不可：
+//   relayEvents —— 最近 RELAY_LOG_MAX 条明细，回答"刚才这个请求发生了什么"；
+//   relayAgg    —— 按 账号 × 结果 聚合的累计计数，回答"这个账号到底行不行"。
+//
+// 只有明细没法看趋势（要人肉数 200 条），只有聚合没法定位单次故障，
+// 所以两者都留。聚合计数直接供管理页出"账号健康矩阵"。
+let relayEvents = [];
+let relaySeq = 0;      // 事件序号，便于对齐明细与聚合
+
+// 聚合表：id -> { pick, ok, rate, risk, auth, client, net, cool, coolSec }
+// coolSec 累计"因该账号而等待的冷却秒数"，是判断"冷却时长设得合不合适"的关键指标：
+// 如果 coolSec 逼近总运行时长，说明池子太小/冷却太长，请求一直在等而不是在跑。
+let relayAgg = {};
+// 全局聚合：换号次数、耗尽次数、平均每请求尝试数 —— 轮换规则好坏的直接读数
+let relayTotals = { pick: 0, ok: 0, fail: 0, switch: 0, exhaust: 0, abort: 0, trunc: 0 };
+
+// 记录一条中转事件。
+//
+// 所有字段都用短名（id/ev/sec/why）：环缓冲只有 200 条，字段名长了内存翻倍，
+// 而这张表是要在 900MB 内存的路由器上长驻的。
+function relayLog(id, ev, why, extra) {
+	relaySeq++;
+	let e = {
+		n: relaySeq,          // 序号
+		t: time(),            // 时间戳
+		id: '' + (id || ''),  // 账号 id（'' 表示与账号无关的事件）
+		ev: '' + (ev || ''),  // 事件类型
+	};
+	if (why) e.why = substr('' + why, 0, 180);   // 截断：上游错误可能很长
+	if (extra) {
+		for (let k in extra) {
+			// ucode 没有全局 undefined（裸写 undefined 会被判为未定义标识符），
+			// 判空一律用 `!= null` —— 它同时覆盖 null 与 undefined。
+			if (extra[k] != null && extra[k] !== '')
+				e[k] = extra[k];
+		}
+	}
+
+	push(relayEvents, e);
+	// 环缓冲：超出上限丢最旧的。
+	//
+	// 用「新建数组 + 拷贝尾部」而不是 shift()：ucode 的数组方法集与 JS 不同
+	// （没有 slice，shift 是否可用在各版本间不一致），手写拷贝最稳。
+	// 只在超限时发生一次，n=200 的代价可忽略。
+	if (length(relayEvents) > RELAY_LOG_MAX) {
+		let keep = [];
+		let from = length(relayEvents) - RELAY_LOG_MAX;
+		for (let i = from; i < length(relayEvents); i++) push(keep, relayEvents[i]);
+		relayEvents = keep;
+	}
+
+	// 聚合
+	if (length(e.id) > 0) {
+		if (!relayAgg[e.id]) relayAgg[e.id] = {
+			pick: 0, ok: 0, rate: 0, risk: 0, auth: 0,
+			client: 0, net: 0, cool: 0, coolSec: 0,
+		};
+		let a = relayAgg[e.id];
+		if (a[e.ev] != null) a[e.ev]++;
+	}
+	if (relayTotals[e.ev] != null) relayTotals[e.ev]++;
+
+	return e;
+}
+
+// 记录一次冷却，附带时长（供 coolSec 累加）
+function relayLogCool(id, sec, why) {
+	let e = relayLog(id, 'cool', why, { sec: int(sec) });
+	if (length(e.id) > 0 && relayAgg[e.id]) relayAgg[e.id].coolSec += int(sec);
+	return e;
+}
+
+// 清空中转日志（管理页按钮）—— 用于"改完规则后从零观察效果"
+function relayReset() {
+	relayEvents = [];
+	relayAgg = {};
+	relaySeq = 0;
+	relayTotals = { pick: 0, ok: 0, fail: 0, switch: 0, exhaust: 0, abort: 0, trunc: 0 };
+}
+
+// 账号健康矩阵：把聚合计数整理成"一眼能判断该账号行不行"的行。
+//
+// 关键派生指标：
+//   okRate   = ok / pick      —— 选中后真正成功的比例（<50% 的账号应考虑剔除）
+//   rateRate = rate / pick    —— 被限流比例（高说明该账号配额小，适合低频用）
+//   coolSec  —— 累计冷却秒数（占运行时长比例过高说明池子太小）
+//
+// upSec 由调用方传入，不在这里读 metrics.since ——
+// metrics 声明在文件靠后处（initMetrics 之后），而 ucode 不提升顶层 let，
+// 在这里直接引用会抛 "access to undeclared variable metrics"。
+// 中转日志里的一行，到底是凭据池账号还是自建上游 Key？
+// 判据统一放在这里，避免各处 substr(key,0,3)==='up:' 写歪。
+function relayIsUpKey(key) { return substr('' + key, 0, 3) === 'up:'; }
+
+// 该账号/Key 当前还剩多少秒冷却。两张状态表形状相同但是**两张表**
+// （credState 管凭据池、upState 管自建上游的 Key），改错一侧等于没改。
+//
+// upState 走 F 表读取而不是直接引用：它声明在文件靠后处（upState 在 1900+ 行，
+// 本函数在 900 行附近）。ucode 在**函数定义时**就解析自由变量，直接写 upState
+// 会让静态检查报 "reference before declaration"，运行时则是
+// "access to undeclared variable"。F 表的存在就是为了绕开这个限制。
+function relayCoolingSec(isUp, key) {
+	if (isUp) {
+		let st = F.upStateGet(key);
+		if (st && st.coolUntil > time()) return st.coolUntil - time();
+		return 0;
+	}
+	let cs = credState[key];
+	if (cs && cs.coolUntil > time()) return cs.coolUntil - time();
+	return 0;
+}
+
+// 该账号/Key 最近一次失败原因，同样跨两张表取。
+function relayLastErr(isUp, key) {
+	if (isUp) {
+		let st = F.upStateGet(key);
+		return (st && st.lastErr) ? st.lastErr : '';
+	}
+	let cs = credState[key];
+	return (cs && cs.lastErr) ? cs.lastErr : '';
+}
+
+// 记录"一次账号/Key 被选中"。
+//
+// 口径（这是整个中转日志最容易搞错的地方）：
+//   relayTotals.pick  —— 选中次数 = 所有"选中相关"事件之和
+//                        （spawn 的 pick + 该次选中后的 rate/auth/net）
+//   账号行的 pick     —— 同一个口径，按账号分别统计（relayAccounts 里求和）
+//   成功率分母        —— 用上面这个 pick，而不是只数 'pick' 事件。
+//                        只数 'pick' 会让分母偏小，把 11% 的账号显示成 50%
+//                        （v2.2.0 真机验收真实出现过 totals=101 / 账号和=38）。
+//
+// 注意**不要**在这里再写 relayTotals.pick++：relayLog 内部的通用累加
+// `if (relayTotals[e.ev] != null) relayTotals[e.ev]++` 已经给 'pick' 事件
+// 计过一次了，再手动加一次会让总数直接翻倍。
+function relayPick(id, mode, extra) {
+	let ex = extra || {};
+	ex.mode = mode;
+	relayLog(id, 'pick', '', ex);
+}
+
+// 记录"一次选中以失败告终"。
+//
+// rate/auth/net 这些事件的 ev 不是 'pick'，所以 relayLog 的通用累加不会
+// 把它们计入 totals.pick —— 但它们确实属于"这次选中"，必须补上，
+// 否则全局 pick 会小于各账号 pick 之和，两处口径对不上。
+function relayFail(id, ev, why, extra) {
+	let ex = extra || {};
+	relayLog(id, ev, why, ex);
+	if (ev !== 'pick') relayTotals.pick++;
+}
+
+function relayAccounts(upSec) {
+	let out = [];
+	let up = (upSec && upSec > 0) ? upSec : 1;
+	let ids = [];
+	for (let id in relayAgg) push(ids, id);
+	// ucode 有 sort()，但为保证跨版本稳定这里手动插入排序（按 id 字典序）
+	for (let i = 1; i < length(ids); i++) {
+		let v = ids[i], j = i - 1;
+		while (j >= 0 && ids[j] > v) { ids[j + 1] = ids[j]; j--; }
+		ids[j + 1] = v;
+	}
+	// 注意：ucode 的 for..in 对数组给出的是「值」而不是「下标」
+	//（for (let i in ['a']) 里 i === 'a'），所以这里必须用显式索引循环。
+	for (let n = 0; n < length(ids); n++) {
+		let key = ids[n];
+		let a = relayAgg[key];
+		if (a == null) continue;
+		// 上游 Key 的 id 形如 'up:<upId>:<maskedKey>'。它们与凭据池账号是
+		// 两套完全不同的东西（一个是"用哪个 WorkBuddy 账号"，一个是
+		// "用哪把自定义上游 Key"），混在一张表里会让人以为某个账号叫
+		// "up:u123:sk-…"。用 kind 标出来，前端分成两张表渲染。
+		let isUp = relayIsUpKey(key);
+		// "选中次数"必须把该账号上的**所有**中转事件都算进去，而不能只数
+		// 'pick' 事件。
+		//
+		// 原因：选中同一个账号会留下不止一条事件 —— spawn 时记一条 'pick'，
+		// 之后这个账号被限流/鉴权失败时 markUpKeyFail 又各记一条 'rate'/'auth'/
+		// 'net'；这些失败事件同样发生在"它被选中"这一次里，且 relayTotals.pick
+		// 也是这么累加的（见 spawnUpstreamDirect 与 markUpKeyFail）。
+		//
+		// 曾经这里只写 a.pick，结果真机验收出现 totals.pick=101 而
+		// sum(account.pick)=38：另外 63 次全部散落在 rate/auth/net 里，
+		// 健康矩阵的「成功率」分母偏小，把 11% 的账号显示成 50%。
+		let picks = (a.pick || 0) + (a.rate || 0) + (a.risk || 0)
+			+ (a.auth || 0) + (a.client || 0) + (a.net || 0);
+		push(out, {
+			id: key,
+			kind: isUp ? 'up' : 'cred',
+			pick: picks,
+			ok: a.ok || 0,
+			rate: a.rate || 0,
+			risk: a.risk || 0,
+			auth: a.auth || 0,
+			client: a.client || 0,
+			net: a.net || 0,
+			cool: a.cool || 0,
+			coolSec: a.coolSec || 0,
+			okRate: picks > 0 ? int((a.ok || 0) * 100 / picks) : -1,      // 百分比整数，-1 = 无数据
+			rateRate: picks > 0 ? int((a.rate || 0) * 100 / picks) : -1,
+			coolPct: int((a.coolSec || 0) * 100 / up),                      // 冷却时长占运行时长百分比
+			// 「当前是否在冷却」要同时看两张表：凭据池账号的状态在 credState，
+			// 自建上游 Key 的在 upState。只看 credState 的话，上游 Key 那两栏
+			// 永远是「—」，而它们恰恰是最容易被限流的一群。
+			coolingSec: relayCoolingSec(isUp, key),
+			lastErr: relayLastErr(isUp, key),
+		});
+	}
+	return out;
+}
+
+// 最近事件，倒序（最新在前），最多 n 条。
+// 倒序是因为排障时关心的是"刚才那一下"，而不是"200 次之前"。
+function relayRecent(n) {
+	let out = [];
+	let total = length(relayEvents);
+	let start = total - n;
+	if (start < 0) start = 0;
+	for (let i = total - 1; i >= start; i--) push(out, relayEvents[i]);
+	return out;
+}
+
+// 中转日志快照。抽成独立函数，是因为两处要用同一份数据：
+//   GET /metrics            —— 给监控/脚本读
+//   GET /admin/api/state    —— 给管理页「中转日志」页签渲染
+// 两处各写一份的话，字段迟早会漂移，前端就会莫名其妙地少一列。
+//
+// 必须定义在这里（relayRecent 之后、handleAdmin 之前）：ucode 在函数**定义时**
+// 就解析自由变量，定义在 handleAdmin 后面的话，管理页一加载就抛
+// "left-hand side is not a function"。这条规则 v2.2.0 已经踩过两次。
+//
+// upSec 由调用方传入，而不是在这里读 metrics.since —— metrics 声明在文件
+// 靠后处（initMetrics 之后），本函数在这里引用它会触发
+// "access to undeclared variable metrics"（relayAccounts 出于同样理由收 upSec）。
+function relaySnapshot(upSec) {
+	let up = (upSec && upSec > 0) ? upSec : 0;
+	return {
+		totals: {
+			pick: relayTotals.pick,
+			ok: relayTotals.ok,
+			fail: relayTotals.fail,
+			switch: relayTotals.switch,
+			exhaust: relayTotals.exhaust,
+			abort: relayTotals.abort,
+			trunc: relayTotals.trunc,
+		},
+		// 每个账号一行健康矩阵。按 id 排序保证输出稳定，便于前后对比。
+		accounts: relayAccounts(up),
+		// 最近事件（倒序，最新在前）—— 排障时看的是"刚刚发生了什么"
+		recent: relayRecent(40),
+		capacity: RELAY_LOG_MAX,
+		totalEvents: relaySeq,
+	};
+}
+
 // 读池文件的原始条目（含禁用项，不去重），供管理页展示与编辑。
 function readPoolRaw() {
 	let j = readJsonFile(TOKEN_POOL_FILE);
@@ -758,6 +1081,76 @@ function readPoolRaw() {
 function savePoolRaw(list) {
 	return writeJsonFile(TOKEN_POOL_FILE, { credentials: list });
 }
+
+// v2.2.0：把一次「网页登录」得到的 token 追加进凭据池。
+//
+// 与 addPoolCred 的区别（这是本函数存在的全部理由）：
+//   addPoolCred      面向**手动粘贴**，撞到重复账号时拒绝（用户主动输入，需要明确反馈）；
+//   addWebLoginCred  面向**登录流程**，撞到同一账号时**就地更新**而不是拒绝 ——
+//                    用户重新登录同一账号是正常操作（token 过期要续期），
+//                    此时必须刷新 token，绝不能报错、更不能覆盖别的账号。
+//
+// 返回 { ok, added, updated, id, name } 或 { ok:false, error }。
+function addWebLoginCred(cfg, token) {
+	token = trim('' + (token || ''));
+	if (length(token) < 20)
+		return { ok: false, error: '登录返回的 token 过短' };
+
+	let info = parseJwt(token);
+	if (info === null)
+		return { ok: false, error: '登录返回的不是有效 JWT' };
+
+	let sub = (info && length(info.sub) > 0) ? info.sub : '';
+	let list = readPoolRaw();
+
+	// 1) 同一账号已存在 -> 就地更新 token（刷新），保留 id/name/位置不变。
+	//    按 sub 匹配而不是按 token 全文：同一账号重新登录会拿到新 token
+	//    （jti/iat 都变了），按全文匹配必然匹配不上，结果就是"同一账号存了多份"。
+	if (length(sub) > 0) {
+		for (let c in list) {
+			let ci = parseJwt('' + (c.accessToken || ''));
+			if (ci && length(ci.sub) > 0 && ci.sub === sub) {
+				let oldName = '' + (c.name || '');
+				c.accessToken = token;
+				c.syncedAt = time();
+				// 重新登录说明账号恢复可用，清掉旧的冷却/失败标记
+				delete credState['' + (c.id || '')];
+				if (!savePoolRaw(list))
+					return { ok: false, error: '更新凭据池失败' };
+				logInfo('weblogin refreshed existing credential: ' + c.id + ' (' + oldName + ')');
+				return { ok: true, added: false, updated: true, id: '' + (c.id || ''), name: oldName };
+			}
+		}
+	}
+
+	// 2) 新账号 -> 追加，**绝不触碰**已有条目
+	let base = 'w' + time();
+	let id = base;
+	let n = 1;
+	let taken = {};
+	for (let c in list) taken['' + (c.id || '')] = true;
+	while (taken[id]) { id = base + '-' + n; n++; }
+
+	let nm = (info && length(info.username) > 0) ? info.username : ('网页登录 ' + (length(list) + 1));
+
+	push(list, {
+		id: id,
+		name: nm,
+		accessToken: token,
+		enabled: true,
+		source: 'weblogin',
+		syncedAt: time(),
+	});
+	if (!savePoolRaw(list))
+		return { ok: false, error: '写入凭据池失败' };
+
+	logInfo(sprintf('weblogin credential appended: %s (%s), pool size now %d',
+		id, nm, length(list)));
+	return { ok: true, added: true, updated: false, id: id, name: nm };
+}
+
+// 挂到前向引用表：saveToken() 定义在文件靠前处，需要调用本函数。
+F.addWebLoginCred = addWebLoginCred;
 
 function findPoolById(id) {
 	for (let c in readPoolRaw())
@@ -1041,10 +1434,11 @@ function usablePool(cfg) {
 
 // 标记凭据异常并进入冷却。retryAfter（秒）为上游响应头里的 Retry-After 窗口，
 // 仅在限流类失败时被采信（风控/鉴权类不采信 —— 那些是账号级问题，重试窗口没意义）。
-// rate 由调用方传入（isRateLimitReason 定义在本函数之后，ucode 不提升，不能在此调用）。
-function markCredFail(cfg, id, reason, rate, retryAfter) {
+// rate/auth 由调用方传入（isRateLimitReason / isAuthReason 定义在本函数之后，
+// ucode 不提升，不能在此调用）。
+function markCredFail(cfg, id, reason, rate, retryAfter, auth) {
 	let now = time();
-	let st = credState[id] || { coolUntil: 0, fails: 0, probs: 0, lastErr: '' };
+	let st = credState[id] || { coolUntil: 0, coolAt: 0, fails: 0, probs: 0, lastErr: '' };
 	let risk = isRiskControlReason(reason);
 	// v2.1.0：429/限流属于"暂时问题"（probs），不累计 fails —— fails 只反映
 	// 真正变冷的失败（风控/鉴权/网络），避免最健康的凭据因被限流而越排越后。
@@ -1071,17 +1465,41 @@ function markCredFail(cfg, id, reason, rate, retryAfter) {
 	cool = int(cool * jitterFactor());
 	if (cool < 1) cool = 1;
 	st.coolUntil = now + cool;
+	st.coolAt = now;
 	st.lastErr = '' + reason;
 	credState[id] = st;
 	logErr(sprintf('credential %s cooling down %ds: %s', id, cool, reason));
+
+	// v2.2.0：记进中转日志。分类入账，便于统计"这个账号主要栽在哪一类"。
+	// rate/risk/auth 三类分开记 —— 它们的处置方式完全不同（等一会 / 弃用 / 换 token），
+	// 混在一起就失去了优化轮换规则所需的分辨率。
+	let ev = rate ? 'rate' : (risk ? 'risk' : (auth ? 'auth' : 'net'));
+	relayLogCool(id, cool, reason);
+	relayLog(id, ev, reason);
 }
 
 function markCredOk(id) {
-	if (!credState[id]) return;
+	if (!credState[id]) {
+		// 即便没有冷却记录也要记一次成功 —— 聚合表需要"这个账号成功过几次"，
+		// 全新账号第一次就成功时 credState 里还没有条目。
+		relayLog(id, 'ok');
+		return;
+	}
 	credState[id].fails = 0;
 	credState[id].probs = 0;
-	credState[id].coolUntil = 0;
 	credState[id].lastErr = '';
+
+	// v2.2.0：结算本次冷却的实际经历时长，与 markUpKeyOk 同理 ——
+	// 冷却时长来自"按失败类型给的"或"上游 Retry-After 指定的"，
+	// 事后无法还原，只有起止两个时间戳相减才得到真实值。
+	let spent = 0;
+	if (credState[id].coolAt && credState[id].coolUntil > credState[id].coolAt)
+		spent = credState[id].coolUntil - credState[id].coolAt;
+	credState[id].coolUntil = 0;
+	credState[id].coolAt = 0;
+	if (spent > 0) relayLogCool(id, spent, 'cooldown served');
+
+	relayLog(id, 'ok');
 }
 
 // 凭据健康摘要（供 /health 使用）。
@@ -1428,11 +1846,17 @@ function metricMode(conn) {
 function recordConnMetrics(conn) {
 	if (!conn.reqAt) return;   // 不是聊天请求（/health、/models、管理页等）
 	metrics.chatTotal++;
+	// v2.2.0：把整条请求的结局补进中转日志。
+	// 上面那些 marker 事件（pick/rate/switch）只是"过程中的站点"，
+	// 缺了这条收尾记录就没法算"选 A 号最终成功率是多少"。
+	let durMs = nowMs() - conn.reqAt;
 	// v2.1.0：客户端在响应完成前断开（读侧 EOF / 写失败）单独记 abort 桶，
 	// 不再让 sseHeaders 先置的 httpStatus=200 把这类请求误算成成功。
 	if (conn.aborted) {
 		metrics.chatAborted++;
-		histAdd(metricMode(conn).total, nowMs() - conn.reqAt);
+		histAdd(metricMode(conn).total, durMs);
+		relayLog(conn.credId || '', 'abort', '', { req: conn.reqId || '', ms: durMs });
+		relayTotals.abort++;
 		return;
 	}
 	let st = conn.httpStatus || 0;
@@ -1440,7 +1864,14 @@ function recordConnMetrics(conn) {
 	else if (st === 429) { metrics.rateLimited429++; metrics.chatFail++; }
 	else if (st >= 400 && st < 500) metrics.chatClientErr++;
 	else metrics.chatFail++;
-	histAdd(metricMode(conn).total, nowMs() - conn.reqAt);
+	histAdd(metricMode(conn).total, durMs);
+
+	// 截断（流式没收尾）单独标记：它比"彻底失败"更危险 ——
+	// 客户端可能把半截回答当成完整回答用掉，而状态码还是 200。
+	if (conn.headersSent && conn.sawDone === false && conn.wantNonStream !== true) {
+		relayLog(conn.credId || '', 'trunc', '', { req: conn.reqId || '', ms: durMs });
+		relayTotals.trunc++;
+	}
 }
 
 // 读取上游配置。返回数组，每条形如：
@@ -1511,6 +1942,10 @@ function loadUpstreams() {
 
 // 上游健康状态：仅存内存，重启即清（冷却本来就不该跨重启持久化）
 let upState = {};
+// v2.2.0：供文件前部的 relayCoolingSec / relayLastErr 读取本表。
+// 那两个函数在 900 行附近，直接写 upState 会触发 ucode 的
+// "reference before declaration"（定义时解析自由变量），故经 F 表绕行。
+F.upStateGet = function (key) { return upState[key]; };
 // v1.8.1 上游级限流刹车状态：upId -> { hits, winStart, openUntil, trip, waited, rejected }
 let upBrake = {};
 // v2.0：会话粘性表：upId|client -> { key, until }（client 为 API Key 名或客户端 IP）
@@ -1880,7 +2315,7 @@ function usableUpKeys(up, stickyFor) {
 function markUpKeyFail(up, key, reason, retryAfter) {
 	let now = time();
 	let id = up.id + '|' + key;
-	let st = upState[id] || { coolUntil: 0, fails: 0, probs: 0, lastErr: '' };
+	let st = upState[id] || { coolUntil: 0, coolAt: 0, fails: 0, probs: 0, lastErr: '' };
 
 	// v2.1.0：失败分类 —— 429/限流是"暂时问题"（probs），不累计 fails。
 	// 原实现把所有失败都累进 fails，限流也因此参与指数退避（5→10→20s），
@@ -1915,10 +2350,21 @@ function markUpKeyFail(up, key, reason, retryAfter) {
 	if (cool < 1) cool = 1;
 
 	st.coolUntil = now + cool;
+	// 冷却起点。只有"起点 + 终点"两个时间戳都在，markUpKeyOk 才能算出这次
+	// 冷却实际持续了多久（v2.2.0 的冷却占比指标依赖它）。
+	st.coolAt = now;
 	st.lastErr = '' + reason;
 	upState[id] = st;
 	logErr(sprintf('upstream %s key %s cooling %ds (%s): %s',
 		up.prefix, maskKey(key), cool, rate ? '限流' : (auth ? '鉴权' : '瞬时'), reason));
+
+	// v2.2.0：自建上游的 Key 也进中转日志。
+	// 账号 id 用 "up:<upstreamId>:<maskedKey>" —— 与凭据池的 c<ts> 区分开，
+	// 健康矩阵里一眼能看出这是自有上游的 Key 而不是 WorkBuddy 账号。
+	// 用 relayFail 而不是裸 relayLog：限流/鉴权失败也属于"这次选中"，
+	// 必须同时计入该 Key 的 pick 与全局 pick（口径见 relayPick 的注释）。
+	relayFail('up:' + up.id + ':' + maskKey(key),
+		rate ? 'rate' : (auth ? 'auth' : 'net'), reason, { sec: cool });
 
 	// 指标埋点就放这里：本函数是"这把 Key 失败过"的唯一入口，
 	// 分档判据 rate/auth 上一行已经算好，不必让指标层再判一遍。
@@ -1961,11 +2407,35 @@ function markUpKeyOk(up, key) {
 	brakeClear(up);
 
 	let id = up.id + '|' + key;
+
+	// 与上面两处同理：中转日志的成功计数也必须放在提前 return **之前**。
+	// 一把从未失败过的 Key 在 upState 里没有条目，若把 relayLog 放在
+	// return 之后，它每次成功都不会被记录，健康矩阵里就会显示成
+	// "选中 6 次、成功 0 次、成功率 0%"——看起来像这把 Key 完全不可用，
+	// 而事实恰恰相反（它一次都没被限流）。v2.2.0 首次真机验收就撞上了这个坑：
+	// pick=52 但 ok 只有 5。
+	relayLog('up:' + up.id + ':' + maskKey(key), 'ok');
+
 	if (!upState[id]) return;
 	upState[id].fails = 0;
 	upState[id].probs = 0;
-	upState[id].coolUntil = 0;
 	upState[id].lastErr = '';
+
+	// v2.2.0：结算本次冷却的"实际经历时长"。
+	//
+	// 为什么必须在这里算：冷却时长有两个来源，事后无法还原 ——
+	//   ① 我们按失败类型给的（UP_RATE_COOL / UP_AUTH_COOL / 指数退避）
+	//   ② 上游 Retry-After 指定的（markUpKeyFail 采信并夹到 MAX_RETRY_AFTER）
+	// 只有"开始冷却的时刻"（记在 coolAt）和"冷却真正结束的时刻"（此刻）两个
+	// 时间戳相减，才是这把 Key 实际被冷藏了多久。少了这一步，健康矩阵里的
+	// 「冷却占比」永远是 0 —— 真机首测就是这样：限流 29 次、冷却次数 0，
+	// 评估冷却参数时看不到任何信号。
+	let spent = 0;
+	if (upState[id].coolAt && upState[id].coolUntil > upState[id].coolAt)
+		spent = upState[id].coolUntil - upState[id].coolAt;
+	upState[id].coolUntil = 0;
+	upState[id].coolAt = 0;
+	if (spent > 0) relayLogCool('up:' + up.id + ':' + maskKey(key), spent, 'cooldown served');
 }
 
 // ---------- v2.0：成功收尾 / token 用量统计 ----------
@@ -3647,6 +4117,13 @@ function spawnUpstream(conn) {
 	logInfo(sprintf('chat via credential %s (attempt %d/%d) req=%s',
 		cred.id, conn.tries, conn.tryLimit, conn.reqId || '?'));
 
+	// v2.2.0：记录这次选中。poolSize 一并记下 —— 排查"为什么总是同一个账号"
+	// 时，第一个要看的就是当时池子到底有几个可选项（池子只有 1 个时，
+	// 任何"轮换不生效"的怀疑都是误判）。
+	relayPick(cred.id, 'pool', {
+		try: conn.tries, poolSize: length(conn.pool),
+	});
+
 	// 带上客户端版本：上游目前不校验版本，但统一的 UA 更贴近真实客户端，
 	// 也便于日后上游若启用版本门禁时不必再改代码。
 	let ua = clientVersion(cfg);
@@ -3711,12 +4188,12 @@ function tryNextCred(conn, reason) {
 		// 上游真实限流时长，而不是全靠本地猜测。
 		let hdr = readUpstreamStatus(conn);
 		let rate = isRateLimitReason(reason);
+		let auth = isAuthReason(reason);
 		// 状态码为 429 但响应体没匹配到限流关键词时，以状态码为准（Anthropic
 		// spend-cap 429 与普通限流 error type 相同，只能靠 Retry-After 区分）。
 		if (hdr && hdr.status === 429 && !rate) rate = true;
-		markCredFail(cfg, conn.credId, reason, rate, hdr ? hdr.retryAfter : 0);
-		metricFail('wb', conn.credId,
-			rate ? 'rate' : (isAuthReason(reason) ? 'auth' : ''), reason);
+		markCredFail(cfg, conn.credId, reason, rate, hdr ? hdr.retryAfter : 0, auth);
+		metricFail('wb', conn.credId, rate ? 'rate' : (auth ? 'auth' : ''), reason);
 	}
 
 	if (conn.headersSent) {
@@ -3726,9 +4203,17 @@ function tryNextCred(conn, reason) {
 	}
 
 	if (conn.tries < conn.tryLimit) {
+		// v2.2.0：换号也要记一笔。"换号后成功率"是评估轮换规则的核心指标 ——
+		// 如果 switch 很多但 ok 很少，说明池子里能用的账号太少，或冷却太短
+		// 导致刚跳过又跳回来。
+		relayLog('', 'switch', reason, { from: conn.credId, try: conn.tries });
 		F.spawnUpstream(conn);
 		return;
 	}
+
+	// v2.2.0：所有账号试完仍未成功 —— 这是最需要告警的结局
+	relayLog('', 'exhaust', reason, { tries: conn.tries, limit: conn.tryLimit });
+	relayTotals.fail++;
 
 	// 风控类失败附一句人话解释。否则客户端只拿到 "上游错误码：11140"，
 	// 无法判断是"我写的问题太敏感"还是"账号被封了"—— 后者要换账号，
@@ -3825,6 +4310,13 @@ function spawnUpstreamDirect(conn) {
 
 	logInfo(sprintf('chat via upstream %s key %s (attempt %d/%d) req=%s',
 		up.prefix, maskKey(key), conn.upTry, length(conn.upKeys), conn.reqId || '?'));
+
+	// v2.2.0：自建上游的选中也记一笔，keyCount 说明当时有几把 Key 可轮。
+	// 注意不在这里赋 conn.upKeyInUse —— 那由 spawn 成功后统一设置（见本函数尾部），
+	// 提前赋值会让"spawn 失败但日志显示已选中"这种假象混进健康矩阵。
+	relayPick('up:' + up.id + ':' + maskKey(key), 'direct', {
+		try: conn.upTry, keyCount: length(conn.upKeys),
+	});
 
 	// Accept 头必须跟着 body 的 stream 字段走。
 	// 自定义上游（sensenova 等）看到 Accept: text/event-stream 就会返回 SSE，
@@ -4770,6 +5262,7 @@ function adminAppPage() {
     <button data-t="keys" onclick="tab('keys')">API 密钥</button>
     <button data-t="ups" onclick="tab('ups')">服务器管理</button>
     <button data-t="creds" onclick="tab('creds')">凭据池</button>
+    <button data-t="relay" onclick="tab('relay')">中转日志</button>
     <button data-t="cfg" onclick="tab('cfg')">设置</button>
   </div>
 
@@ -4896,6 +5389,27 @@ function adminAppPage() {
     </div>
   </div>
 
+  <div id="t-relay" class="hide">
+    <div class="card">
+      <h2>中转轮换分析</h2>
+      <p class="desc">按账号统计的轮换质量：每个账号被选中多少次、成功/限流/风控/鉴权/客户端/网络各多少次，
+        以及累计冷却时长占比。这些数字就是调轮换规则的依据——例如某个账号
+        <b>限流率</b>长期偏高，就该把它权重调低；<b>冷却占比</b>接近 100% 说明它基本不可用。</p>
+      <p class="hint">统计自进程启动（或上次重置）起累计，只存在内存里，重启即清零。</p>
+      <div id="relayBody">加载中…</div>
+    </div>
+
+    <div class="card">
+      <h2>最近中转事件</h2>
+      <p class="desc">最新 40 条。排障时先看这里：连着几条 <code>cool</code> 说明上游在限流，
+        出现 <code>switch</code> 说明已经换号，出现 <code>exhaust</code> 说明所有账号都试过了。</p>
+      <div id="relayEvents">加载中…</div>
+      <div class="row" style="margin-top:12px">
+        <button onclick="resetRelay()">重置统计</button>
+      </div>
+    </div>
+  </div>
+
   <div id="t-cfg" class="hide">
     <div class="card">
       <h2>服务设置</h2>
@@ -4988,7 +5502,7 @@ function api(path, body) {
 }
 
 function tab(name) {
-  var names = ['ov','keys','ups','creds','cfg'];
+  var names = ['ov','keys','ups','creds','relay','cfg'];
   for (var i = 0; i < names.length; i++) {
     document.getElementById('t-' + names[i]).className = (names[i] === name) ? '' : 'hide';
   }
@@ -5008,7 +5522,7 @@ function load() {
   api('state').then(function(d) {
     S = d;
     document.getElementById('bVer').textContent = 'v' + d.version;
-    renderOv(d); renderModels(d); renderKeys(d); renderCreds(d); renderUpstreams(d); renderCfg(d); renderWan(d);
+    renderOv(d); renderModels(d); renderKeys(d); renderCreds(d); renderUpstreams(d); renderRelay(d); renderCfg(d); renderWan(d);
 
     // 如果服务端还有一个登录流程在等授权（比如页面被刷新过），
     // 就恢复显示并接着轮询，不要让它变成"看不见的后台任务"。
@@ -5352,7 +5866,7 @@ function renderCreds(d) {
     h += '<tr><td>' + esc(c.name) + '</td>' +
          '<td>' + account + '</td>' +
          '<td>' + credBadge(c) + '</td>' +
-         '<td><span class="badge">' + (c.source === 'legacy' ? '网页登录' : '手动添加') + '</span></td>' +
+         '<td><span class="badge">' + (c.source === 'legacy' ? '网页登录' : (c.weblogin ? '网页登录' : '手动添加')) + '</span></td>' +
          '<td style="white-space:nowrap">' + actions + '</td></tr>';
   }
   h += '</tbody></table>';
@@ -5368,6 +5882,165 @@ function renderCreds(d) {
             (bad ? '，<span style="color:var(--err)">' + bad + ' 条已过期需更换</span>' : '') + '。</p>';
 
   box.innerHTML = sum + h;
+}
+
+// ---------- 中转日志 ----------
+
+// 事件类型 → 中文标签 + 颜色类。用查表而不是 if 链，
+// 是为了新增事件类型时只改这一处，不会漏掉某个分支。
+var RELAY_EV = {
+  pick:    ['选中', 'ok'],
+  ok:      ['成功', 'ok'],
+  rate:    ['限流', 'warn'],
+  risk:    ['风控', 'err'],
+  auth:    ['鉴权', 'err'],
+  client:  ['请求错', 'warn'],
+  net:     ['网络', 'warn'],
+  cool:    ['冷却', 'warn'],
+  switch:  ['换号', 'dim'],
+  exhaust: ['耗尽', 'err'],
+  abort:   ['中断', 'dim'],
+  trunc:   ['截断', 'err'],
+};
+
+function relayBadge(ev) {
+  var m = RELAY_EV[ev];
+  var label = m ? m[0] : ev;
+  var cls = m ? m[1] : 'dim';
+  // dim 不是 badge 的既有配色，退化成一个普通 badge
+  if (cls === 'dim') return '<span class="badge">' + esc(label) + '</span>';
+  return '<span class="badge ' + cls + '">' + esc(label) + '</span>';
+}
+
+// 比率 -> 文本 + 配色。'-1' 是无数据的哨兵（pick 为 0 时算不出比率），
+// 必须显示成「—」而不是「-1%」，否则用户会以为出了负数故障。
+function pctCell(v, warnAt, errAt) {
+  if (v == null || v < 0) return '<span style="opacity:.4">—</span>';
+  var cls = '';
+  if (errAt != null && v >= errAt) cls = ' style="color:var(--err)"';
+  else if (warnAt != null && v >= warnAt) cls = ' style="color:var(--warn)"';
+  return '<span' + cls + '>' + v + '%</span>';
+}
+
+function relTime(t) {
+  var d = Math.floor(Date.now() / 1000) - t;
+  if (d < 0) d = 0;
+  if (d < 60) return d + ' 秒前';
+  if (d < 3600) return Math.floor(d / 60) + ' 分钟前';
+  if (d < 86400) return Math.floor(d / 3600) + ' 小时前';
+  return Math.floor(d / 86400) + ' 天前';
+}
+
+function renderRelay(d) {
+  var box = document.getElementById('relayBody');
+  var evBox = document.getElementById('relayEvents');
+  var r = d.relay;
+  if (!r) {
+    box.innerHTML = '<p class="hint">本版本未提供中转日志。</p>';
+    evBox.innerHTML = '';
+    return;
+  }
+
+  // ---- 顶部总计 ----
+  var t = r.totals || {};
+  var h = '<p class="hint" style="margin:0 0 10px">累计 ' + (r.totalEvents || 0) + ' 条事件，' +
+          '保留最近 ' + (r.capacity || 0) + ' 条明细。</p>';
+  h += '<div class="kv"><span class="k">选中账号</span><span>' + (t.pick || 0) + ' 次</span></div>';
+  h += '<div class="kv"><span class="k">成功</span><span>' + (t.ok || 0) + ' 次</span></div>';
+  h += '<div class="kv"><span class="k">换号 / 全部耗尽</span><span>' + (t.switch || 0) + ' 次 / ' +
+       (t.exhaust || 0) + ' 次</span></div>';
+  h += '<div class="kv"><span class="k">响应中断 / 截断</span><span>' + (t.abort || 0) + ' 次 / ' +
+       (t.trunc || 0) + ' 次</span></div>';
+
+  // ---- 账号健康矩阵 ----
+  // 凭据池账号与自定义上游 Key 是两套东西，分两张表渲染，
+  // 否则用户会看到 "up:u123:sk-xxx" 这种 id 混在账号列表里。
+  var accs = r.accounts || [];
+  var creds = [], ups = [];
+  for (var q = 0; q < accs.length; q++) {
+    if (accs[q].kind === 'up') ups.push(accs[q]); else creds.push(accs[q]);
+  }
+
+  function matrix(list, title, note) {
+    if (!list.length) return '';
+    var t2 = '<h3 style="margin:16px 0 8px">' + title + '</h3>';
+    t2 += '<table><thead><tr>' +
+          '<th>账号 / Key</th><th>选中</th><th>成功</th><th>成功率</th>' +
+          '<th>限流</th><th>限流率</th><th>风控</th><th>鉴权</th><th>网络</th>' +
+          '<th>冷却次数</th><th>冷却占比</th><th>当前冷却</th><th>最近错误</th>' +
+          '</tr></thead><tbody>';
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i];
+      var cooling = a.coolingSec > 0
+        ? '<span style="color:var(--warn)">' + a.coolingSec + 's</span>'
+        : '<span style="opacity:.4">—</span>';
+      t2 += '<tr>' +
+           '<td><code>' + esc(a.id) + '</code></td>' +
+           '<td>' + a.pick + '</td>' +
+           '<td>' + a.ok + '</td>' +
+           '<td>' + pctCell(a.okRate, null, null) + '</td>' +
+           '<td>' + a.rate + '</td>' +
+           '<td>' + pctCell(a.rateRate, 30, 60) + '</td>' +
+           '<td>' + (a.risk || 0) + '</td>' +
+           '<td>' + (a.auth || 0) + '</td>' +
+           '<td>' + (a.net || 0) + '</td>' +
+           '<td>' + (a.cool || 0) + '</td>' +
+           '<td>' + pctCell(a.coolPct, 50, 80) + '</td>' +
+           '<td>' + cooling + '</td>' +
+           '<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
+             esc(a.lastErr) + '">' + (a.lastErr ? esc(a.lastErr) : '<span style="opacity:.4">—</span>') + '</td>' +
+           '</tr>';
+    }
+    t2 += '</tbody></table>';
+    t2 += '<p class="hint" style="margin-top:8px">' + note + '</p>';
+    return t2;
+  }
+
+  h += matrix(creds, '凭据池账号',
+    '成功率＝成功 / 选中。限流率超过 30% 标黄、60% 标红，说明该账号额度紧张，' +
+    '应考虑降低它的使用频率；冷却占比接近 100% 表示它基本不可用。');
+  h += matrix(ups, '自定义上游 Key',
+    '这些是「自定义上游」里配置的 Key，与凭据池账号无关。' +
+    '限流率高的 Key 应调低权重或换成额度更大的账号。');
+
+  if (!accs.length) {
+    h += '<p class="hint" style="margin-top:12px">还没有中转记录。发几个请求就会出现。</p>';
+  }
+  box.innerHTML = h;
+
+  // ---- 最近事件 ----
+  var evs = r.recent || [];
+  if (!evs.length) {
+    evBox.innerHTML = '<p class="hint">暂无事件。</p>';
+    return;
+  }
+  var e = '<table><thead><tr><th style="white-space:nowrap">时间</th><th>事件</th>' +
+          '<th>账号 / Key</th><th>说明</th><th>附加</th></tr></thead><tbody>';
+  for (var k = 0; k < evs.length; k++) {
+    var v = evs[k];
+    // 附加字段（sec/req/try 等）逐条列出，它们排障时最有用
+    var extra = '';
+    for (var key in v) {
+      if (key === 'n' || key === 't' || key === 'id' || key === 'ev' || key === 'why') continue;
+      extra += '<span class="badge">' + esc(key) + '=' + esc(v[key]) + '</span> ';
+    }
+    e += '<tr>' +
+         '<td style="white-space:nowrap">' + relTime(v.t) + '</td>' +
+         '<td>' + relayBadge(v.ev) + '</td>' +
+         '<td><code>' + (v.id ? esc(v.id) : '<span style="opacity:.4">—</span>') + '</code></td>' +
+         '<td style="max-width:360px">' + (v.why ? esc(v.why) : '') + '</td>' +
+         '<td>' + extra + '</td>' +
+         '</tr>';
+  }
+  e += '</tbody></table>';
+  evBox.innerHTML = e;
+}
+
+function resetRelay() {
+  api('relay/reset', {}).then(function(r) {
+    if (r && r.ok) { toast('中转统计已重置', 'ok'); load(); }
+    else { toast('重置失败：' + ((r && r.error) || '未知错误'), 'err'); }
+  });
 }
 
 // ---------- 凭据池操作 ----------
@@ -5773,6 +6446,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 				id: '' + (c.id || ''),
 				name: '' + (c.name || c.id || ''),
 				source: 'pool',
+				weblogin: (('' + (c.source || '')) === 'weblogin'),  // 网页登录来的条目，徽章显示"网页登录"
 				enabled: (c.enabled !== false),
 				managed: true,                       // 可在管理页删除/启停
 				status: st,                          // ok | expiring | expired | unknown
@@ -5788,34 +6462,52 @@ function handleAdmin(conn, req, method, path, query, body) {
 			});
 		}
 
-		// 网页登录凭据（token.json）。它是池的一部分，但**不走 pool.json 那套**
-		// 增删改：没有启停开关（它在另一个存储里），删除也走另一条路径
-		// （清掉 token.json 本体）。所以单独标注 managed=false，
-		// 前端据此换成「测试 / 删除账号」这组按钮。
+		// 网页登录镜像（token.json）。
+		//
+		// v2.2.0 起，网页登录得到的账号**已经**以普通条目形式写进 pool.json
+		// （见 addWebLoginCred），token.json 退化成"最近一次登录的镜像"。
+		// 因此这里必须按 JWT sub 去重，否则同一个账号会在表格里出现两行 ——
+		// 一行是池条目（可启停/可删除），一行是这个镜像（managed=false），
+		// 用户会以为配了两个账号，还会困惑"删哪个才对"。
+		//
+		// 保留这块显示的意义：兼容"只升级了 ucode 但还没重新登录"的存量设备 ——
+		// 那种情况下 token.json 里的账号确实不在池里，必须让用户看到并管理它。
 		let legacyTok = getToken(cfg);
 		if (legacyTok) {
-			let lj = readJsonFile(tokenPath(cfg)) || {};
 			let info = parseJwt(legacyTok);
-			let st = credStatus(legacyTok, now);
-			let stt = credState['default'] || {};
-			let cool = (stt.coolUntil || 0) > now;
-			push(creds, {
-				id: 'default',
-				name: '网页登录凭据',
-				source: 'legacy',
-				enabled: true,
-				managed: false,
-				status: st,
-				exp: info ? info.exp : 0,
-				expDays: (info && info.exp) ? int((info.exp - now) / 86400) : -1,
-				username: info ? info.username : '',
-				accountId: info ? info.sub : '',
-				tail: length(legacyTok) >= 8 ? substr(legacyTok, length(legacyTok) - 8) : '',
-				tokenLength: length(legacyTok),
-				syncedAt: lj.syncedAt || 0,
-				cooling: cool,
-				coolRemain: cool ? ((stt.coolUntil || 0) - now) : 0,
-			});
+			let alreadyInPool = false;
+			if (info && length(info.sub) > 0 && seenSub[info.sub])
+				alreadyInPool = true;
+			// sub 解析不出来时退回按 token 全文比对，避免重复行
+			if (!alreadyInPool) {
+				for (let c in rawList) {
+					if (('' + (c.accessToken || '')) === legacyTok) { alreadyInPool = true; break; }
+				}
+			}
+
+			if (!alreadyInPool) {
+				let lj = readJsonFile(tokenPath(cfg)) || {};
+				let st = credStatus(legacyTok, now);
+				let stt = credState['default'] || {};
+				let cool = (stt.coolUntil || 0) > now;
+				push(creds, {
+					id: 'default',
+					name: '网页登录凭据',
+					source: 'legacy',
+					enabled: true,
+					managed: false,
+					status: st,
+					exp: info ? info.exp : 0,
+					expDays: (info && info.exp) ? int((info.exp - now) / 86400) : -1,
+					username: info ? info.username : '',
+					accountId: info ? info.sub : '',
+					tail: length(legacyTok) >= 8 ? substr(legacyTok, length(legacyTok) - 8) : '',
+					tokenLength: length(legacyTok),
+					syncedAt: lj.syncedAt || 0,
+					cooling: cool,
+					coolRemain: cool ? ((stt.coolUntil || 0) - now) : 0,
+				});
+			}
 		}
 
 		let usable = loadPool(cfg);
@@ -5869,6 +6561,9 @@ function handleAdmin(conn, req, method, path, query, body) {
 			// 内置服务器（WorkBuddy 自身）的状态，供服务器列表首卡展示
 			hasToken: (length(loadPool(cfg)) > 0),
 			endpoint: cfg.endpoint,
+			// 中转日志（v2.2.0）。管理页的「中转日志」页签全靠这一块，
+			// 少了它前端只会显示"本版本未提供中转日志"。
+			relay: relaySnapshot(time() - metrics.since),
 		});
 		return;
 	}
@@ -5999,6 +6694,15 @@ function handleAdmin(conn, req, method, path, query, body) {
 			remain: el > 0 ? el : 0,
 			lastError: '' + (login.lastError || ''),
 		});
+		return;
+	}
+
+	if (path === '/admin/api/relay/reset' && method === 'POST') {
+		// 只清中转日志的统计，不动任何账号/密钥——用户想重新观察一段时间
+		// 的轮换质量时用，不应该有任何破坏性副作用。
+		relayReset();
+		logInfo('admin reset relay stats' + who);
+		jsonResponse(conn, 200, { ok: true });
 		return;
 	}
 
@@ -6308,6 +7012,11 @@ function metricsSnapshot() {
 			upMaxInflight: cfg.upMaxInflight,
 			wbMaxInflight: cfg.wbMaxInflight,
 		},
+		// v2.2.0：中转决策日志。relay 是"轮换规则好不好"的唯一客观依据 ——
+		// switch/exhaust 比、各账号 ok/rate 比、coolSec 占比，都从这里读。
+		// 抽成 relaySnapshot() 是因为 /admin/api/state 也要用它，
+		// 两处各写一份迟早会漂移。
+		relay: relaySnapshot(time() - metrics.since),
 		// 直连 vs 池化：同一批上游、同一套口径，这两个数就是池化的净收益
 		ttfbMs: {
 			pool: metricStat(metrics.mode.pool.ttfb),
