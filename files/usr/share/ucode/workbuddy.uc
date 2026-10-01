@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.2.0';
+const APP_VERSION = '2.3.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -318,6 +318,7 @@ const TOKEN_POOL_FILE = '/etc/workbuddy/pool.json';
 //   /overlay 只有 32MB 可用，写盘日志会拖累闪存寿命且迟早写满；
 //   需要长期留存时由外部 syslog 收集，本模块只负责"最近 N 条 + 累计聚合"。
 const RELAY_LOG_MAX = 200;        // 环缓冲保留的最近事件条数
+const RELAY_MIN_SAMPLES = 3;     // 成功率权重的最小样本量：少于此数视为"无数据"，权重退回 1
 
 // 中转事件类型。用短字符串而非数字：日志要给人看，也要能被 grep。
 //   pick     选中某个账号开始尝试
@@ -805,7 +806,8 @@ function saveToken(cfg, accessToken, refreshToken) {
 // 不能像常见做法那样一条凭据一个文件。
 
 let credState = {};   // id -> { coolUntil: <ts>, fails: <n>, lastErr: <str> }
-let credCursor = 0;   // 轮询游标
+let credCursor = 0;   // 轮询游标（v2.3.0 前用于纯轮询，现保留给 fallback）
+let poolCursor = 0;   // 加权轮询游标（v2.3.0：按成功率加权）
 
 // ---------- v2.2.0：中转决策日志（内存环缓冲 + 聚合计数） ----------
 //
@@ -961,6 +963,59 @@ function relayFail(id, ev, why, extra) {
 	if (ev !== 'pick') relayTotals.pick++;
 }
 
+// v2.3.0：根据中转日志的历史成功率计算动态权重。
+//
+// 返回值 ≥ 1，用于加权轮询（weightedRotate / poolWeightedRotate）：
+//   · 样本不足（< RELAY_MIN_SAMPLES）→ 1（冷启动，不偏置）
+//   · 成功率 100% → 10（给 10× 流量，显著倾斜）
+//   · 成功率 50%  → 5
+//   · 成功率 10%  → 1（几乎不倾斜，但仍给最低流量以便恢复后重新积累）
+//   · 成功率  0%  → 1（不绝杀：冷却恢复后仍给机会试）
+//
+// 为什么不绝杀 0% 的账号：relayAgg 是进程生命周期内的累计，早期的失败
+// 会一直拉低均分。给 weight=1 而非 0，让它在冷却结束后仍能被试到，
+// 如果它恢复了，后续 ok 会逐步拉高均分 —— 这正是"自我修复"的反馈环。
+// 真正的绝杀由冷却机制做（被风控 → cool 30min，这期间根本不入选）。
+function relayWeight(id) {
+	let a = relayAgg[id];
+	if (!a) return 1;
+	let picks = (a.pick || 0) + (a.rate || 0) + (a.risk || 0)
+		+ (a.auth || 0) + (a.client || 0) + (a.net || 0);
+	if (picks < RELAY_MIN_SAMPLES) return 1;
+	// ucode 整数除法：2/3==0，必须先乘后除（与 relayAccounts 的 okRate 同一手法）。
+	let w = int((a.ok || 0) * 10 / picks);   // 0..10
+	if (w < 1) w = 1;
+	return w;
+}
+
+// v2.3.0：凭据池的加权轮询。
+//
+// 与 weightedRotate（给自建上游 Key 用）的区别：凭据没有用户配置的静态权重，
+// 唯一的权重来源就是 relayWeight（即历史成功率）。游标用 poolCursor。
+function poolWeightedRotate(keys) {
+	let n = length(keys);
+	let w = [];
+	let total = 0;
+	for (let i = 0; i < n; i++) {
+		let wt = relayWeight(keys[i].id);
+		if (!(wt >= 1)) wt = 1;
+		w[i] = wt;
+		total += wt;
+	}
+	// 游标按权重取模定位首个；权重全为 1 时退化为普通轮询。
+	let pos = poolCursor % total;
+	poolCursor = poolCursor + 1;
+	let first = 0;
+	let acc = 0;
+	for (let i = 0; i < n; i++) {
+		acc += w[i];
+		if (pos < acc) { first = i; break; }
+	}
+	let out = [];
+	for (let i = 0; i < n; i++) push(out, keys[(first + i) % n]);
+	return out;
+}
+
 function relayAccounts(upSec) {
 	let out = [];
 	let up = (upSec && upSec > 0) ? upSec : 1;
@@ -1016,6 +1071,7 @@ function relayAccounts(upSec) {
 			// 永远是「—」，而它们恰恰是最容易被限流的一群。
 			coolingSec: relayCoolingSec(isUp, key),
 			lastErr: relayLastErr(isUp, key),
+			weight: relayWeight(key),     // v2.3.0：当前轮询权重（1=无数据/最低，10=100%成功率）
 		});
 	}
 	return out;
@@ -1418,16 +1474,9 @@ function usablePool(cfg) {
 		if (best !== null) push(ok, best);
 	}
 
-	// 从游标处轮转，实现轮流使用
-	if (length(ok) > 1) {
-		let n = length(ok);
-		let start = credCursor % n;
-		let rotated = [];
-		for (let i = 0; i < n; i++)
-			push(rotated, ok[(start + i) % n]);
-		credCursor = (credCursor + 1) % n;
-		ok = rotated;
-	}
+	// v2.3.0：按 relay 成功率加权轮询，替代原来的纯轮询。
+	// 成功率高的凭据获得更多流量；冷启动（无历史）退化为轮询。
+	if (length(ok) > 1) ok = poolWeightedRotate(ok);
 
 	return ok;
 }
@@ -2229,8 +2278,16 @@ function weightedRotate(up, keys) {
 	let w = [];
 	let total = 0;
 	for (let i = 0; i < n; i++) {
-		let wt = (up.weights && up.weights[keys[i]]) || 1;
-		if (!(wt >= 1)) wt = 1;
+		// v2.3.0：取"配置权重"与"relay 成功率权重"的较大值。
+		// 配置权重是用户手动设的底线（"这把 Key 我要保证至少 N 倍流量"），
+		// relay 权重是运行时自动加成（"这把 Key 最近表现好，多给些"）。
+		// 用 max 而非乘法：乘法会把"配置=1 + relay=10"放大成 10，但也会把
+		// "配置=5 + relay=1（冷启动）"缩成 5 —— 后者没问题，但前者在
+		// relay 数据还不稳定时波动太大。max 更保守，relay 只做"加成"不做"打折"。
+		let cfg_w = (up.weights && up.weights[keys[i]]) || 1;
+		if (!(cfg_w >= 1)) cfg_w = 1;
+		let relay_w = relayWeight('up:' + up.id + ':' + maskKey(keys[i]));
+		let wt = (cfg_w > relay_w) ? cfg_w : relay_w;
 		w[i] = wt;
 		total += wt;
 	}
@@ -5965,7 +6022,7 @@ function renderRelay(d) {
     if (!list.length) return '';
     var t2 = '<h3 style="margin:16px 0 8px">' + title + '</h3>';
     t2 += '<table><thead><tr>' +
-          '<th>账号 / Key</th><th>选中</th><th>成功</th><th>成功率</th>' +
+          '<th>账号 / Key</th><th>权重</th><th>选中</th><th>成功</th><th>成功率</th>' +
           '<th>限流</th><th>限流率</th><th>风控</th><th>鉴权</th><th>网络</th>' +
           '<th>冷却次数</th><th>冷却占比</th><th>当前冷却</th><th>最近错误</th>' +
           '</tr></thead><tbody>';
@@ -5976,6 +6033,7 @@ function renderRelay(d) {
         : '<span style="opacity:.4">—</span>';
       t2 += '<tr>' +
            '<td><code>' + esc(a.id) + '</code></td>' +
+           '<td><span class="badge" style="' + (a.weight > 1 ? 'background:var(--accent2)' : '') + '">' + a.weight + '</span></td>' +
            '<td>' + a.pick + '</td>' +
            '<td>' + a.ok + '</td>' +
            '<td>' + pctCell(a.okRate, null, null) + '</td>' +
@@ -5997,11 +6055,12 @@ function renderRelay(d) {
   }
 
   h += matrix(creds, '凭据池账号',
-    '成功率＝成功 / 选中。限流率超过 30% 标黄、60% 标红，说明该账号额度紧张，' +
+    '成功率＝成功 / 选中。权重由成功率自动计算（100%→10，50%→5，10%→1），' +
+    '权重≥2 标蓝。限流率超过 30% 标黄、60% 标红，说明该账号额度紧张，' +
     '应考虑降低它的使用频率；冷却占比接近 100% 表示它基本不可用。');
   h += matrix(ups, '自定义上游 Key',
     '这些是「自定义上游」里配置的 Key，与凭据池账号无关。' +
-    '限流率高的 Key 应调低权重或换成额度更大的账号。');
+    '权重＝max(配置权重, relay成功率权重)。限流率高的 Key 会自动获得低权重。');
 
   if (!accs.length) {
     h += '<p class="hint" style="margin-top:12px">还没有中转记录。发几个请求就会出现。</p>';
