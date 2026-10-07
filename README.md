@@ -540,6 +540,45 @@ weight = max(1, int((life * 3 + rec * 7) / 10))
 > 数字可以手工按公式复算，任何一格对不上就说明聚合口径出了问题——这也是
 > 把「近期」列放进管理页的意义。
 
+### 上游管理增强：编辑服务器 + 单 Key 启停/权重（v2.5.0）
+
+v2.5.0 的起点是用户报障：「上游更换不了 Key、添加不了服务器」。根因在
+**前端 `api()` 调用参数错位**——`api(path, body)` 只有两个参数，但 5 处上游
+相关调用写成了三个参数：
+
+```
+api('POST', '/admin/api/upstreams/test', {id})   // 错误：path='POST'，body='/admin/api/upstreams/test'
+```
+
+请求于是打到 `/admin/api/POST`，返回 `404 no such admin endpoint`。后端端点
+全部正常，缺陷 100% 在前端。已把 5 处调用全部改成两参形态
+（`test` / `keys` / `toggle` / `delete` / `add`）。
+
+顺带按主流中转（one-api / new-api / gpt-load）补齐了上游管理能力：
+
+| 能力 | 实现 | 位置 |
+| --- | --- | --- |
+| **编辑服务器** | 改名称 / 模型前缀 / API 地址；前缀查重（排除自身）；前缀变更时返回 `prefixChanged`，提示客户端同步改模型名 | `editUpstream()` @2864；端点 `/admin/api/upstreams/edit` |
+| **单 Key 启停** | 掩码反查真实 Key（管理页只显示掩码）；停用时清该 Key 的失败计数与冷却状态 | `toggleUpstreamKey()` @2931；端点 `/admin/api/upstreams/key/toggle` |
+| **单 Key 权重** | 1–1000 整数，只改单个 Key，不整批覆盖 | `setUpstreamKeyWeight()` @2969；端点 `/admin/api/upstreams/key/weight` |
+| 停用 Key 不入选 | `usableUpKeys()` 跳过已停用 Key，不参与 clean 也不进 rec 恢复队列 | `usableUpKeys()` |
+| Key 徽章交互 | 点击掩码徽章弹出「Key 管理」模态框（状态开关 + 权重输入 + 当前失败次数） | `editUpKey()` @6019 |
+| 编辑服务器按钮 | 上游卡片操作区新增「编辑服务器」 | `editUpInfo()` @5976 |
+
+管理 API 现在提供完整的 `upstreams` 增删改查：`add` / `delete` / `toggle` /
+`edit` / `test` / `keys`，外加 `key/toggle`、`key/weight` 两个单 Key 维度端点。
+
+#### 验收记录（真机，2026-10，`v2.5.0`）
+
+| 判据 | 结果 |
+| --- | --- |
+| 静态六项检查 | 全部 OK（顶层函数 245） |
+| 单元测试 | `==== ALL PASS ==== / UNIT_RC=0`（v2.4.0 用例全部保留） |
+| `ucode -c` | RC=0（322520 字节，无 BOM） |
+| 管理 API 直连 | `upstreams/add` → `edit`（返回 `prefixChanged`）→ `key/toggle`（停/启）→ `key/weight`（设 7）→ `delete` 全链路通过；错误掩码正确返回「Key 不存在」 |
+| 管理页 UI | 编辑服务器模态框、Key 管理模态框、Key 池徽章交互均正常（浏览器实测） |
+| 长流连通性 | 8 路并发长流式输出无队列拒绝（`up_max_inflight=8`）、4 个 Key 全部有 usage 消耗 |
+
 ### 管理页安全设计
 
 | 项目 | 做法 | 理由 |

@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.4.0';
+const APP_VERSION = '2.5.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -2374,6 +2374,10 @@ function usableUpKeys(up, stickyFor) {
 	let clean = [];
 	let rec = [];
 	for (let k in up.keys) {
+		// v2.5.0：单 Key 停用。停用的 Key 连"恢复队列"都不进 —— 用户手动
+		// 停用通常是因为这把 Key 已被上游封禁/欠费，再拿它去试探只会白费
+		// 一次请求并让上游多记一次失败。
+		if (up.disabled && up.disabled[k]) continue;
 		let st = upState[up.id + '|' + k];
 		if (st && st.fails > 0) push(rec, k); else push(clean, k);
 	}
@@ -2846,6 +2850,54 @@ function toggleUpstream(id, enabled) {
 	return saveUpstreamsFile(j);
 }
 
+// 编辑某个上游的基本信息（名称 / 前缀 / 地址 / 启停）。
+//
+// 为什么单独开一个接口而不是复用 add：
+//   add 的语义是"新建"，Key 是必填的；而用户想改的往往只是地址写错了、
+//   或者名字想换个好认的，此时逼他重新粘贴一遍全部 Key 既危险（容易粘错
+//   覆盖掉正常的 Key）也没有必要。主流中转（one-api/new-api/gpt-load）
+//   都允许单独编辑渠道信息，这里是补齐这个缺口。
+//
+// 改 prefix 的连带影响：客户端里已写好的 "旧前缀/模型" 会立刻失效
+// （findUpstreamByPrefix 找不到）。所以这里在返回值里回传 oldPrefix，
+// 前端据此提示用户改客户端配置。
+function editUpstream(id, name, prefix, baseUrl, enabled) {
+	let j = readJsonFile(UPSTREAM_FILE);
+	if (!j || type(j.upstreams) !== 'array') return { ok: false, error: '无上游配置' };
+
+	let np = normalizePrefix(prefix);
+	if (np === null) return { ok: false, error: '前缀无效（2-32 位小写字母、数字、- 或 _）' };
+
+	let nu = normalizeBaseUrl(baseUrl);
+	if (nu === null) return { ok: false, error: '地址无效（需 http(s):// 且不能指向内网）' };
+
+	// 前缀不能和别的上游撞车，否则 splitModelRef 路由会二义。
+	for (let u in j.upstreams) {
+		if (type(u) !== 'object' || u === null) continue;
+		if (('' + (u.id || '')) === ('' + id)) continue;
+		if (('' + (u.prefix || '')) === np)
+			return { ok: false, error: '前缀已被「' + (u.name || u.id) + '」占用' };
+	}
+
+	let hit = null;
+	for (let u in j.upstreams) {
+		if (type(u) === 'object' && u !== null && ('' + (u.id || '')) === ('' + id)) hit = u;
+	}
+	if (hit === null) return { ok: false, error: '上游不存在' };
+
+	let oldPrefix = '' + (hit.prefix || '');
+	hit.prefix = np;
+	hit.baseUrl = nu;
+	// 名称允许留空：留空时回落到 prefix，避免管理页出现一片空白卡片。
+	hit.name = (type(name) === 'string' && length(trim(name)) > 0) ? trim(name) : np;
+	// ucode 没有全局 undefined（裸写会抛 ReferenceError），判空用 != null。
+	if (enabled != null) hit.enabled = enabled ? true : false;
+
+	if (!saveUpstreamsFile(j)) return { ok: false, error: '写入失败' };
+	return { ok: true, id: '' + id, prefix: np, oldPrefix: oldPrefix,
+		prefixChanged: (oldPrefix !== np), name: hit.name };
+}
+
 // 替换某个上游的 Key 组（管理页"编辑 Key"用）
 function setUpstreamKeys(id, keysText) {
 	let j = readJsonFile(UPSTREAM_FILE);
@@ -2870,6 +2922,76 @@ function setUpstreamKeys(id, keysText) {
 	return { ok: true, count: length(keys) };
 }
 
+// v2.5.0：单 Key 启用/停用。
+//
+// 传进来的 keyRef 是掩码后的 Key（管理页只拿得到 maskKey(k)，拿不到明文）。
+// 因此这里必须用 maskKey 反查真实 Key —— 绝不能把掩码当成真 Key 存进去。
+// 主流中转（one-api/new-api/gpt-load）都有这个开关：某把 Key 欠费/被封时，
+// 用户想立刻把它摘出去，而不是等它自己冷却到超时。
+function toggleUpstreamKey(id, masked, on) {
+	let j = readJsonFile(UPSTREAM_FILE);
+	if (!j || type(j.upstreams) !== 'array') return { ok: false, error: '无上游配置' };
+
+	let hit = null;
+	for (let u in j.upstreams) {
+		if (type(u) === 'object' && u !== null && ('' + (u.id || '')) === ('' + id)) hit = u;
+	}
+	if (hit === null) return { ok: false, error: '上游不存在' };
+
+	// 掩码 -> 明文。找不到说明管理页数据过期，明确报错而不是静默写坏配置。
+	let real = null;
+	for (let k in hit.keys)
+		if (maskKey(k) === ('' + masked)) { real = k; break; }
+	if (real === null) return { ok: false, error: 'Key 不存在（页面数据可能已过期，请刷新）' };
+
+	if (type(hit.disabled) !== 'object' || hit.disabled === null) hit.disabled = {};
+	if (on) {
+		// ucode 没有 delete 运算符，只能重建表来移除这一项。
+		let nd = {};
+		for (let k in hit.disabled)
+			if (k !== real) nd[k] = hit.disabled[k];
+		hit.disabled = nd;
+	} else {
+		hit.disabled[real] = true;
+		// 停用即清掉它的失败状态：否则重新启用时它还带着旧的 fails/冷却，
+		// 表现成"刚启用就又被跳过了"。
+		let sk = hit.id + '|' + real;
+		if (upState[sk]) upState[sk] = { fails: 0, coolUntil: 0, lastErr: '' };
+	}
+
+	if (!saveUpstreamsFile(j)) return { ok: false, error: '写入失败' };
+	return { ok: true, enabled: on ? true : false };
+}
+
+// v2.5.0：单 Key 权重编辑（权重 ≥1 的整数）。
+// 与 setUpstreamKeys 的"整批覆盖"不同，这里只动一把 Key 的权重，
+// 不会碰其它 Key —— 用户调参时最怕的就是手滑把别的 Key 弄丢。
+function setUpstreamKeyWeight(id, masked, weight) {
+	let j = readJsonFile(UPSTREAM_FILE);
+	if (!j || type(j.upstreams) !== 'array') return { ok: false, error: '无上游配置' };
+
+	let w = +weight;
+	if (!(w >= 1) || w !== int(w) || w > 1000)
+		return { ok: false, error: '权重需为 1-1000 的整数' };
+
+	let hit = null;
+	for (let u in j.upstreams) {
+		if (type(u) === 'object' && u !== null && ('' + (u.id || '')) === ('' + id)) hit = u;
+	}
+	if (hit === null) return { ok: false, error: '上游不存在' };
+
+	let real = null;
+	for (let k in hit.keys)
+		if (maskKey(k) === ('' + masked)) { real = k; break; }
+	if (real === null) return { ok: false, error: 'Key 不存在（页面数据可能已过期，请刷新）' };
+
+	if (type(hit.weights) !== 'object' || hit.weights === null) hit.weights = {};
+	hit.weights[real] = w;
+
+	if (!saveUpstreamsFile(j)) return { ok: false, error: '写入失败' };
+	return { ok: true, weight: w };
+}
+
 // 上游状态汇总（给管理页用，不含 Key 明文）
 function upstreamStatus() {
 	let list = loadUpstreams();
@@ -2882,11 +3004,13 @@ function upstreamStatus() {
 		for (let k in u.keys) {
 			let st = upState[u.id + '|' + k];
 			let cool = (st && st.coolUntil > now) ? (st.coolUntil - now) : 0;
-			if (cool === 0) usable++;
+			let off = (u.disabled && u.disabled[k]) ? true : false;
+			if (cool === 0 && !off) usable++;
 			let keyUsage = metrics.usageByKey[u.id + '|' + maskKey(k)] || { prompt: 0, completion: 0, total: 0 };
 			push(keys, {
 				masked: maskKey(k),
 				weight: (u.weights && +u.weights[k] >= 1) ? +u.weights[k] : 1,
+				disabled: off,
 				cooling: cool,
 				fails: st ? (st.fails || 0) : 0,
 				lastErr: st ? (st.lastErr || '') : '',
@@ -5804,19 +5928,22 @@ function renderUpstreams(d) {
     h += '<div class="uprow"><span class="lbl">模型前缀</span><code>' + esc(u.prefix) + '/</code></div>';
     h += '<div class="uprow"><span class="lbl">服务器</span><code>' + esc(u.baseUrl) + '</code></div>';
 
-    // Key 明细（掩码）+ v2.0 权重/用量
+    // Key 明细（掩码）+ v2.0 权重/用量 + v2.5.0 单 Key 管理入口
     if (u.keys && u.keys.length) {
       h += '<div class="uprow"><span class="lbl">Key 池</span><span>';
       for (var j = 0; j < u.keys.length; j++) {
         var k = u.keys[j];
-        var kTip = '权重 ' + k.weight + (k.usageText ? '，用量 ' + k.usageText : '');
-        if (k.cooling > 0) {
-          h += '<span class="badge warn" title="' + esc(k.lastErr || '') + '">' +
-               esc(k.masked) + ' 冷却 ' + k.cooling + 's</span> ';
-        } else {
-          h += '<span class="badge ok" title="' + esc(kTip) + '">' +
-               esc(k.masked) + (k.weight > 1 ? ' ×' + k.weight : '') + '</span> ';
-        }
+        var kTip = '权重 ' + k.weight + (k.usageText ? '，用量 ' + k.usageText : '') +
+                   '\\n点击可单独启停 / 改权重';
+        var kCls = k.disabled ? 'badge' : (k.cooling > 0 ? 'badge warn' : 'badge ok');
+        var kTxt = esc(k.masked);
+        if (k.disabled) kTxt += ' 已停用';
+        else if (k.cooling > 0) kTxt += ' 冷却 ' + k.cooling + 's';
+        else if (k.weight > 1) kTxt += ' ×' + k.weight;
+        h += '<span class="' + kCls + '" style="cursor:pointer" ' +
+             'title="' + esc(kTip) + '" ' +
+             'onclick="editUpKey(\\'' + esc(u.id) + '\\',\\'' + esc(k.masked) + '\\')">' +
+             kTxt + '</span> ';
       }
       h += '</span></div>';
     }
@@ -5827,6 +5954,7 @@ function renderUpstreams(d) {
 
     h += '<div class="uprow"><span class="lbl">操作</span><span style="white-space:nowrap">';
     h += '<button onclick="testUp(\\'' + esc(u.id) + '\\')">测试</button> ';
+    h += '<button onclick="editUpInfo(\\'' + esc(u.id) + '\\')">编辑服务器</button> ';
     h += '<button onclick="editUpKeys(\\'' + esc(u.id) + '\\')">改 Key</button> ';
     h += '<button onclick="toggleUp(\\'' + esc(u.id) + '\\',' + (u.enabled ? 'false' : 'true') + ')">' +
          (u.enabled ? '停用' : '启用') + '</button> ';
@@ -5843,9 +5971,100 @@ function renderUpstreams(d) {
   box.innerHTML = h;
 }
 
+// v2.5.0：编辑服务器信息（名称 / 前缀 / 地址）。
+// 与「改 Key」分开：改地址时不该逼用户重贴一遍 Key（容易手滑覆盖掉）。
+function editUpInfo(id) {
+  var list = (S && S.upstreams) || [];
+  var u = null;
+  for (var i = 0; i < list.length; i++) if (list[i].id === id) u = list[i];
+  if (!u) return;
+
+  openModal('编辑服务器 · ' + u.name,
+    '<p class="hint" style="margin-top:0">只改服务器信息，<strong>Key 池不受影响</strong>。</p>' +
+    '<label class="fld"><span>名称</span>' +
+      '<input id="mUpName" value="' + esc(u.name) + '" placeholder="显示用，可留空"></label>' +
+    '<label class="fld"><span>模型前缀</span>' +
+      '<input id="mUpPrefix" value="' + esc(u.prefix) + '" placeholder="如 sensenova"></label>' +
+    '<label class="fld"><span>API 地址</span>' +
+      '<input id="mUpUrl" value="' + esc(u.baseUrl) + '" placeholder="https://api.example.com/v1"></label>' +
+    '<p class="hint">改前缀会让客户端里已写好的 <code>旧前缀/模型</code> 立刻失效，' +
+      '记得同步改客户端配置。</p>' +
+    '<div class="modal-foot">' +
+      '<button onclick="closeModal()">取消</button>' +
+      '<button class="primary" onclick="saveUpInfo(\\'' + esc(id) + '\\')">保存</button>' +
+    '</div>');
+}
+
+function saveUpInfo(id) {
+  var name = document.getElementById('mUpName').value;
+  var prefix = document.getElementById('mUpPrefix').value;
+  var url = document.getElementById('mUpUrl').value;
+  if (!prefix || !url) { alert('前缀和 API 地址是必填的'); return; }
+  api('upstreams/edit', { id: id, name: name, prefix: prefix, baseUrl: url }).then(function (r) {
+    if (r && r.ok) {
+      closeModal();
+      alert('已保存 ✅' + (r.prefixChanged
+        ? '\\n\\n注意：前缀已从 ' + r.oldPrefix + ' 改为 ' + r.prefix +
+          '，客户端里的模型名要同步改成 ' + r.prefix + '/模型名'
+        : ''));
+    } else {
+      alert('保存失败：' + ((r && r.error) || '未知错误'));
+    }
+    refresh();
+  });
+}
+
+// v2.5.0：单 Key 管理（启停 + 权重）。
+// keyRef 是掩码后的 Key —— 后端会用 maskKey 反查真实 Key，明文从不经过浏览器。
+function editUpKey(upId, keyRef) {
+  var list = (S && S.upstreams) || [];
+  var u = null, k = null;
+  for (var i = 0; i < list.length; i++) if (list[i].id === upId) u = list[i];
+  if (!u) return;
+  for (var j = 0; j < (u.keys || []).length; j++) if (u.keys[j].masked === keyRef) k = u.keys[j];
+  if (!k) return;
+
+  var on = !k.disabled;
+  openModal('Key 管理 · ' + u.name,
+    '<p class="hint" style="margin-top:0"><code>' + esc(k.masked) + '</code></p>' +
+    '<label class="fld"><span>状态</span>' +
+      '<span class="sw"><input type="checkbox" id="mKeyOn"' + (on ? ' checked' : '') + '>' +
+      '<span></span></span></label>' +
+    '<label class="fld"><span>权重</span>' +
+      '<input id="mKeyWeight" type="number" min="1" max="1000" value="' + k.weight + '"></label>' +
+    '<p class="hint">权重 ≥1，仅调整<b>被选中概率</b>，不影响其它 Key。' +
+      '停用后这把 Key 不参与轮换（也不会再被试探），直到你重新启用。</p>' +
+    '<p class="hint">当前失败次数：' + k.fails +
+      (k.lastErr ? '<br>最近错误：' + esc(k.lastErr) : '') + '</p>' +
+    '<div class="modal-foot">' +
+      '<button onclick="closeModal()">取消</button>' +
+      '<button class="primary" onclick="saveUpKey(\\'' + esc(upId) + '\\',\\'' + esc(keyRef) + '\\',' + (k.disabled ? 'true' : 'false') + ')">保存</button>' +
+    '</div>');
+}
+
+function saveUpKey(upId, keyRef, wasDisabled) {
+  var on = document.getElementById('mKeyOn').checked;
+  var w = parseInt(document.getElementById('mKeyWeight').value, 10);
+  if (!(w >= 1)) { alert('权重需为 ≥1 的整数'); return; }
+
+  // 先存状态再存权重：状态变更会清掉失败计数，权重是独立字段，顺序不影响结果，
+  // 但两次请求串行发出比并发更稳妥（后端每次都要读-改-写整个 upstreams.json）。
+  var p = Promise.resolve();
+  if (on === wasDisabled) {
+    p = api('upstreams/key/toggle', { id: upId, key: keyRef, enabled: on });
+  }
+  p.then(function () {
+    return api('upstreams/key/weight', { id: upId, key: keyRef, weight: w });
+  }).then(function (r) {
+    if (r && r.ok) { closeModal(); }
+    else { alert('保存失败：' + ((r && r.error) || '未知错误')); }
+    refresh();
+  });
+}
+
 // 测试上游：拉一次 /models，把结果直接告诉用户
 function testUp(id) {
-  api('POST', '/admin/api/upstreams/test', { id: id }).then(function (r) {
+  api('upstreams/test', { id: id }).then(function (r) {
     if (r && r.ok) {
       var names = [];
       for (var i = 0; i < r.models.length && i < 6; i++) names.push(r.models[i].id);
@@ -5887,7 +6106,7 @@ function editUpKeys(id) {
 function saveUpKeys(id) {
   var v = document.getElementById('mKeysEdit').value;
   if (!v || !v.replace(/\\s/g, '')) { alert('至少需要一条 Key'); return; }
-  api('POST', '/admin/api/upstreams/keys', { id: id, keys: v }).then(function (r) {
+  api('upstreams/keys', { id: id, keys: v }).then(function (r) {
     if (r && r.ok) { closeModal(); alert('已保存 ' + r.count + ' 条 Key ✅'); }
     else { alert('保存失败：' + ((r && r.error) || '未知错误')); }
     refresh();
@@ -5907,7 +6126,7 @@ function closeModal() {
 }
 
 function toggleUp(id, on) {
-  api('POST', '/admin/api/upstreams/toggle', { id: id, enabled: on }).then(function () { refresh(); });
+  api('upstreams/toggle', { id: id, enabled: on }).then(function () { refresh(); });
 }
 
 // 删除服务器。内置的 WorkBuddy 不走这里（它的卡片没有删除按钮）。
@@ -5915,7 +6134,7 @@ function delUp(id, name) {
   if (!confirm('确定删除服务器「' + name + '」？\\n\\n' +
       '删除后它的模型会从 /v1/models 消失，指向它的请求将返回 400。\\n' +
       '该服务器上配置的所有 Key 会一并删除。')) return;
-  api('POST', '/admin/api/upstreams/delete', { id: id }).then(function (r) {
+  api('upstreams/delete', { id: id }).then(function (r) {
     if (r && r.ok) refresh();
     else alert('删除失败：' + ((r && r.error) || '未知错误'));
   });
@@ -5934,7 +6153,7 @@ function addUpstreamUI() {
     return;
   }
 
-  api('POST', '/admin/api/upstreams/add', {
+  api('upstreams/add', {
     name: name, prefix: prefix, baseUrl: url, keys: keys,
   }).then(function (r) {
     if (r && r.ok) {
@@ -6926,6 +7145,56 @@ function handleAdmin(conn, req, method, path, query, body) {
 		}
 		logInfo('admin updated upstream keys ' + (j.id || '') + ' -> ' + r.count + who);
 		jsonResponse(conn, 200, { ok: true, count: r.count });
+		return;
+	}
+
+	// v2.5.0：编辑服务器信息（名称/前缀/地址/启停），Key 保持不变。
+	if (path === '/admin/api/upstreams/edit' && method === 'POST') {
+		let j = parseJsonBody(body);
+		let r = editUpstream(
+			'' + (j.id || ''),
+			'' + (j.name || ''),
+			'' + (j.prefix || ''),
+			'' + (j.baseUrl || ''),
+			('enabled' in j) ? truthy(j.enabled) : null
+		);
+		if (!r.ok) {
+			jsonResponse(conn, 400, { ok: false, error: r.error });
+			return;
+		}
+		logInfo('admin edited upstream ' + r.id + ' prefix ' + r.oldPrefix + ' -> ' + r.prefix + who);
+		jsonResponse(conn, 200, {
+			ok: true, id: r.id, name: r.name,
+			prefix: r.prefix, oldPrefix: r.oldPrefix,
+			prefixChanged: r.prefixChanged,
+		});
+		return;
+	}
+
+	// v2.5.0：单 Key 启用/停用
+	if (path === '/admin/api/upstreams/key/toggle' && method === 'POST') {
+		let j = parseJsonBody(body);
+		let on = truthy(j.enabled);
+		let r = toggleUpstreamKey('' + (j.id || ''), '' + (j.key || ''), on);
+		if (!r.ok) {
+			jsonResponse(conn, 400, { ok: false, error: r.error });
+			return;
+		}
+		logInfo('admin toggled upstream key ' + (j.id || '') + ' ' + (j.key || '') + ' -> ' + on + who);
+		jsonResponse(conn, 200, { ok: true, enabled: on });
+		return;
+	}
+
+	// v2.5.0：单 Key 权重编辑
+	if (path === '/admin/api/upstreams/key/weight' && method === 'POST') {
+		let j = parseJsonBody(body);
+		let r = setUpstreamKeyWeight('' + (j.id || ''), '' + (j.key || ''), j.weight);
+		if (!r.ok) {
+			jsonResponse(conn, 400, { ok: false, error: r.error });
+			return;
+		}
+		logInfo('admin set upstream key weight ' + (j.id || '') + ' ' + (j.key || '') + ' -> ' + r.weight + who);
+		jsonResponse(conn, 200, { ok: true, weight: r.weight });
 		return;
 	}
 
