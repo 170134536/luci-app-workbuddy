@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.8.0';
+const APP_VERSION = '2.9.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -502,6 +502,10 @@ const FRE_SESSION_TTL_MIN = 30;       // 上游返回的 ttl 小于此值时不�
 const FRE_SESSION_BACKOFF = 60;       // 会话包拉取失败后的退避（秒），避免打爆授权服务端
 const FRE_TOKEN_GRACE = 60;           // token 过期前的提前续签余量（秒）
 const FRE_MAX_TOKENS = 4000;          // 与官方网关一致：max_tokens 上限 4000（不是指纹里的 32000）
+// freeAI 上游的"免费层闸门"是瞬时拒绝（实测成串成功里偶发 1~2 次），
+// 不是额度耗尽也不是配置错误。给客户端一个够长的退避窗口，避免它立刻重撞；
+// 报 429 + Retry-After 而不是 502，是为了让客户端走标准退避语义。
+const FRE_TRANSIENT_RETRY_SEC = 5;
 const FRE_UA = 'opencode/1.18.31 (windows amd64; node22)';
 // web-deepseek.gd7.cn 在 Cloudflare 后有两条 A 记录，但"哪条证书正常"会随
 // Cloudflare 边缘路由变化而翻转（实测 104.21.89.29 与 172.67.136.143 先后
@@ -2870,13 +2874,29 @@ function extractUsage(text) {
 	if (substr(t, 0, 1) === '{') {
 		try { obj = json(t); } catch (e) { obj = null; }
 	} else {
+		// v2.9.0 修复：倒序扫描**所有** data: 行，找到第一个真正携带 usage 的对象为止。
+		//
+		// 旧实现只要解析出一行合法 JSON 就 break —— 于是"最后一行"决定了结果。
+		// freeAI（opencode/zen）的流尾形态是：
+		//     data: {... "usage":{...}}
+		//     data: [DONE]
+		//     data: {"choices":[],"cost":"0"}
+		// 最后那个 cost 计费块**没有 usage 字段**，旧实现在它上面 break 后
+		// `obj.usage` 取到 null，直接 return null，用量永远记不上账
+		// （实测：freeAI 聊天 HTTP 200 成功，全局 usage 计数纹丝不动）。
+		// 现在把"解析成功"与"确实含 usage"分开判断，解析不出 usage 就继续往前找。
 		let lines = split(t, '\n');
 		for (let i = length(lines) - 1; i >= 0; i--) {
 			let ln = trim(lines[i]);
 			if (substr(ln, 0, 5) !== 'data:') continue;
 			let payload = trim(substr(ln, 5));
 			if (payload === '[DONE]') continue;
-			try { obj = json(payload); } catch (e) { obj = null; }
+			let cand = null;
+			try { cand = json(payload); } catch (e) { cand = null; }
+			if (type(cand) !== 'object' || cand === null) continue;
+			let cu = cand.usage;
+			if (type(cu) !== 'object' || cu === null) continue;
+			obj = cand;
 			break;
 		}
 	}
@@ -4639,10 +4659,14 @@ function freeaiActivate() {
 		return { ok: false, err: '激活请求失败（网络或超时）' };
 	}
 	if (j.ok !== true) {
+		// 授权服务端的 error 是内部术语（too_frequent / token invalid /
+		// must_upgrade / 服务暂停…），**只在日志里保留原文**，返回值一律
+		// 分类成自己的文案 —— 它可能被拼进 HTTP 响应体（见 spawnUpstream
+		// 的 freeAI 会话刷新分支），拼原文就等于泄露上游实现。
 		let err = '' + (j.error || '激活失败');
 		freActivateFailAt = now + FRE_ACTIVATE_BACKOFF;
 		logErr('freeai activate failed: ' + err);
-		return { ok: false, err: err };
+		return { ok: false, err: F.freeaiErrText(err) };
 	}
 	if (type(j.token) === 'string' && length(j.token) > 50) {
 		F.freeaiSaveToken(j.token);
@@ -4876,16 +4900,32 @@ function freeaiHeaders(pack) {
 		'X-Session-Id': freeaiSessionId(),
 		'x-freeai-session': '' + (pack.sig || ''),
 	};
-	// 会话包下发的头优先（它可能带 opencode 版本相关的字段）
+	// 会话包下发的头优先（它可能带 opencode 版本相关的字段）。
+	//
+	// v2.9.0 修复：**必须按小写名去重**，不能直接覆盖。
+	// ucode 的对象键区分大小写，而会话包下发的头是全小写形态
+	// （authorization / user-agent），我们上面用的是首字母大写形态。
+	// 直接 `out['' + k] = v` 会让两种形态**同时存在**，freeaiCurlArgs 会把
+	// 每个键各发一条 -H，于是 curl 发出四行 Authorization/User-Agent，
+	// 上游直接回 `400 Bad Request`（HTML 错误页）。
+	//
+	// 更隐蔽的是紧接着的"重新钉住 User-Agent"：它只覆盖精确大小写的
+	// `User-Agent`，对包下发的 `user-agent` 无效，于是上游收到的 UA 仍是
+	// ai-sdk 形态 —— 正是会被免费层判成"非 OpenCode 客户端"的那个值。
+	//
+	// 这个 bug 让 freeAI 的 chat 步骤 100% 失败，而 session/models 两步
+	// （不经过 freeaiHeaders）全部正常，所以看起来像"上游拒绝请求体"。
+	let ours = {};
+	for (let k in out) ours[lc('' + k)] = true;
 	if (type(pack.headers) === 'object' && pack.headers !== null) {
 		for (let k in pack.headers) {
+			let key = '' + k;
+			// 我们自己已经决定了的头（含 Authorization/User-Agent/会话头）一律不让包覆盖
+			if (ours[lc(key)]) continue;
 			let v = pack.headers[k];
-			if (type(v) === 'string' || type(v) === 'int') out['' + k] = '' + v;
+			if (type(v) === 'string' || type(v) === 'int') out[key] = '' + v;
 		}
 	}
-	// 但 User-Agent 必须钉成本地 CLI 形态：会话包下发的 UA 是 ai-sdk 形态，
-	// 上游免费层会把它识别成"非 OpenCode 客户端"（实测 FreeTierError）。
-	out['User-Agent'] = FRE_UA;
 	return out;
 }
 
@@ -5049,14 +5089,49 @@ function freeaiPurifyLine(line) {
 
 // 把上游字样换成 freeAI 的对外说法。**对外绝不出现 opencode/上游字样**：
 // 用户看到"opencode"只会以为是配置错了。
+// 把上游错误改写成品牌化文案。硬约束：**绝不能把上游原文拼进返回值**。
+// 早先的兜底分支是 'freeAI 服务暂时不可用：' + s，上游原文里带着
+// "Error from provider (Console)"、"OpenCode's free tier ..."、
+// "Model X is not supported" 这类字样，等于在客户端侧点名上游，
+// 正是品牌中性化要消除的东西。因此这里改为"分类后只回自己的话"：
+// 认得出的类别给专门文案，认不出的给通用文案，原文一律丢弃（只记日志）。
 function freeaiBrandMessage(msg) {
 	let s = '' + msg;
 	if (length(s) === 0) return 'freeAI 服务暂时不可用，请稍后重试';
 	let l = lc(s);
 	if (index(l, 'rate limit') >= 0 || index(l, 'too many request') >= 0 ||
+	    index(l, 'too frequent') >= 0 ||
 	    index(l, '额度') >= 0 || index(l, 'quota') >= 0)
 		return 'freeAI 免费额度已用完：可在控制面板切换出口后重试，或稍后再试';
-	return 'freeAI 服务暂时不可用：' + s;
+	if (index(l, 'not supported') >= 0 || index(l, 'unknown model') >= 0 ||
+	    index(l, 'no such model') >= 0 || index(l, 'model not found') >= 0)
+		return 'freeAI 不支持该模型：请在管理页「freeAI」页签刷新模型列表后重选';
+	if (index(l, 'unauthorized') >= 0 || index(l, 'forbidden') >= 0 ||
+	    index(l, 'token') >= 0 || index(l, '认证') >= 0 || index(l, '授权') >= 0)
+		return 'freeAI 授权已失效：请在管理页「freeAI」页签重新激活';
+	return 'freeAI 服务暂时不可用，请稍后重试';
+}
+
+// 授权服务端（fp.php / activate.php / heartbeat.php）错误码的分类器。
+// 与 freeaiBrandMessage 同一条硬约束：**只回自己的话，原文字符串一律不拼**。
+// 单独抽一个函数，是因为授权类的错误有两个消费方：会话刷新失败的响应体
+// （spawnUpstream）与 Activate 的返回值，前者会直接交给客户端。
+function freeaiErrText(raw) {
+	let l = lc('' + raw);
+	if (index(l, 'too_frequent') >= 0 || index(l, 'too frequent') >= 0)
+		return 'freeAI 请求过于频繁，请稍后重试';
+	if (index(l, 'replay') >= 0)
+		return 'freeAI 会话状态异常，请稍后重试';
+	if (index(l, 'paused') >= 0 || index(l, '暂停') >= 0)
+		return 'freeAI 服务暂时停用，请稍后重试';
+	if (index(l, 'upgrade') >= 0)
+		return 'freeAI 客户端版本过旧：请升级插件后重试';
+	if (index(l, 'expired') >= 0 || index(l, '过期') >= 0 ||
+	    index(l, 'invalid') >= 0 || index(l, 'token') >= 0 ||
+	    index(l, 'banned') >= 0 || index(l, '封禁') >= 0 ||
+	    index(l, 'auth') >= 0)
+		return 'freeAI 授权已失效：请在管理页「freeAI」页签重新激活';
+	return 'freeAI 会话不可用，请稍后重试';
 }
 
 // ---------- 同步获取模型列表（用 curl，带超时；失败回退内置） ----------
@@ -5769,6 +5844,34 @@ function spawnUpstreamDirect(conn) {
 		if (retry > 0) {
 			extra = { 'Retry-After': '' + retry };
 		}
+		// v2.9.0：freeAI 没有"Key 池"可轮换，且它是内置上游 —— 用通用文案
+		// 会同时犯三个错：说"所有 Key 均失败"（用户无从下手，因为根本没有 Key
+		// 可换）、把上游真名与内部错误文本原样透出（违反品牌中性化要求：
+		// 用户在别处看到 freeAI 请求，后台很容易识别），以及把上游的瞬时
+		// 免费层闸门说成"服务故障"。这里统一走 freeaiBrandMessage 品牌化，
+		// 并保留 429 语义 + Retry-After 让客户端退避。
+		if (up.id === FRE_UPID) {
+			let raw = (conn.lastFailReason || '');
+			// 上游把免费层拒绝写成 "free tier can only be used from within
+			// OpenCode"；它对客户端表现为"稍后再试"，不是额度耗尽。
+			let l = lc(raw);
+			let transient = (index(l, 'free tier') >= 0 ||
+				index(l, 'within opencode') >= 0);
+			let ra = retry > 0 ? retry : (transient ? FRE_TRANSIENT_RETRY_SEC : 0);
+			let extra2 = (ra > 0) ? { 'Retry-After': '' + ra } : null;
+			// 上游原文只进日志（排障需要），绝不进响应体。
+			logInfo(sprintf('freeai terminal error: %s', raw));
+			jsonResponse(conn, ra > 0 ? 429 : 502, {
+				error: {
+					message: transient
+						? 'freeAI 服务繁忙，请稍后重试'
+						: F.freeaiBrandMessage(raw),
+					type: ra > 0 ? 'rate_limit_error' : 'upstream_error',
+					retry_after: ra,
+				},
+			}, extra2);
+			return;
+		}
 		jsonResponse(conn, retry > 0 ? 429 : 502, {
 			error: {
 				message: '上游 ' + up.prefix + ' 的所有 Key 均失败' +
@@ -5826,12 +5929,15 @@ function spawnUpstreamDirect(conn) {
 				F.spawnUpstreamDirect(conn);
 				return;
 			}
+			// 同样不能把 rr.err 原文拼进去：授权服务端的错误码是内部术语
+			// （too_frequent / session_replayed / token invalid），既泄露上游
+			// 实现，又把"领会话太频繁"误导成"授权码或机器码有问题"——
+			// 前者只要等一会儿，后者会让用户去改正确的配置。
+			let re = lc('' + (rr.err || ''));
+			let msg = F.freeaiErrText(rr.err);
+			logInfo(sprintf('freeai session refresh failed: %s', '' + (rr.err || '')));
 			jsonResponse(conn, 502, {
-				error: {
-					message: 'freeAI 会话不可用：' + (rr.err || '未知错误') +
-						'（请在管理页 freeAI 设置中检查授权码与机器码）',
-					type: 'upstream_error',
-				},
+				error: { message: msg, type: 'upstream_error' },
 			});
 			return;
 		}
@@ -6447,6 +6553,7 @@ F.nowMs = nowMs;
 F.freeaiModels = freeaiModels;
 F.freeaiSaveToken = freeaiSaveToken;
 F.freeaiBrandMessage = freeaiBrandMessage;
+F.freeaiErrText = freeaiErrText;
 F.freeaiPurifyLine = freeaiPurifyLine;
 
 // ---------- v2.0：通用端点透传 ----------
@@ -8451,9 +8558,14 @@ function handleAdmin(conn, req, method, path, query, body) {
 		let j = parseJsonBody(body);
 		let cur = freeaiRaw();
 		// 注意：ucode 没有 undefined 标识符，JSON 缺字段访问得到 null。
-		let lic = (j.license === null) ? cur.license : ('' + j.license).trim;
-		let mac = (j.machine === null) ? cur.machine : ('' + j.machine).trim;
-		let tok = (j.token === null) ? cur.token : ('' + j.token).trim;
+		// v2.9.0 修复：这里原本写成 `.trim`（取属性而不是调用），ucode 在
+		// 求值时就抛 `Reference error: left-hand side expression is not an
+		// array or object` —— 于是**只要用户填了授权码或机器码，保存请求
+		// 还没写盘就 500**，配置静默存不下去（只有不改这两个字段时才侥幸成功）。
+		// 静态检查与单测都拦不住这种"运行到那一行才炸"的错。
+		let lic = (j.license === null) ? cur.license : trim('' + j.license);
+		let mac = (j.machine === null) ? cur.machine : trim('' + j.machine);
+		let tok = (j.token === null) ? cur.token : trim('' + j.token);
 		writeJsonFile(FRE_CFG_FILE, {
 			enabled: (j.enabled === null) ? cur.enabled : truthy(j.enabled),
 			license: lic, machine: mac, token: tok,
@@ -8462,7 +8574,10 @@ function handleAdmin(conn, req, method, path, query, body) {
 			injectFingerprint: (j.injectFingerprint === null) ? cur.injectFingerprint : truthy(j.injectFingerprint),
 			brandNeutralize: (j.brandNeutralize === null) ? cur.brandNeutralize : truthy(j.brandNeutralize),
 		});
-		freCache = { at: 0, cfg: null };
+		// v2.9.0 修复：字段名必须是 data —— freeaiRaw() 读的是 freCache.data，
+		// 写成 cfg 等于**没有失效缓存**，于是保存后 2 秒内读到的仍是旧配置
+		// （表现为"管理页显示保存成功、但刷新后模型又变回去了"）。
+		freCache = { at: 0, data: null };
 		freSession = null;              // 配置变了，旧会话作废
 		logInfo('admin saved freeai config (enabled=' + freeaiRaw().enabled + ')');
 		jsonResponse(conn, 200, { ok: true, freeai: freeaiStatus() });
@@ -8476,7 +8591,11 @@ function handleAdmin(conn, req, method, path, query, body) {
 		let out = { ok: false, session: null, models: null, chat: null, license: freeaiRaw().license };
 		let r = freeaiRefreshPack(true);
 		if (!r.ok) {
-			out.error = r.err || '会话包领取失败';
+			// 管理页是"我方 UI"，但错误码同样不能透传：too_frequent 这类
+			// 内部术语对用户没有信息量，而"请求过于频繁，请稍后重试"能直接
+			// 告诉他该怎么办。原文进日志。
+			logInfo(sprintf('freeai test: session step failed: %s', '' + (r.err || '')));
+			out.error = F.freeaiErrText(r.err);
 			jsonResponse(conn, 200, out);
 			return;
 		}
@@ -8520,7 +8639,10 @@ function handleAdmin(conn, req, method, path, query, body) {
 					try { j2 = json(p); } catch (e) { continue; }
 					if (type(j2) !== 'object' || j2 === null) continue;
 					if (type(j2.error) === 'object' && j2.error !== null) {
-						out.chat = { ok: false, error: '' + (j2.error.message || 'upstream error') };
+						// 流内错误同样过分类器（原文进日志，不出响应体）
+						let em = '' + (j2.error.message || '');
+						logInfo(sprintf('freeai test: chat step upstream error: %s', em));
+						out.chat = { ok: false, error: F.freeaiBrandMessage(em) };
 						break;
 					}
 					if (type(j2.choices) === 'array' && length(j2.choices) > 0) {

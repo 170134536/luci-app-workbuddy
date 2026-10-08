@@ -696,6 +696,123 @@ push(out, {
 | 落盘文件 | `/etc/workbuddy/modelcache.json`（600，428 B）写入 `{"saved":...,"cache":{"sensenova\|https://token.sensenova.cn/v1\|4":{...}}}` |
 | 管理页数据层 | 浏览器实取 `/admin/api/state`：`version="2.8.0"`、`modelRefreshEnabled=true`、`modelRefreshHour=1`、`modelCount=2`、`modelsText="deepseek-v4-flash\ngpt-4o=glm-5.2"`（编辑弹窗可无损回显） |
 
+### freeAI 集成与投毒式用量漏账修复（v2.9.0）
+
+freeAI（`opencode.ai/zen` 免费层）是 v2.6.0 引入的内置上游，`APP_VERSION` 保持
+`2.9.0` 期间修复了两个真实缺陷，其中第二个直到本轮端到端验收才暴露。
+
+#### ① 大小写重复头导致 freeAI 聊天 100% 400
+
+`freeaiHeaders()` 把会话包下发的头合并进请求头时**没有做大小写去重**。会话包
+下发的键是**全小写**（`authorization`、`user-agent`），而我们自己拼的是首字母
+大写（`Authorization`、`User-Agent`）。ucode 对象键**区分大小写**，于是合并后
+同时存在两组键：
+
+```
+[Authorization] => Bearer public          [authorization] => Bearer public
+[User-Agent] => opencode/1.18.31 …        [user-agent] => opencode/1.18.15 ai-sdk/…
+```
+
+`freeaiCurlArgs` 是逐键 push `-H` 的，curl 于是发出**四行互相冲突**的
+Authorization / User-Agent，上游直接回 400。
+
+隐蔽之处在于：末尾那句「重新把 UA 钉回 CLI 形态」的 `out['User-Agent'] = FRE_UA`
+只覆盖**精确大小写**的那个键，对包下发的 `user-agent` 完全无效——上游实际收到
+的反而是那个会触发免费层识别的 ai-sdk UA。而且 `session` / `models` 两步不经过
+`freeaiHeaders`，所以探活显示全绿，看起来像"上游拒绝请求体"。
+
+修法是合并前先建小写索引表跳过碰撞：
+
+```js
+let ours = {};
+for (let k in out) ours[lc('' + k)] = true;
+for (let k in pack.headers) {
+    let key = '' + k;
+    if (ours[lc(key)]) continue;   // 我们自己钉的键优先
+    out[key] = '' + pack.headers[k];
+}
+```
+
+#### ② 投毒式用量漏账：流尾的计费块盖掉了 usage
+
+`extractUsage()` 倒序扫描 SSE 行取用量，旧实现**只要解析出一行合法 JSON 就
+`break`**——于是"最后一行"决定了结果。freeAI 的流尾形态是：
+
+```
+data: {... "usage":{"prompt_tokens":8594,...}}
+data: [DONE]
+data: {"choices":[],"cost":"0"}      ← 最后一行，没有 usage 字段
+```
+
+旧实现在计费块上 `break`，`obj.usage` 取到 `null`，直接 `return null`。后果是
+**freeAI 聊天 HTTP 200 成功、SSE 完整、`[DONE]` 齐全，但用量一笔都没记上账**：
+
+| 观测点 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 全局 `usage`（连打一次 freeai chat 前后） | `112453/504/112957` → **纹丝不动** | `112453/504/112957` → `121047/521/121568`（**+8594/+17/+8611**，与流内 `prompt_tokens:8594` 逐字吻合） |
+| `/metrics` 的 `byUp` | 只有 `wb:*` 与 `u1790326707` | 首次出现 **`ufreeai`** 与 **`ufreeai\|***`** |
+| `/admin/api/state` 的 `freeai.usage` | 恒为 `null` | `{"prompt":8594,"completion":17,"total":8611}` |
+
+这个 bug 之所以危险，是因为它**只影响记账、不影响功能**：回答照常返回，只有
+"用量面板永远显示 0"这一个症状，很容易被当成前端问题。修法是把「解析成功」与
+「确实含 usage」分开判断，解析不出 usage 就继续往前找：
+
+```js
+let cand = null;
+try { cand = json(payload); } catch (e) { cand = null; }
+if (type(cand) !== 'object' || cand === null) continue;
+let cu = cand.usage;
+if (type(cu) !== 'object' || cu === null) continue;  // ← 关键：不含 usage 就继续
+obj = cand;
+break;
+```
+
+已补三条单元测试锁死该行为（含反向对照：只有计费块、确实没有 usage 时**必须**
+仍然返回 `null`，不能瞎编数字）。
+
+#### ③ 终态错误品牌化（配合用户 m13333 的中性化要求）
+
+freeAI 的失败路径此前只品牌化了一半：**流式**路径由 `freeaiPurifyLine` 捕获流内
+错误并走 `freeaiBrandMessage()`；**非流式 / 流前失败**不进流，落到通用兜底
+`'上游 ' + up.prefix + ' 的所有 Key 均失败：' + conn.lastFailReason`。三个问题：
+
+1. freeAI **没有 Key 池可轮换**，"所有 Key 均失败"让用户无从下手；
+2. 原样泄露上游真名与内部文本（`Error from provider (Console)`、`OpenCode's free
+   tier can only be used from within OpenCode`）；
+3. 把**瞬时**闸门说成服务故障。
+
+现在 `freeaiBrandMessage()` 改成「分类后只回自己的话，原文一律丢弃」，原文只进
+日志；`freeaiErrText()` 负责授权服务端（`fp.php`/`activate.php`/`heartbeat.php`）
+错误码的中性化翻译；全失败分支对 `up.id === FRE_UPID` 特判，瞬时闸门回
+`429 + Retry-After: 5` + `'freeAI 服务繁忙，请稍后重试'`，其余回 `502` + 分类文案。
+
+验收实测：未知模型触发终态错误后，响应体 `grep -ciE 'opencode|free tier|within
+OpenCode|provider \(Console\)|zen'` = **0**。
+
+#### 验收记录（真机，2026-10，`v2.9.0`）
+
+| 判据 | 结果 |
+| --- | --- |
+| 静态六项检查 | 全部 OK（顶层函数 279） |
+| 单元测试 | `==== ALL PASS ==== / UNIT_RC=0` |
+| `ucode -c` | RC=0，零输出（406312 字节，无 BOM） |
+| 文件一致性 | 本地与路由器 md5 均为 `a2615249b654e3183f1bd52c5171607a` |
+| 管理页「测试」按钮（`/admin/api/freeai/test`） | HTTP 200，三步全绿：`session.ok`（ttl 300）/ `models.ok`（7 个）/ `chat.ok`（`done:true`、`text:"OK"`） |
+| 管理页「重置」按钮（`/admin/api/freeai/reset`） | HTTP 200 `{"ok":true}`，state 的 `session` 回到 `null` |
+| 管理页「保存」按钮（`/admin/api/freeai/save`） | HTTP 200，磁盘 `freeai.json` 的 `model`/`ver`/`injectFingerprint`/`brandNeutralize` 全部按提交值落盘 |
+| 流式请求（`freeai/big-pickle`） | HTTP 200 / 2446 字节，SSE 完整、含 `reasoning_content` 增量、尾部 `usage` + `[DONE]` |
+| 非流式请求 | HTTP 200 / 538 字节，标准 `chat.completion` 对象、`content:"56"`、usage 完整 |
+| 品牌中性化 | 终态错误响应体零上游字样（grep 计数 0） |
+| 用量记账 | 单次 chat 后全局 usage `+8594/+17/+8611`，`byUp` 首次出现 `ufreeai` |
+| 心跳续签 | `tokenAge: 2`（60s 心跳 tick 生效），日志见 `chat via upstream freeai key ***` |
+
+> **会话 id 派生（验收项③的正面证据）**：探针用同样的头集合打上游，**只有
+> body 里带上会话包下发的 `fingerprint.tools`（12 个 opencode 工具，天然含
+> `bash`/`read`）时才 200**；裸 119 字节 body 一律 403 `FreeTierError`。这与
+> `agent2api` 的 `emulation.rs` 硬编码的三项校验互相印证：`Bearer public` 凭据、
+> `ses_` 26 字符形态、**body 必须是 agent 形态（`stream:true` + 含 `bash`/`read`
+> 工具桩）**。生产路径一直能通，正因为 `freeaiShape()` 无条件注入这 12 个工具。
+
 ### 管理页安全设计
 
 | 项目 | 做法 | 理由 |
