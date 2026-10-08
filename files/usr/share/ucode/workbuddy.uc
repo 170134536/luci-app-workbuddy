@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.5.0';
+const APP_VERSION = '2.8.0';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -477,7 +477,71 @@ const POOL_CONNECT_TIMEOUT = 3;      // 走回环时连接超时要短，才能�
 const BRIDGE_PORT_DEFAULT = 8791;
 const NC_PATH = '/usr/bin/nc';
 
-// ---------- v2.0：能力扩展 ----------
+// ---------- v2.6.0：freeAI 原生客户端 ----------
+//
+// 背景：freeAI 官方是一个跑在 Windows 上的 Node 网关（bytenode 字节码锁死），
+// 它自己再以「伪造 opencode 官方客户端」的形态去访问 opencode.ai/zen 的免费模型池。
+// 本模块在 ucode 里**原生实现同一套协议**，不依赖那台 Windows 机器。
+//
+// 协议逆向结论（2026-10-08 本机实测，见 lessons 文档）：
+//   1) 会话包  GET fp.php?machine=<id>&sid=<oid>&cv=<ver>[&token=<t>]&act=session
+//      返回 upstream_url / headers / fingerprint / wm / sig_block / exp / refreshed_token
+//   2) **sid 必须是 26 字符 oid 形态**（12 位 hex + 14 位 Base62），
+//      否则上游一律 403 —— 这是硬性校验，不是"建议格式"（实测 40 字符随机 sid 全 403）。
+//   3) 请求必须带 `x-freeai-session: <sig_block>`，否则 403。
+//   4) 匿名凭据是字面串 `public`（Authorization: Bearer public）。
+//   5) 请求体必须是"agent 形态"：stream:true 且 tools 同时含 bash 与 read 函数桩。
+//
+// 为什么要在路由器上重实现而不是转发到 PC：用户明确选择本方案（Design B），
+// PC 关机后插件依然可用。代价是授权是机器绑定的，token 需要从 PC 侧同步过来。
+const FRE_CFG_FILE = '/etc/workbuddy/freeai.json';
+const FRE_BASE_DEFAULT = 'https://web-deepseek.gd7.cn/freeAI-admin/api';
+const FRE_VER_DEFAULT = '1.4.6';
+const FRE_SESSION_TTL = 240;          // 会话包本地软过期（上游给 300s，留 60s 余量）
+const FRE_SESSION_TTL_MIN = 30;       // 上游返回的 ttl 小于此值时不予采信
+const FRE_SESSION_BACKOFF = 60;       // 会话包拉取失败后的退避（秒），避免打爆授权服务端
+const FRE_TOKEN_GRACE = 60;           // token 过期前的提前续签余量（秒）
+const FRE_MAX_TOKENS = 4000;          // 与官方网关一致：max_tokens 上限 4000（不是指纹里的 32000）
+const FRE_UA = 'opencode/1.18.31 (windows amd64; node22)';
+// web-deepseek.gd7.cn 在 Cloudflare 后有两条 A 记录，但"哪条证书正常"会随
+// Cloudflare 边缘路由变化而翻转（实测 104.21.89.29 与 172.67.136.143 先后
+// 扮演过坏 IP：缺 SAN 返回 HTTP 421 / TLS 重置）。DNS 轮询会导致授权请求
+// 命中坏 IP 而失败，因此 freeaiHttp 用 --resolve 逐条钉住候选 IP 探测，
+// 把当前可达的那条缓存到 freGoodIp。此列表需要保持为两条已知 A 记录；
+// 若 Cloudflare 换 IP，只需更新此常量（并同步注释）。
+const FRE_CF_IPS = ['172.67.136.143', '104.21.89.29'];
+const FRE_CF_HOST = 'web-deepseek.gd7.cn';
+const FRE_OID_C62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+const FRE_COOL_AUTH = 30;             // freeAI 鉴权/会话类失败的冷却（秒）
+const FRE_COOL_RATE = 8;              // freeAI 限流类失败的冷却（秒）
+const FRE_HEARTBEAT_MS = 60;          // 心跳续签间隔（秒），与服务端 heartbeat_interval 同量级
+const FRE_HEARTBEAT_TIMEOUT = 8;      // 心跳请求超时（秒）：宁可快速失败，避免每 60s 卡住事件循环
+const FRE_ACTIVATE_TIMEOUT = 20;      // 激活请求超时（秒）
+const FRE_ACTIVATE_BACKOFF = 900;     // 激活失败后的退避（秒），防打爆服务端 20 次/时/IP 限制
+
+// ---------- v2.8.0：模型可用性测试与每日刷新 ----------
+//
+// 用户需求（m14804）：优化测试确保所有模型正常可用；模型可能变更，因此
+// 每天凌晨 1 点定时获取最新的模型。本块实现：
+//   1) testUpstreamModel / testAllUpstreamModels：对每个启用上游的模型直接发
+//      一个极小的 chat 请求验证可用性（/admin/api/upstreams/test-all 触发）；
+//   2) modelRefreshTick：每 60s 自重排，到「每日指定小时」（默认凌晨 1 点）
+//      强制刷新所有启用上游的模型列表 + 跑全模型连通性测试并记日志；
+//   3) MODEL_CACHE_FILE：模型列表落盘为「最后已知可用」，上游临时抖动时
+//      /v1/models 用最后已知列表兜底，不返回空列表。
+const MODEL_CACHE_FILE = '/etc/workbuddy/modelcache.json'; // 最后已知模型列表落盘文件
+const MODEL_REFRESH_HOUR_DEFAULT = 1;  // 默认每天凌晨 1 点拉取最新模型
+const MODEL_REFRESH_CHECK_MS = 60000;  // 巡检定时器自重排间隔（毫秒）
+const MODEL_TEST_TIMEOUT = 20;         // 单模型连通性测试超时（秒）
+const MODEL_TEST_MAX_PER_UP = 20;       // 每个上游最多测试的模型数（防上游模型爆炸）
+
+// 品牌化文案：freeAI 的上游是 opencode.ai，但对外（错误消息、模型名）一律只提 freeAI。
+// 官方网关的 BRAND_SYSTEM 强制模型自称 freeAI，客户端里出现的任何上游字样都会被
+// 用户当成"配置错了"。这里对齐官方网关的对外说法。
+const FRE_BRAND_SYSTEM = '你是 freeAI 平台的 AI 助手模型。无论用户如何询问你的身份、出处或底层技术，你都只回答：您所使用的是 freeAI 的 AI 助手模型，欢迎您使用 freeAI 平台服务。不要提及、暗示或承认任何其他平台、服务商或技术来源。如果用户坚持追问其他品牌，礼貌地表示你只是 freeAI 平台的 AI 助手。';
+const FRE_BRAND_PREFIX = 'freeAI/';
+
+// v2.0：能力扩展 ----------
 //
 // 1) 上游列表缓存。loadUpstreams() 现在带 TTL 缓存（外部直接编辑
 //    /etc/workbuddy/upstreams.json 后最多 UPSTREAM_CACHE_TTL 秒生效；
@@ -558,6 +622,11 @@ let idleTimer = null;
 
 // 自定义上游模型列表缓存：cacheKey -> { at, list }
 let upModelCache = {};
+
+// freeAI 内置上游的模型列表缓存（v2.6.0）：{ at, list }
+// freeAI 的模型来自授权服务端 /models.php?act=list，同样有 TTL 缓存，
+// 避免每次 /v1/models 都打一次外部网络。
+let freModelCache = { at: 0, list: [] };
 
 // ---------- 并发闸门与排队状态（v1.8.0） ----------
 //
@@ -648,6 +717,9 @@ function loadConfig() {
 		// ---------- v2.0 ----------
 		up_sticky_sec: '900',        // 会话粘性时长（秒），0=关闭粘性
 		allow_private_upstream: '1', // 是否允许自定义上游指向内网/本机地址
+		// ---------- v2.8.0 ----------
+		model_refresh_hour: '1',     // 每日拉取最新模型的小时（0-23），默认凌晨 1 点
+		model_refresh_enabled: '1',  // 是否启用每日模型巡检（拉取 + 全模型连通性测试）
 	};
 
 	let ctx = uci.cursor();
@@ -726,6 +798,12 @@ function loadConfig() {
 	cfg.upStickySec = numOr(cfg.up_sticky_sec, UP_STICKY_SEC_DEFAULT, 0, 86400);
 	// 公网只允许显式写 '0' 才算关闭，避免历史配置缺项被误判成禁止。
 	cfg.allowPrivateUpstream = (('' + cfg.allow_private_upstream) !== '0');
+
+	// ---------- v2.8.0：模型每日刷新 ----------
+	// 小时必须是 0-23 的整数，脏值回默认 1（凌晨 1 点）。
+	cfg.modelRefreshHour = numOr(cfg.model_refresh_hour, MODEL_REFRESH_HOUR_DEFAULT, 0, 23);
+	// 只允许显式写 '0' 才算关闭，历史配置缺项视为开启。
+	cfg.modelRefreshEnabled = (('' + cfg.model_refresh_enabled) !== '0');
 
 	return cfg;
 }
@@ -1803,6 +1881,13 @@ function toggleApiKey(id, enabled) {
 // 上游池轮询的是不同厂商的 key，冷却与失败语义都不同，混在一起会互相污染。
 const UPSTREAM_FILE = '/etc/workbuddy/upstreams.json';
 
+// freeAI 内置上游的固定 id 与模型前缀。它不写进 upstreams.json ——
+// 用户在管理页看到的是独立的「freeAI」设置卡，而配置落在 FRE_CFG_FILE。
+// 之所以仍做成"上游"形态：转发链、并发闸门、刹车、relay 日志、指标、
+// 连接池回退全部按上游维度组织，另起一条链等于把这些再来一遍。
+const FRE_UPID = 'ufreeai';
+const FRE_PREFIX = 'freeai';
+
 // 上游池轮询游标：按上游分别记录，避免多上游互相打乱节奏
 let upCursor = {};
 
@@ -1812,6 +1897,131 @@ function maskKey(k) {
 	let s = '' + (k || '');
 	if (length(s) <= 10) return '***';
 	return substr(s, 0, 6) + '…' + substr(s, length(s) - 4, 4);
+}
+
+// ---------- freeAI：配置 ----------
+//
+// 独立设置项，与 upstreams.json 分开存：freeAI 的凭据形态（授权码 + 机器指纹 +
+// 会话 token）和普通上游的"一串 API Key"完全不同，塞进同一个 schema 只会让
+// 两边的校验都变脏。
+//
+// 门禁：没有授权码就不能用。`enabled && license 非空` 才会被当成可用上游，
+// 这既是用户要求（"需要授权码才能使用"），也让未配置时 freeai/ 前缀直接 404
+// 而不是打上游拿到一堆 403。
+let freCache = { at: 0, data: null };
+
+function freeaiRaw() {
+	let now = time();
+	if (freCache.data !== null && (now - freCache.at) < UPSTREAM_CACHE_TTL)
+		return freCache.data;
+	let j = readJsonFile(FRE_CFG_FILE);
+	let c = (type(j) === 'object' && j !== null) ? j : {};
+	let out = {
+		enabled: (c.enabled === true),
+		license: '' + (c.license || ''),
+		machine: '' + (c.machine || ''),
+		token: '' + (c.token || ''),
+		tokenAt: +c.tokenAt || 0,
+		model: '' + (c.model || ''),
+		base: '' + (c.base || FRE_BASE_DEFAULT),
+		ver: '' + (c.ver || FRE_VER_DEFAULT),
+		injectFingerprint: (c.injectFingerprint !== false),
+		brandNeutralize: (c.brandNeutralize !== false),
+	};
+	freCache = { at: now, data: out };
+	return out;
+}
+
+function freeaiUsable() {
+	let c = freeaiRaw();
+	return (c.enabled && length(c.license) > 0);
+}
+
+// 把 freeAI 配置投影成一个"上游"对象，形状与 loadUpstreams() 的条目一致。
+// Key 只有一把（freeAI 是单会话，不存在多 Key 轮换），且必须每次现取 ——
+// 会话包里的 token 会滑动续签，缓存住旧的就会持续 401。
+function freeaiUpstream() {
+	let c = freeaiRaw();
+	return {
+		id: FRE_UPID,
+		name: 'freeAI',
+		prefix: FRE_PREFIX,
+		baseUrl: c.base,
+		keys: ['__freeai__'],
+		weights: {},
+		disabled: {},
+		enabled: true,
+		builtin: 'freeai',
+		createdAt: 0,
+	};
+}
+
+// ---------- freeAI：oid（会话/请求 ID） ----------
+//
+// **格式是硬校验，不是建议。** 实测：40 字符 base36 随机串无论怎么补齐
+// fp.system / tools 都返回 403 空 body；换成这里生成的 26 字符形态后全部 200。
+//
+// 官方实现（gateway.mjs oid()）：
+//   value = BigInt(ms) * 0x1000n + counter
+//   time  = 取 value 的 40/32/24/16/8/0 位各 8bit，转 16 进制补零 → 12 字符
+//   + 14 个 C62 随机字符（0-9A-Za-z）
+// 总长 12 + 14 = 26。
+//
+// ucode 没有 BigInt，但 value >> 40 的最高 8 位恰好就是 ms >> 28：
+//   value = ms * 4096 + n（n < 4096 恒成立）
+//   value >> 40 = (ms*4096 + n) >> 40 = ms >> 28 + (低位进位)
+// 进位只在 n 把低 28 位顶满时发生，而 ms 低 28 位远未顶满，故等价。
+// 下面用逐字节移位复刻，不去赌这条推导 —— 反正是常数时间。
+let freOidSeq = 0;
+
+function freeaiOid() {
+	let ms = F.nowMs();
+	freOidSeq = (freOidSeq + 1) % 4096;
+	// 72 位足够容纳 ms*4096（ms ~ 1.8e12，×4096 ~ 7.4e15 < 2^53），
+	// 用数组当大整数：[低位, ..., 高位]，每项 8 bit。
+	let w = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+	let lo = ms % 4294967296;              // ms 的低 32 位
+	let hi = (ms - lo) / 4294967296;       // ms 的高位
+	// ms * 4096：整体左移 12 bit（= 1.5 字节，用「12 bit」精确处理）
+	let v = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+	v[0] = lo & 255; v[1] = (lo / 256) & 255; v[2] = (lo / 65536) & 255; v[3] = (lo / 16777216) & 255;
+	v[4] = hi & 255; v[5] = (hi / 256) & 255; v[6] = (hi / 65536) & 255; v[7] = (hi / 16777216) & 255;
+	// 左移 12 bit = 左移 1 字节 + 左移 4 bit
+	let s = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+	for (let i = 0; i < 12; i++) s[i + 1] = v[i];
+	for (let i = 12; i >= 0; i--) {
+		let x = s[i] * 16;
+		s[i] = x & 255;
+		if (i + 1 < 13) s[i + 1] += (x - (x & 255)) / 256;
+	}
+	// 加 counter
+	s[0] += freOidSeq;
+	for (let i = 0; i < 13; i++) {
+		if (s[i] < 256) break;
+		s[i + 1] += (s[i] - (s[i] & 255)) / 256;
+		s[i] = s[i] & 255;
+	}
+	// 取 40/32/24/16/8/0 位各 8bit → 12 个 hex 字符
+	let hex = '0123456789abcdef';
+	let out = '';
+	for (let i = 5; i >= 0; i--) {
+		let b = s[i] || 0;
+		out += substr(hex, (b - (b % 16)) / 16, 1) + substr(hex, b % 16, 1);
+	}
+	// 14 个 Base62 随机字符
+	let rnd = '' + readRandom(64);
+	let h = sha256Hex(rnd + '.' + ms + '.' + freOidSeq);
+	for (let i = 0; i < 14; i++) {
+		let pair = substr(h, i * 2, 2);
+		let b = 0;
+		let c0 = substr(pair, 0, 1), c1 = substr(pair, 1, 1);
+		let d0 = index(hex, c0), d1 = index(hex, c1);
+		if (d0 < 0) d0 = 0;
+		if (d1 < 0) d1 = 0;
+		b = d0 * 16 + d1;
+		out += substr(FRE_OID_C62, b % 62, 1);
+	}
+	return out;
 }
 
 // ---------- 指标采集（v1.8.0） ----------
@@ -2038,6 +2248,29 @@ function loadUpstreams() {
 			}
 		}
 
+		// v2.7.0：模型映射。v2.8.0 修复：loadUpstreams() 构造新对象时之前没拷贝
+		// 这两个字段，导致 /v1/models 的自定义清单分支与 upstreamStatus() 的
+		// modelCount/modelsText 全部失效（管理页看不到映射、列表也不生效）。
+		let modelListSeen = {};
+		let modelList = [];
+		let modelMap = {};
+		if (type(u.modelList) === 'array') {
+			for (let mid in u.modelList) {
+				if (type(mid) !== 'string') continue;
+				let t = trim(mid);
+				if (length(t) === 0) continue;
+				if (modelListSeen[t]) continue;
+				modelListSeen[t] = true;
+				push(modelList, t);
+			}
+		}
+		if (type(u.modelMap) === 'object' && u.modelMap !== null) {
+			for (let ak in u.modelMap) {
+				let av = '' + (u.modelMap[ak] || '');
+				if (type(av) === 'string' && length(av) > 0) modelMap['' + ak] = av;
+			}
+		}
+
 		push(out, {
 			id: id,
 			name: '' + (u.name || prefix),
@@ -2047,6 +2280,8 @@ function loadUpstreams() {
 			weights: weights,
 			enabled: (u.enabled !== false),
 			createdAt: +u.createdAt || 0,
+			modelList: modelList,
+			modelMap: modelMap,
 		});
 	}
 	upstreamCache = { at: now, list: out };
@@ -2246,6 +2481,40 @@ function upEarliestRetrySec(up) {
 	return best < 0 ? 0 : best;
 }
 
+// ---------- v2.8.0：模型列表落盘（最后已知可用） ----------
+//
+// upModelCache 原本只存在内存：上游 /models 一抖，/v1/models 就跟着变空，
+// 客户端拿到空列表会以为自己配错了。现在把「最后已知可用」的模型列表落盘到
+// MODEL_CACHE_FILE，启动时载入、拉取成功时写入、上游配置变更时清空。
+//
+// 【位置约束】必须定义在 saveUpstreamsFile（紧随其后）之前 —— 那个函数会调用
+// saveModelCache()，而 ucode 不提升声明，函数按定义时的词法作用域解析自由变量，
+// 声明在后会抛 "access to undeclared variable"（踩坑记录 #12）。
+function saveModelCache() {
+	let slim = {};
+	for (let ck in upModelCache) {
+		let ce = upModelCache[ck];
+		if (type(ce) === 'object' && ce !== null && type(ce.list) === 'array')
+			slim[ck] = { at: ce.at, list: ce.list };
+	}
+	try {
+		writeJsonFile(MODEL_CACHE_FILE, { saved: time(), cache: slim });
+	} catch (e) {
+		logErr('saveModelCache failed: ' + e);
+	}
+}
+
+function loadModelCache() {
+	let j = null;
+	try { j = readJsonFile(MODEL_CACHE_FILE); } catch (e) { j = null; }
+	if (!j || type(j.cache) !== 'object' || j.cache === null) return;
+	for (let ck in j.cache) {
+		let ce = j.cache[ck];
+		if (type(ce) === 'object' && ce !== null && type(ce.list) === 'array')
+			upModelCache[ck] = { at: +ce.at || 0, list: ce.list };
+	}
+}
+
 function saveUpstreamsFile(j) {
 	if (!writeJsonFile(UPSTREAM_FILE, j)) {
 		logErr('upstream save failed');
@@ -2254,6 +2523,10 @@ function saveUpstreamsFile(j) {
 	// 上游配置变了（增删 / 改 Key / 停用），模型列表缓存必须作废，
 	// 否则管理页改完还要等 TTL 到期才看得到新模型。
 	upModelCache = {};
+	// v2.8.0：落盘副本同步清空。不清的话，下次上游拉取失败时会用"上一个
+	// 上游配置"的最后已知列表兜底 —— 那是错的列表，比空列表更容易误导人。
+	// （清空后 saveModelCache 写的是空表，loadModelCache 自然什么都不兜。）
+	saveModelCache();
 	// v2.0：loadUpstreams 的 TTL 缓存同样立即失效。
 	upstreamCache = { at: 0, list: null };
 	return true;
@@ -2371,6 +2644,14 @@ function weightedRotate(up, keys) {
 }
 
 function usableUpKeys(up, stickyFor) {
+	// freeAI 只有一把合成 Key，且它的"失败"是会话/token 层面的，不是 Key 层面的：
+	// 走通用冷却会让一次 401 把整条上游按 60s 关掉，而实际只需重领一次会话包。
+	// 所以这里直接返回单元素数组，冷却交给 freeai 自己的会话重试逻辑处理。
+	if (up.id === FRE_UPID) {
+		if (!freeaiUsable()) return [];
+		return ['__freeai__'];
+	}
+
 	let clean = [];
 	let rec = [];
 	for (let k in up.keys) {
@@ -2656,6 +2937,9 @@ function fmtUsage(u) {
 
 // 按前缀查找已启用的自定义上游
 function findUpstreamByPrefix(prefix) {
+	// freeAI 是内置上游（不写进 upstreams.json），但它同样以「模型前缀」参与路由，
+	// 所以必须在同一条查找路径上 —— 否则 freeai/xxx 会走到"unknown upstream prefix"。
+	if (prefix === FRE_PREFIX) return freeaiUsable() ? freeaiUpstream() : null;
 	let list = loadUpstreams();
 	for (let u in list) {
 		if (u.enabled && u.prefix === prefix) return u;
@@ -2674,6 +2958,10 @@ function shquote(s) {
 // 拉取某个自定义上游的模型列表。
 // 返回 [{ id }]；失败返回空数组（不让一个挂掉的上游拖垮整个 /v1/models）。
 function fetchUpstreamModels(up) {
+	// freeAI 的模型列表来自它自己的授权服务端，不是 OpenAI 兼容的 /models
+	// —— 直接走 /models 只会拿到 404，然后被当成"Key 坏了"记进冷却。
+	if (up.id === FRE_UPID) return F.freeaiModels();
+
 	let keys = usableUpKeys(up);
 	if (length(keys) === 0) return [];
 
@@ -2763,7 +3051,60 @@ function parseKeysText(keysText) {
 	return { keys: keys, weights: weights };
 }
 
-function addUpstream(name, prefix, baseUrl, keysText) {
+// v2.7.0：解析管理页粘贴的「模型映射」文本，用来把上游的真实模型名
+// 与对外的模型名解耦（one-api / new-api 的「模型重定向」）。
+//
+// 每行一条，两种写法：
+//   <真实模型名>                 —— 直接暴露（别名=真名）
+//   <别名>=<真实模型名>          —— 对外暴露别名，转发时替换回真名
+//
+// 为什么需要它：上游有时会列出它其实不提供的模型（见 @2317 的注释），
+// 或者模型名很长/带不稳定的后缀。客户端只认一个稳定的名字，
+// 由这里做映射，换上游/换版本时只改映射，不用改客户端配置。
+//
+// 返回 { map: {别名: 真名}, list: [对外的模型名...] }。
+// map 只在「别名 != 真名」时登记，这样纯粹的模型清单不占额外空间。
+function parseModelMap(text) {
+	let map = {};
+	let list = [];
+	let seen = {};
+	let lines = split('' + (text || ''), '\n');
+	for (let ln in lines) {
+		let t = trim(ln);
+		if (length(t) === 0) continue;
+		// 支持 `#` 开头的注释行，方便在管理页里写说明
+		if (substr(t, 0, 1) === '#') continue;
+		let alias = t;
+		let real = t;
+		let eq = index(t, '=');
+		// eq === 0 表示以 `=` 开头（没有别名），是笔误，整行丢弃 ——
+		// 否则会把 "=onlyreal" 当成一个叫这个名字的模型暴露出去。
+		if (eq === 0) continue;
+		if (eq > 0) {
+			alias = trim(substr(t, 0, eq));
+			real = trim(substr(t, eq + 1));
+		}
+		if (length(alias) === 0 || length(real) === 0) continue;
+		if (seen[alias]) continue;
+		seen[alias] = true;
+		push(list, alias);
+		if (alias !== real) map[alias] = real;
+	}
+	return { map: map, list: list };
+}
+
+// 把对外的模型名翻译成上游认得的真名。没有映射表或查不到时原样返回
+// —— 上游直连的裸名必须继续可用（否则用户升级后旧客户端全挂）。
+function mapUpstreamModel(up, model) {
+	if (up === null || type(up) !== 'object') return model;
+	let mm = up.modelMap;
+	if (type(mm) !== 'object' || mm === null) return model;
+	let hit = mm['' + model];
+	if (type(hit) === 'string' && length(hit) > 0) return hit;
+	return model;
+}
+
+function addUpstream(name, prefix, baseUrl, keysText, modelsText) {
 	let j = readJsonFile(UPSTREAM_FILE);
 	if (!j || type(j.upstreams) !== 'array') j = { upstreams: [] };
 
@@ -2803,6 +3144,15 @@ function addUpstream(name, prefix, baseUrl, keysText) {
 	};
 	// 权重非默认（存在 >1 的项）时才写入文件，保持旧文件格式不变。
 	if (length(parsed.weights) > 0) entry.weights = parsed.weights;
+	// v2.7.0：可选的模型映射（见 parseModelMap）。全空时不写字段，
+	// 这样"没配映射"和"配了空映射"在文件里是同一种形态。
+	if (modelsText != null) {
+		let pm = parseModelMap('' + modelsText);
+		if (length(pm.list) > 0) {
+			entry.modelList = pm.list;
+			if (length(keys(pm.map)) > 0) entry.modelMap = pm.map;
+		}
+	}
 	push(j.upstreams, entry);
 	if (!saveUpstreamsFile(j)) return { ok: false, error: '写入失败' };
 	logInfo(sprintf('upstream added: %s -> %s (%d keys)', pf, url, length(keys)));
@@ -2861,7 +3211,7 @@ function toggleUpstream(id, enabled) {
 // 改 prefix 的连带影响：客户端里已写好的 "旧前缀/模型" 会立刻失效
 // （findUpstreamByPrefix 找不到）。所以这里在返回值里回传 oldPrefix，
 // 前端据此提示用户改客户端配置。
-function editUpstream(id, name, prefix, baseUrl, enabled) {
+function editUpstream(id, name, prefix, baseUrl, enabled, modelsText) {
 	let j = readJsonFile(UPSTREAM_FILE);
 	if (!j || type(j.upstreams) !== 'array') return { ok: false, error: '无上游配置' };
 
@@ -2893,9 +3243,24 @@ function editUpstream(id, name, prefix, baseUrl, enabled) {
 	// ucode 没有全局 undefined（裸写会抛 ReferenceError），判空用 != null。
 	if (enabled != null) hit.enabled = enabled ? true : false;
 
+	// v2.7.0：模型映射。modelsText 为 null 表示"本次不改"，空串表示"清空映射"。
+	// 这个区分很重要：管理页的其它字段（如只改名称）不该顺手把映射抹掉。
+	if (modelsText != null) {
+		let pm = parseModelMap('' + modelsText);
+		// 全空 ⇒ 删除字段（而不是留一个空表），保持旧文件格式干净。
+		if (length(pm.list) === 0) {
+			hit.modelList = null;
+			hit.modelMap = null;
+		} else {
+			hit.modelList = pm.list;
+			hit.modelMap = (length(keys(pm.map)) > 0) ? pm.map : null;
+		}
+	}
+
 	if (!saveUpstreamsFile(j)) return { ok: false, error: '写入失败' };
 	return { ok: true, id: '' + id, prefix: np, oldPrefix: oldPrefix,
-		prefixChanged: (oldPrefix !== np), name: hit.name };
+		prefixChanged: (oldPrefix !== np), name: hit.name,
+		modelCount: (type(hit.modelList) === 'array') ? length(hit.modelList) : 0 };
 }
 
 // 替换某个上游的 Key 组（管理页"编辑 Key"用）
@@ -3018,6 +3383,16 @@ function upstreamStatus() {
 				usageText: fmtUsage(keyUsage),
 			});
 		}
+		// v2.7.0：把模型映射回送给管理页，供「编辑服务器」弹窗回显。
+		// 用 `别名=真名`（有映射）/ 裸名（无映射）两种写法的原始文本，
+		// 这样"打开弹窗再原样保存"不会丢信息。
+		let ml = (type(u.modelList) === 'array') ? u.modelList : [];
+		let mmt = [];
+		for (let mid in ml) {
+			let real = null;
+			if (type(u.modelMap) === 'object' && u.modelMap !== null) real = u.modelMap[mid];
+			push(mmt, (real !== null && real !== mid) ? (mid + '=' + real) : ('' + mid));
+		}
 		push(out, {
 			id: u.id,
 			name: u.name,
@@ -3029,9 +3404,185 @@ function upstreamStatus() {
 			keys: keys,
 			usage: upUsage,
 			usageText: fmtUsage(upUsage),
+			modelCount: length(ml),
+			modelsText: join('\n', mmt),
 		});
 	}
 	return out;
+}
+
+// ---------- v2.8.0：模型可用性测试与每日刷新 ----------
+
+// 每日巡检定时器的句柄与"上次已跑过的日期"（用 yyyymmdd 数字比较）。
+// 必须声明在函数之前：ucode 不提升声明（踩坑记录 #12）。
+let modelRefreshTimer = null;
+let modelRefreshLastDay = -1;
+
+// 为什么测试直连上游而不是走本机代理：走 handleChat 会占用并发闸门（up_max_inflight）
+// 和排队槽位，一次「测试全部模型」可能把在途额度吃光、把真实用户请求挤进排队。
+// 测试请求本身极小（max_tokens:1），直连最省事也最不打扰生产链路。
+
+// 对某个上游的单个模型发一个极小的 chat 请求，验证它真的可用。
+// 直接调上游的 /chat/completions（stream:false、max_tokens:1），比只拉 /models
+// 更接近真实使用路径：能过鉴权、能完成一次推理才算"可用"。
+// 返回 { model, ok, error }。
+function testUpstreamModel(up, modelName) {
+	let keys = usableUpKeys(up);
+	if (length(keys) === 0)
+		return { model: modelName, ok: false, error: '无可用 Key（全部冷却/停用）' };
+
+	// 对外名 -> 上游真名（模型映射在真实转发里同样生效，测试要走同一路径）
+	let real = mapUpstreamModel(up, modelName);
+	let key = keys[0];
+	let reqBody = {
+		model: real,
+		messages: [{ role: 'user', content: 'ping' }],
+		max_tokens: 1,
+		stream: false,
+	};
+	let bodyJson = sprintf('%.J', reqBody);
+	let cmd = join(' ', [
+		'curl', '-sS', '-m', '' + MODEL_TEST_TIMEOUT, '-4',
+		'-X', 'POST',
+		'-H', shquote('Authorization: Bearer ' + key),
+		'-H', shquote('Content-Type: application/json'),
+		shquote(up.baseUrl + '/chat/completions'),
+		'--data-binary', shquote(bodyJson),
+	]);
+
+	let raw = '';
+	try {
+		let p = popen(cmd, 'r');
+		if (p) raw = p.read('all') || '';
+	} catch (e) {
+		return { model: modelName, ok: false, error: '请求异常: ' + e };
+	}
+
+	let j = null;
+	try { j = json(raw); } catch (e) { j = null; }
+	if (j && type(j.choices) === 'array' && length(j.choices) > 0)
+		return { model: modelName, ok: true };
+
+	// 提取错误信息（JSON error / HTTP 状态 / 原始片段），尽量给用户可读的原因
+	let err = '';
+	if (j && j.error) {
+		if (type(j.error) === 'object' && j.error !== null)
+			err = '' + (j.error.message || j.error.code || '');
+		else
+			err = '' + j.error;
+	}
+	if (length(err) === 0) {
+		let head = substr(trim(raw), 0, 160);
+		err = length(head) > 0 ? head : '空响应/超时';
+	}
+	return { model: modelName, ok: false, error: err };
+}
+
+// 遍历所有启用上游（跳过 freeAI，它有独立的 /freeai/test），对每个模型发最小
+// 请求验证可用性。模型来源优先级：自定义清单 > 最后已知列表 > 现场拉取。
+// 每上游最多 MODEL_TEST_MAX_PER_UP 个模型，去重后测试。
+// 返回 { ok, total, okCount, failCount, results:[{model,ok,error}] }。
+function testAllUpstreamModels() {
+	let ups = loadUpstreams();
+	let results = [];
+	let okCount = 0;
+	let failCount = 0;
+	for (let u in ups) {
+		if (!u.enabled) continue;
+		if (u.id === FRE_UPID) continue; // freeAI 是动态合成上游，走 /freeai/test
+
+		// 决定要测哪些模型
+		let models = [];
+		let seen = {};
+		if (type(u.modelList) === 'array' && length(u.modelList) > 0) {
+			// 有自定义清单：以清单为准（测试对外的名字，映射在函数里做）
+			for (let mid in u.modelList) {
+				if (seen[mid]) continue;
+				seen[mid] = true;
+				push(models, mid);
+			}
+		} else {
+			let ck = u.prefix + '|' + u.baseUrl + '|' + length(u.keys);
+			let ce = upModelCache[ck];
+			if (ce && type(ce.list) === 'array') {
+				for (let m in ce.list) {
+					if (seen[m.id]) continue;
+					seen[m.id] = true;
+					push(models, m.id);
+				}
+			}
+			if (length(models) === 0) {
+				let remote = fetchUpstreamModels(u);
+				for (let m in remote) {
+					if (seen[m.id]) continue;
+					seen[m.id] = true;
+					push(models, m.id);
+				}
+			}
+		}
+
+		// 每上游上限，防止模型列表爆炸时测试请求打爆上游
+		let tested = [];
+		for (let m in models) {
+			push(tested, m);
+			if (length(tested) >= MODEL_TEST_MAX_PER_UP) break;
+		}
+
+		for (let m in tested) {
+			let r = testUpstreamModel(u, m);
+			if (r.ok) okCount++;
+			else failCount++;
+			push(results, r);
+		}
+	}
+	return {
+		ok: failCount === 0,
+		total: okCount + failCount,
+		okCount: okCount,
+		failCount: failCount,
+		results: results,
+	};
+}
+
+// 每日模型巡检：每 MODEL_REFRESH_CHECK_MS 自重排，检查是否到了
+// cfg.modelRefreshHour（默认凌晨 1 点）且今天还没跑过；到了就：
+//   1) 强制刷新所有启用上游的模型列表（拉取成功写缓存 + 落盘）；
+//   2) 跑一遍全模型连通性测试，把失败记入日志。
+// 重排必须发生在业务逻辑之前（无论是否到点都先排下一次）。
+function modelRefreshTick() {
+	modelRefreshTimer = uloop.timer(MODEL_REFRESH_CHECK_MS, () => modelRefreshTick());
+	if (!cfg.modelRefreshEnabled) return;
+
+	let lt = localtime(time());
+	let today = lt.year * 10000 + (lt.mon + 1) * 100 + lt.day;
+	if (lt.hour !== cfg.modelRefreshHour || modelRefreshLastDay === today) return;
+	modelRefreshLastDay = today;
+
+	logInfo(sprintf('model refresh: daily %02d:00 run started', cfg.modelRefreshHour));
+
+	// 1) 强制刷新模型列表
+	let ups = loadUpstreams();
+	for (let u in ups) {
+		if (!u.enabled) continue;
+		if (u.id === FRE_UPID) continue;
+		let ck = u.prefix + '|' + u.baseUrl + '|' + length(u.keys);
+		let remote = fetchUpstreamModels(u);
+		if (length(remote) > 0) {
+			upModelCache[ck] = { at: time(), list: remote };
+			saveModelCache();
+			logInfo(sprintf('model refresh: %s -> %d models', u.prefix, length(remote)));
+		} else {
+			logErr('model refresh: ' + u.prefix + ' returned empty model list');
+		}
+	}
+
+	// 2) 全模型连通性巡检
+	let t = testAllUpstreamModels();
+	logInfo(sprintf('model refresh: test-all done: %d/%d ok, %d failed',
+		t.okCount, t.total, t.failCount));
+	for (let r in t.results) {
+		if (!r.ok) logErr('model refresh: ' + r.model + ' FAIL: ' + r.error);
+	}
 }
 
 // ---------- 公网访问（WAN 防火墙规则） ----------
@@ -3823,7 +4374,8 @@ function adaptBody(raw, cfg) {
 						error: 'unknown upstream prefix: ' + ref.prefix };
 				}
 				upstreamId = up.id;
-				body.model = ref.model;
+				// v2.7.0：模型映射（与 routePassthrough 同一语义，见那里的注释）
+				body.model = mapUpstreamModel(up, ref.model);
 			}
 		}
 	}
@@ -3970,7 +4522,544 @@ function runCurl(cfg, args) {
 	return runCurlStr(join(' ', parts));
 }
 
-// 同步获取模型列表（用 curl，带超时；失败回退内置）
+// ---------- freeAI：会话包 ----------
+//
+// 整个 freeAI 协议里最容易踩的两个坑都在这里：
+//   1) 会话包会过期（上游 ttl=300s），过期后用旧 token 调 fp.php 得到的是
+//      `{"ok":false,"error":"token invalid"}` —— 必须能识别并静默换新，
+//      否则表现为"用一下就断"。
+//   2) 403 有两种语义：426 = 客户端版本过旧（版本闸），403 = 无设备档案/凭据被拒。
+//      这里把 403/401 都归为"凭据类"，触发一次静默重新领取（同官方网关的做法）。
+//
+// 会话包不落盘 disk cache 之外的任何地方；失败有退避，避免反复打授权服务端
+// （activate.php 限 20 次/时/IP，会话接口虽未实测限流也要有礼貌）。
+let freSession = null;        // { pack, at, sid, exp }
+let freSessionFailAt = 0;
+let freSessionErr = '';
+let freReauthing = false;     // 防止并发请求同时触发重激活
+let freHeartbeatTimer = null;
+let freHeartbeatFail = 0;     // 连续心跳失败次数，>=3 清除 token 走激活自愈
+let freActivateFailAt = 0;    // 激活失败退避截止时间（Unix 秒）
+let freGoodIp = null;        // 当前可达的 Cloudflare A 记录（freeaiHttp 探测后缓存）
+let freSessionSeed = '';     // 本次请求的第一条 user 消息内容，用于派生会话头（每次请求重置）
+
+// 对 freeAI 授权服务端执行一次 HTTP 请求，自动挑选当前可达的 Cloudflare IP。
+// 返回 { code: <3位状态码>, body: <解析后的 JSON 对象> }，全部候选 IP 都失败时返回 null。
+// 同步阻塞调用（runCurlStr），超时档位由调用方给出，避免钉死事件循环。
+//
+// 为什么自己选 IP：web-deepseek.gd7.cn 的两条 Cloudflare A 记录中，哪条证书正常
+// 会随边缘路由翻转（实测两条先后当过坏 IP）。坏 IP 返回 421（SAN 不匹配）或
+// TLS 重置（code=000）。这里逐条 --resolve 探测，把最近一次成功的 IP 缓存到
+// freGoodIp，下次优先试它；坏 IP 换下一条。
+function freeaiHttp(method, url, headers, body, timeoutSec, retries) {
+	let to = +timeoutSec || 15;
+	let rt = +retries || 0;
+	let candidates = [];
+	if (length(freGoodIp) > 0) push(candidates, freGoodIp);
+	for (let ip in FRE_CF_IPS) {
+		let dup = false;
+		for (let x in candidates) if (x === ip) dup = true;
+		if (!dup) push(candidates, ip);
+	}
+	let bodyFile = '/tmp/fre_http_body';
+	for (let ip in candidates) {
+		let cmd = 'curl ' + shquote('-sS') + ' ' + shquote('-k') + ' ' + shquote('-m') + ' ' + shquote('' + to) +
+			' ' + shquote('--retry') + ' ' + shquote('' + rt) + ' ' +
+			shquote('--retry-all-errors') + ' ' + shquote('--retry-delay') + ' ' + shquote('1') + ' ' +
+			shquote('--resolve') + ' ' + shquote(FRE_CF_HOST + ':443:' + ip) + ' ' +
+			shquote('-o') + ' ' + shquote(bodyFile) + ' ' + shquote('-w') + ' ' + shquote('%{http_code}');
+		if (method === 'POST') {
+			cmd += ' ' + shquote('-X') + ' ' + shquote('POST') + ' ' +
+				shquote('-H') + ' ' + shquote('Content-Type: application/json') + ' ' +
+				shquote('--data-binary') + ' ' + shquote(body);
+		}
+		for (let k in headers)
+			cmd += ' ' + shquote('-H') + ' ' + shquote(k + ': ' + headers[k]);
+		cmd += ' ' + shquote(url);
+		let code = runCurlStr(cmd);
+		if (code !== null) code = trim(code);
+		// 只认真正的 3 位 HTTP 状态码；421 是 Cloudflare 证书路由错误（坏 IP 的特征），
+		// 000/空表示连接级失败（TLS 重置/超时）。这两类都换下一个 IP 重试。
+		if (code !== null && length(code) === 3 && code !== '421') {
+			freGoodIp = ip;
+			let raw = null;
+			try {
+				let fs = require('fs');
+				if (fs.access(bodyFile, 'f')) raw = fs.readfile(bodyFile);
+			} catch (e) { raw = null; }
+			if (raw === null) return null;
+			let j = null;
+			try { j = json(raw); } catch (e) { j = null; }
+			return { code: code, body: j };
+		}
+	}
+	return null;
+}
+
+// GET 一个 JSON 响应（fp.php）。请求签名对齐官方网关：官方对 freeAI-admin 的
+// 请求用 Node fetch 默认头（User-Agent: node，Accept: */*），不能带 opencode UA
+// （后台识别非官方客户端会限制）。-k 仅用于消化 Cloudflare 证书路由怪癖，
+// 对授权服务端不可见；聊天上游 opencode.ai 不走这里。
+function freeaiApi(path, query) {
+	let c = freeaiRaw();
+	let url = c.base + path;
+	if (length(query) > 0) url += '?' + query;
+	let r = freeaiHttp('GET', url, { 'Accept': '*/*', 'User-Agent': 'node' }, '', 30, 3);
+	if (r === null) return null;
+	return r.body;
+}
+
+// POST 一个 JSON 对象到 freeAI 授权服务端（activate.php / heartbeat.php），
+// 返回解析后的对象或 null。POST 请求体是幂等/可重试的（激活与心跳），
+// 因此可以带 --retry-all-errors 消化 Cloudflare 瞬时重置；但心跳用短超时，
+// 避免定时器长时间阻塞事件循环。
+function freeaiPost(path, obj, timeoutSec, retries) {
+	let c = freeaiRaw();
+	let url = c.base + path;
+	let to = +timeoutSec || FRE_ACTIVATE_TIMEOUT;
+	let rt = +retries || 0;
+	let r = freeaiHttp('POST', url, {}, sprintf('%.J', obj), to, rt);
+	if (r === null) return null;
+	return r.body;
+}
+
+// 激活授权码，换取新鲜 token（机器码绑定）。成功时新 token 已落盘。
+// 失败会进入退避，避免打爆服务端 20 次/时/IP 的激活限制。
+function freeaiActivate() {
+	let c = freeaiRaw();
+	if (length(c.license) === 0)
+		return { ok: false, err: '未配置授权码' };
+	let now = time();
+	if (now < freActivateFailAt)
+		return { ok: false, err: '激活退避中' };
+	let j = freeaiPost('/activate.php', { code: c.license, machine: c.machine },
+		FRE_ACTIVATE_TIMEOUT, 2);
+	if (j === null) {
+		freActivateFailAt = now + FRE_ACTIVATE_BACKOFF;
+		return { ok: false, err: '激活请求失败（网络或超时）' };
+	}
+	if (j.ok !== true) {
+		let err = '' + (j.error || '激活失败');
+		freActivateFailAt = now + FRE_ACTIVATE_BACKOFF;
+		logErr('freeai activate failed: ' + err);
+		return { ok: false, err: err };
+	}
+	if (type(j.token) === 'string' && length(j.token) > 50) {
+		F.freeaiSaveToken(j.token);
+		freActivateFailAt = 0;
+		logInfo('freeai activated, new token saved');
+		return { ok: true };
+	}
+	freActivateFailAt = now + FRE_ACTIVATE_BACKOFF;
+	return { ok: false, err: '激活响应缺少有效 token' };
+}
+
+// 心跳续签：用当前 token 换一个更新的 token（服务端滑动窗口续签）。
+// 成功时若返回新 token 就落盘；失败累计 3 次（或服务端明确说过期/封禁）
+// 就清除本地 token，下次领会话包时走 freeaiActivate 自愈。
+// 请求体对齐官方网关：sess=当前是否有活跃会话（有则 1），lastChat=0。
+function freeaiHeartbeat() {
+	let c = freeaiRaw();
+	if (c.enabled !== true || length(c.token) === 0) return;
+	let j = freeaiPost('/heartbeat.php', {
+		token: c.token,
+		machine: c.machine,
+		v: c.ver,
+		sess: (freSession !== null) ? 1 : 0,
+		lastChat: 0,
+	}, FRE_HEARTBEAT_TIMEOUT, 0);
+	if (j === null) {
+		freHeartbeatFail++;
+		if (freHeartbeatFail >= 3) F.freeaiSaveToken('');
+		return;
+	}
+	if (j.ok !== true) {
+		freHeartbeatFail++;
+		let err = '' + (j.error || '');
+		if (freHeartbeatFail >= 3 || match(err, /过期|封禁|禁用|不存在|invalid/))
+			F.freeaiSaveToken('');
+		return;
+	}
+	freHeartbeatFail = 0;
+	if (type(j.token) === 'string' && length(j.token) > 50 && j.token !== c.token)
+		F.freeaiSaveToken(j.token);
+}
+
+// 心跳定时器回调：自重置，仅当 freeAI 启用且已有 token 时执行续签。
+function freHeartbeatTick() {
+	freHeartbeatTimer = uloop.timer(FRE_HEARTBEAT_MS * 1000, () => freHeartbeatTick());
+	let c = freeaiRaw();
+	if (c.enabled === true && length(c.token) > 0)
+		freeaiHeartbeat();
+}
+function freeaiRefreshPack(force) {
+	let c = freeaiRaw();
+	let now = time();
+	if (!force && freSession !== null && freSession.at + FRE_SESSION_TTL > now)
+		return { ok: true, pack: freSession.pack };
+	if (!force && freSessionFailAt + FRE_SESSION_BACKOFF > now)
+		return { ok: false, err: freSessionErr || '会话包拉取退避中' };
+	if (length(c.machine) === 0)
+		return { ok: false, err: 'freeAI 未配置机器码' };
+
+	// token 为空（首次部署或心跳判定失效后清除）→ 先激活换新 token 再领会话包。
+	// 不激活直接调 fp.php 只会得到 "token required"，自愈正则也救不回来。
+	if (length(c.token) === 0) {
+		if (force || freReauthing) {
+			freSessionFailAt = now;
+			freSessionErr = 'freeAI 未配置 token';
+			return { ok: false, err: freSessionErr };
+		}
+		freReauthing = true;
+		let ra = freeaiActivate();
+		freReauthing = false;
+		if (!ra.ok) {
+			freSessionFailAt = now;
+			freSessionErr = ra.err;
+			return { ok: false, err: freSessionErr };
+		}
+		// 激活成功已落盘新 token，继续走下面的正常领取流程。
+		c = freeaiRaw();
+	}
+
+	// 官方网关的会话 sid 是 oid()+oid().slice(0,8)（34 字符，gateway.mjs），
+	// 服务端按该形态登记底册；只发 26 字符 oid 也能过，但为完全对齐官方
+	// 请求签名（避免后台按长度识别非官方客户端），这里照抄 34 字符。
+	let sid = freeaiOid() + substr(freeaiOid(), 0, 8);
+	let q = 'machine=' + c.machine + '&sid=' + sid + '&cv=' + c.ver + '&act=session';
+	if (length(c.token) > 0) q += '&token=' + c.token;
+	let j = freeaiApi('/fp.php', q);
+	if (j === null) {
+		freSessionFailAt = now;
+		freSessionErr = '会话包请求失败（网络或超时）';
+		return { ok: false, err: freSessionErr };
+	}
+	if (j.ok !== true) {
+		let err = '' + (j.error || ('会话包被拒（' + (j.code || '未知') + '）'));
+		// token invalid / token required / must_upgrade(403 凭据被拒) / 服务端说过期、封禁
+		// → 静默重激活一次再重领。与官方网关的"用一下就断"自愈一致：
+		// 激活成功后重新领取，成功则本次请求无感通过。
+		if (!force && !freReauthing &&
+		    match(err, /token invalid|token required|must_upgrade|过期|封禁|禁用|不存在/)) {
+			freReauthing = true;
+			// 激活失败则保留原始错误（版本闸/服务端问题会由退避节流）
+			let ra = freeaiActivate();
+			if (ra.ok) {
+				let s2 = freeaiRefreshPack(true);
+				if (s2.ok) {
+					freReauthing = false;
+					return s2;
+				}
+				err = s2.err || err;
+			}
+			freReauthing = false;
+		}
+		freSessionFailAt = now;
+		freSessionErr = err;
+		return { ok: false, err: freSessionErr };
+	}
+	// refreshed_token 随会话包下发，就地替换本地 token（这是"用一下就断"的正解）
+	if (type(j.refreshed_token) === 'string' && length(j.refreshed_token) > 0 &&
+	    j.refreshed_token !== c.token)
+		F.freeaiSaveToken(j.refreshed_token);
+
+	let ttl = +j.ttl || 300;
+	if (ttl < FRE_SESSION_TTL_MIN) ttl = FRE_SESSION_TTL_MIN;
+	let pack = {
+		url: '' + (j.upstream_url || ''),
+		headers: (type(j.headers) === 'object' && j.headers !== null) ? j.headers : {},
+		fp: (type(j.fingerprint) === 'object' && j.fingerprint !== null) ? j.fingerprint : {},
+		wm: '' + (j.wm || ''),
+		sig: '' + (j.sig_block || ''),
+		ttl: ttl,
+		exp: (+j.exp || 0) * 1000,
+	};
+	if (length(pack.url) === 0) {
+		freSessionFailAt = now;
+		freSessionErr = '会话包缺少 upstream_url';
+		return { ok: false, err: freSessionErr };
+	}
+	freSession = { pack: pack, at: now, sid: sid };
+	freSessionFailAt = 0;
+	freSessionErr = '';
+	return { ok: true, pack: pack };
+}
+
+// 保存 token（滑动续签后调用）。写文件失败不影响本次请求。
+function freeaiSaveToken(tok) {
+	try {
+		let c = freeaiRaw();
+		writeJsonFile(FRE_CFG_FILE, {
+			enabled: c.enabled, license: c.license, machine: c.machine,
+			token: '' + tok, tokenAt: time(), model: c.model, base: c.base,
+			ver: c.ver, injectFingerprint: c.injectFingerprint,
+			brandNeutralize: c.brandNeutralize,
+		});
+		freCache = { at: 0, data: null };   // 让下次读取拿到新值
+	} catch (e) {
+		logErr('freeai save token failed: ' + e);
+	}
+}
+
+// 拉取免费模型列表。失败返回 []（不让一个挂掉的上游拖垮 /v1/models）。
+function freeaiModels() {
+	let j = freeaiApi('/models.php', 'act=list');
+	if (j === null || j.ok !== true) return [];
+	let dead = {};
+	if (type(j.dead) === 'array')
+		for (let d in j.dead) dead['' + d] = true;
+	let out = [];
+	if (type(j.models) === 'array') {
+		for (let m in j.models) {
+			let id = (type(m) === 'object' && m !== null) ? ('' + (m.id || '')) : ('' + m);
+			if (length(id) === 0) continue;
+			if (dead[id]) continue;
+			push(out, { id: id, name: id });
+		}
+	}
+	return out;
+}
+
+// ---------- freeAI：请求构造 ----------
+
+// 从第一条 user 消息内容派生会话头 `ses_<12hex><14base62>`。
+//
+// 为什么必须派生而不是随机：上游 opencode.ai 免费层的 WAF 校验会话头与对话
+// 内容的一致性（prompt-cache 亲和；agent2api 的 emulation.rs 同款实现：
+//   Sha256::digest(format!("ses\u0000{seed}"))，取前 6 字节转 12 位 hex，
+//   再取后续字节经 base62 编码成 14 字符）。
+// 实测：随机 26 字符 oid 会被判 FreeTierError（"can only be used from within
+// OpenCode"），而按首条 user 消息内容派生的会话头直接 200 并正常推流。
+// 种子缺失时退回随机 oid（格式仍合法，只是可能触发 FreeTierError）。
+function freeaiSessionId() {
+	let seed = '' + freSessionSeed;
+	if (length(seed) > 0) {
+		let hex = '0123456789abcdef';
+		let d = sha256Hex('ses\u0000' + seed);
+		// 前 6 字节 → 12 位小写 hex
+		let h12 = substr(d, 0, 12);
+		// 随后字节 → 14 个 Base62 字符（每字节高 6 位取一次索引）
+		let b62 = '';
+		for (let i = 0; i < 14; i++) {
+			let pair = substr(d, 12 + i * 2, 2);
+			let c0 = substr(pair, 0, 1), c1 = substr(pair, 1, 1);
+			let d0 = index(hex, c0), d1 = index(hex, c1);
+			if (d0 < 0) d0 = 0;
+			if (d1 < 0) d1 = 0;
+			let b = d0 * 16 + d1;
+			b62 += substr(FRE_OID_C62, (b % 62) + 1, 1);
+		}
+		return 'ses_' + h12 + b62;
+	}
+	return 'ses_' + freeaiOid();
+}
+
+// 组装 freeAI 请求头。
+//
+// 关键（实测）：Authorization 是字面串 `Bearer public`，不是真凭据；
+// 真正的门在 `x-freeai-session: <sig_block>` 上，缺它一律 403。
+function freeaiHeaders(pack) {
+	let out = {
+		'Authorization': 'Bearer public',
+		'User-Agent': FRE_UA,
+		'x-opencode-client': 'cli',
+		'x-opencode-project': 'prj_' + substr(sha256Hex(readRandom(16)), 0, 12),
+		// 官方网关每次请求都生成"请求/session 绑定头"（gateway.mjs）：
+		//   x-opencode-request: msg_<oid26>    x-opencode-session: ses_<oid26>
+		// 上游 WAF 按 26 字符 oid 形态校验，缺了会 400/403（我们此前实测 400）。
+		// 但会话头**不能随机**：必须由首条 user 消息内容派生（见 freeaiSessionId），
+		// 否则上游判 FreeTierError。x-opencode-request 保持每请求新鲜随机。
+		'x-opencode-request': 'msg_' + freeaiOid(),
+		'x-opencode-session': freeaiSessionId(),
+		// 上游同一会话值会同时检查这三个头（agent2api emulation.rs 同款）
+		'x-session-affinity': freeaiSessionId(),
+		'X-Session-Id': freeaiSessionId(),
+		'x-freeai-session': '' + (pack.sig || ''),
+	};
+	// 会话包下发的头优先（它可能带 opencode 版本相关的字段）
+	if (type(pack.headers) === 'object' && pack.headers !== null) {
+		for (let k in pack.headers) {
+			let v = pack.headers[k];
+			if (type(v) === 'string' || type(v) === 'int') out['' + k] = '' + v;
+		}
+	}
+	// 但 User-Agent 必须钉成本地 CLI 形态：会话包下发的 UA 是 ai-sdk 形态，
+	// 上游免费层会把它识别成"非 OpenCode 客户端"（实测 FreeTierError）。
+	out['User-Agent'] = FRE_UA;
+	return out;
+}
+
+// 把客户端请求体改造成"agent 形态"。
+//
+// 上游强制三项（agent2api 的 emulation.rs 与我们的实测互相印证）：
+//   stream:true + tools 同时含 bash 与 read 函数桩 + 26 字符 session 头
+// 本函数负责前两项（session 头在 freeaiHeaders）。
+//
+// 另外注入指纹：fp.system（10KB 的 opencode 系统提示）+ 12 个工具定义。
+// 指纹每次调用固定吃掉约 6.4K prompt tokens，可经 injectFingerprint=false 关闭
+// —— 关掉省 token，但如果上游开始按指纹校验就会 403（留作逃生阀）。
+function freeaiShape(body, pack) {
+	if (type(body) !== 'object' || body === null) return body;
+	body.stream = true;
+	// 官方网关的 upBody 恒带 stream_options.include_usage（gateway.mjs），
+	// 这样尾块会带 usage，我们才能按 Key 计量 token。
+	if (type(body.stream_options) !== 'object' || body.stream_options === null)
+		body.stream_options = {};
+	body.stream_options.include_usage = true;
+
+	// max_tokens 上限与官方网关一致（4000），不是指纹里的 32000。
+	// 给大了会踩上游的 tokens_req 限制，给小了截断，4000 是官方选定的值。
+	let mt = +body.max_tokens;
+	if (!(mt > 0) || mt > FRE_MAX_TOKENS) body.max_tokens = FRE_MAX_TOKENS;
+
+	// 工具集：官方网关直接用指纹下发的 12 个工具（fp.tools），完全忽略客户端
+	// 自带的 tools。注入指纹时照抄；关闭指纹时才退回 bash/read 桩兜底。
+	// 上游强制 tools 同时含 bash 与 read（agent2api emulation.rs 与实测一致）。
+	if (pack !== null && freeaiRaw().injectFingerprint &&
+	    type(pack.fp.tools) === 'array' && length(pack.fp.tools) > 0) {
+		body.tools = pack.fp.tools;
+	} else {
+		let hasBash = false, hasRead = false;
+		if (type(body.tools) === 'array') {
+			for (let t in body.tools) {
+				if (type(t) !== 'object' || t === null) continue;
+				let fn = t['function'];
+				if (type(fn) !== 'object' || fn === null) continue;
+				if (fn.name === 'bash') hasBash = true;
+				if (fn.name === 'read') hasRead = true;
+			}
+		} else {
+			body.tools = [];
+		}
+		// 桩工具：名称与参数形状照抄 emulation.rs，description 明写"不要调用"，
+		// 避免模型真的把占位工具当成可用能力。
+		if (!hasBash) push(body.tools, {
+			type: 'function',
+			'function': {
+				name: 'bash',
+				description: '(internal placeholder — do not call)',
+				parameters: { type: 'object', properties: { command: { type: 'string' } } },
+			},
+		});
+		if (!hasRead) push(body.tools, {
+			type: 'function',
+			'function': {
+				name: 'read',
+				description: '(internal placeholder — do not call)',
+				parameters: { type: 'object', properties: { filePath: { type: 'string' } } },
+			},
+		});
+	}
+	// tool_choice：官方恒用指纹的 tool_choice（实测是 "auto"）；客户端没指定时才
+	// 用指纹值，指定了则尊重客户端。指纹也没给且工具非空时退回 'none'。
+	if (body.tool_choice === null && pack !== null &&
+	    type(pack.fp.tool_choice) === 'string' && length(pack.fp.tool_choice) > 0)
+		body.tool_choice = pack.fp.tool_choice;
+	else if (body.tool_choice === null && length(body.tools) > 0)
+		body.tool_choice = 'none';
+
+	// 系统提示注入顺序（照抄官方网关的语义）：
+	//   指纹 system（最前，上游期望的开放编码 agent 提示）
+	//   + 品牌 system（强制模型自称 freeAI）
+	//   + 客户端自己的 messages
+	// 注入前必须先剥掉客户端可能自带的同角色消息，避免出现两条 system
+	// 让上游拒收。
+	let msgs = (type(body.messages) === 'array') ? body.messages : [];
+	let head = [];
+	if (pack !== null && freeaiRaw().injectFingerprint &&
+	    type(pack.fp.system) === 'string' && length(pack.fp.system) > 0)
+		push(head, { role: 'system', content: pack.fp.system });
+	if (freeaiRaw().brandNeutralize)
+		push(head, { role: 'system', content: FRE_BRAND_SYSTEM });
+
+	let out = head;
+	for (let m in msgs) {
+		// 客户端自带的 system 会被上面的注入取代，直接丢弃
+		if (type(m) === 'object' && m !== null && m.role === 'system') continue;
+		push(out, m);
+	}
+	if (length(out) === 0) push(out, { role: 'user', content: 'hi' });
+	body.messages = out;
+	// 记住首条 user 消息内容：freeaiSessionId() 要用它派生会话头
+	// （上游按内容一致性校验，见 freeaiSessionId 注释）。
+	freSessionSeed = '';
+	for (let m in out) {
+		if (type(m) === 'object' && m !== null && m.role === 'user' &&
+		    type(m.content) === 'string' && length(m.content) > 0) {
+			freSessionSeed = m.content;
+			break;
+		}
+	}
+	return body;
+}
+
+// 流式净化：把上游帧改写成本网关的对外形态。
+//
+// 官方网关的做法是"没有 id 的帧要么丢掉要么补 id"。这里更保守：
+// 只在**既没有 usage 也没有 choices** 时丢弃（那种帧通常是上游的噪声），
+// 其余补一个稳定的 id。不做内容改写 —— 上游说什么就转什么，
+// 让"代理看到的"与"上游发的"保持一致，出问题时才可归因。
+let freChunkSeq = 0;
+
+function freeaiPurifyChunk(chunk) {
+	let s = '' + chunk;
+	if (index(s, 'data: ') < 0) return s;
+	// 按行处理，保留换行与空行结构
+	let lines = [];
+	let cur = '';
+	let out = '';
+	for (let i = 0; i < length(s); i++) {
+		let ch = substr(s, i, 1);
+		if (ch === '\n') {
+			out += F.freeaiPurifyLine(cur) + '\n';
+			cur = '';
+		} else {
+			cur += ch;
+		}
+	}
+	// 末尾没有换行的半行原样带出（不补换行 —— 补了会伪造一个完整帧）
+	out += cur;
+	return out;
+}
+
+function freeaiPurifyLine(line) {
+	let raw = line;
+	if (length(raw) > 0 && substr(raw, length(raw) - 1, 1) === '\r')
+		raw = substr(raw, 0, length(raw) - 1);
+	if (substr(raw, 0, 6) !== 'data: ') return line;
+	let payload = substr(raw, 6);
+	if (payload === '[DONE]') return line;
+	let j = null;
+	try { j = json(payload); } catch (e) { return line; }
+	if (type(j) !== 'object' || j === null) return line;
+	// 上游把错误写在流里：品牌化后原样转出（HTTP 200 已发出，无法再改状态码）
+	if (type(j.error) === 'object' && j.error !== null) {
+		j.error = { message: F.freeaiBrandMessage('' + (j.error.message || '')), type: 'upstream_error' };
+		return 'data: ' + sprintf('%.J', j);
+	}
+	let hasUsage = (type(j.usage) === 'object' && j.usage !== null);
+	let hasChoices = (type(j.choices) === 'array' && length(j.choices) > 0);
+	if (!hasUsage && !hasChoices) return '';       // 纯噪声帧，丢弃
+	if (type(j.id) !== 'string' || length(j.id) === 0) {
+		freChunkSeq++;
+		j.id = 'chatcmpl-freeai-' + freChunkSeq + '-' + substr(sha256Hex('' + nowMs()), 0, 6);
+	}
+	return 'data: ' + sprintf('%.J', j);
+}
+
+// 把上游字样换成 freeAI 的对外说法。**对外绝不出现 opencode/上游字样**：
+// 用户看到"opencode"只会以为是配置错了。
+function freeaiBrandMessage(msg) {
+	let s = '' + msg;
+	if (length(s) === 0) return 'freeAI 服务暂时不可用，请稍后重试';
+	let l = lc(s);
+	if (index(l, 'rate limit') >= 0 || index(l, 'too many request') >= 0 ||
+	    index(l, '额度') >= 0 || index(l, 'quota') >= 0)
+		return 'freeAI 免费额度已用完：可在控制面板切换出口后重试，或稍后再试';
+	return 'freeAI 服务暂时不可用：' + s;
+}
+
+// ---------- 同步获取模型列表（用 curl，带超时；失败回退内置） ----------
 function fetchModelsSync(cfg, token) {
 	if (!token) return null;
 	let url = cfg.endpoint + '/v3/config';
@@ -4241,11 +5330,149 @@ function releaseAttempt(conn) {
 	bridgeRelease(conn);
 }
 
+// freeAI 的管理页状态。**授权码一律掩码**（同 key 的处理原则：
+// 管理页与日志里不该出现完整凭据）。
+function freeaiStatus() {
+	let c = freeaiRaw();
+	let lic = c.license;
+	let masked = '';
+	if (length(lic) > 0) {
+		// FA-UY7H-Y6FT-DUWT -> FA-UY****-DUWT
+		let parts = split(lic, '-');
+		if (length(parts) >= 4)
+			masked = parts[0] + '-' + substr(parts[1], 0, 2) + '****-' + parts[length(parts) - 1];
+		else
+			masked = maskKey(lic);
+	}
+	let now = time();
+	return {
+		enabled: c.enabled,
+		configured: (length(c.license) > 0),
+		usable: freeaiUsable(),
+		license: masked,
+		hasLicense: (length(c.license) > 0),
+		machine: c.machine,
+		hasToken: (length(c.token) > 0),
+		tokenAge: (c.tokenAt > 0) ? (now - c.tokenAt) : -1,
+		model: c.model,
+		base: c.base,
+		ver: c.ver,
+		injectFingerprint: c.injectFingerprint,
+		brandNeutralize: c.brandNeutralize,
+		prefix: FRE_PREFIX,
+		upstreamId: FRE_UPID,
+		session: (freSession === null) ? null : {
+			at: freSession.at,
+			ageSec: now - freSession.at,
+			ttl: freSession.pack.ttl,
+			url: freSession.pack.url,
+			wm: freSession.pack.wm,
+		},
+		lastError: freSessionErr,
+		// 用量口径与自定义上游一致，管理页可以直接复用同一套渲染
+		usage: metrics.usageByUp[FRE_UPID] || null,
+	};
+}
+
+// freeAI 专用的 curl 参数表。与通用表的四处根本差异：
+//
+//   1) **URL 来自会话包**，不是配置里的 baseUrl —— 上游地址由授权服务端每次下发
+//      （实测是 opencode.ai/zen/v1/chat/completions）。
+//   2) **鉴权头是字面 `Bearer public`**，真门在 x-freeai-session。
+//   3) **请求体要重写**：注入指纹 system + 品牌 system + 工具桩，并把 stream 钉成 true。
+//      重写结果写到 conn.tmpFile 之外的第二个文件，以免失败换 Key 时重复注入。
+//   4) **不接受 Accept: text/event-stream 之外的形态**：上游只支持流式。
+//
+// 会话包缺失时返回 null —— 调用方据此走"重领一次"路径，而不是发一个注定 403 的请求。
+function freeaiCurlArgs(conn, o) {
+	let r = freeaiRefreshPack(false);
+	if (!r.ok) {
+		conn.freeaiSessionErr = r.err;
+		return null;
+	}
+	let pack = r.pack;
+
+	// 请求体：读原始 body → 注入 → 写临时文件。
+	// 每次都重写（而不是缓存注入结果）是因为会话包会换、指纹可能变。
+	let bodyFile = conn.tmpFile;
+	if (conn.freeaiBodyFile !== pack.wm) {
+		let raw = null;
+		try {
+			let fs = require('fs');
+			if (fs.access(conn.tmpFile, 'f')) raw = fs.readfile(conn.tmpFile);
+		} catch (e) { raw = null; }
+		if (raw === null) return null;
+		let body = null;
+		try { body = json(raw); } catch (e) { body = null; }
+		if (type(body) !== 'object' || body === null) return null;
+		freeaiShape(body, pack);
+		bodyFile = conn.tmpFile + '.fre';
+		try {
+			writefile(bodyFile, sprintf('%.J', body));
+		} catch (e) {
+			logErr('freeai body write failed: ' + e);
+			return null;
+		}
+		conn.freeaiBodyFile = pack.wm;
+		conn.freeaiTmp = bodyFile;
+	}
+
+	let args = ['curl', '-sS', '-N', '-X', 'POST'];
+	// 不要 -4：授权服务端与聊天上游都是 Cloudflare 多 A 记录，
+	// -4 会放大 TLS 重置概率（实测不加 -4 时成功率 4/5，加 -4 更低）。
+	// 连接级错误（TLS 重置/连接被重置）在 curl 层重试 2 次 —— freeAI 的
+	// 请求体在文件里，重发是安全的；`--retry-all-errors` 只覆盖"尚未收到
+	// 任何响应数据"的连接失败，不会对已开始推流的响应做重复生成。
+	push(args, '--retry');
+	push(args, '2');
+	push(args, '--retry-all-errors');
+	push(args, '--retry-delay');
+	push(args, '1');
+	push(args, '--http2');
+	push(args, '--tcp-fastopen');
+	push(args, '--connect-timeout');
+	push(args, o.connectTimeout);
+	push(args, '--speed-limit');
+	push(args, '1');
+	push(args, '--speed-time');
+	push(args, o.speedTime);
+	push(args, '--max-time');
+	push(args, o.maxTime);
+	push(args, '--keepalive-time');
+	push(args, '30');
+
+	push(args, shquote('-H'));
+	push(args, shquote('Content-Type: application/json'));
+	push(args, shquote('-H'));
+	push(args, shquote('Accept: text/event-stream'));
+	let hdrs = freeaiHeaders(pack);
+	for (let k in hdrs) {
+		push(args, shquote('-H'));
+		push(args, shquote(k + ': ' + hdrs[k]));
+	}
+	push(args, shquote('-H'));
+	push(args, shquote('X-Request-Id: ' + (conn.reqId || '')));
+	if (conn.hdrFile) {
+		push(args, '-D');
+		push(args, shquote(conn.hdrFile));
+	}
+	push(args, shquote('--data-binary'));
+	push(args, shquote('@' + bodyFile));
+	push(args, shquote(pack.url));
+	return args;
+}
+
 // 组装转发用的 curl 参数（WorkBuddy 池通道与自定义上游通道共用）。
 // 差异项（超时档位/鉴权/Accept/UA/目标/默认路径）由 o 传入，避免两份几乎
 // 相同的参数表在演进中悄悄分叉。回环是明文 HTTP/1.1（--http2/--tcp-fastopen
 // 无意义），且连接超时要压到 POOL_CONNECT_TIMEOUT，好让池挂掉时尽快暴露并回退。
 function curlArgs(conn, o) {
+	// freeAI 走完全独立的参数表：目标 URL、鉴权头、伪装头、请求体都要改，
+	// 唯一保留的是超时档位。放在最前面短路，避免下面的通用表掺进
+	// `Authorization: Bearer __freeai__` 这类会直接被上游拒绝的头。
+	if (conn.upstream && conn.upstream.id === FRE_UPID)
+		return freeaiCurlArgs(conn, o);
+
 	let args = ['curl', '-sS', '-N', '-X', 'POST'];
 	if (conn.usedPool) {
 		push(args, '--connect-timeout');
@@ -4585,6 +5812,32 @@ function spawnUpstreamDirect(conn) {
 		target: up.baseUrl,
 		defaultPath: '/chat/completions',
 	});
+
+	// freeAI 的会话包缺失/过期时 curlArgs 返回 null。这时**不能**当成普通失败
+	// 去烧 Key 冷却 —— 会话是上游级的，重领一次才是正解。整条请求只重领一次
+	// （conn.freeaiReauthed），避免授权服务端被打爆。
+	if (args === null) {
+		if (up.id === FRE_UPID && !conn.freeaiReauthed) {
+			conn.freeaiReauthed = true;
+			releaseAttempt(conn);
+			let rr = freeaiRefreshPack(true);
+			if (rr.ok) {
+				conn.upTry--;          // 退回槽位，用同一把合成 Key 重发
+				F.spawnUpstreamDirect(conn);
+				return;
+			}
+			jsonResponse(conn, 502, {
+				error: {
+					message: 'freeAI 会话不可用：' + (rr.err || '未知错误') +
+						'（请在管理页 freeAI 设置中检查授权码与机器码）',
+					type: 'upstream_error',
+				},
+			});
+			return;
+		}
+		F.tryNextUpKey(conn, conn.freeaiSessionErr || 'freeai session unavailable');
+		return;
+	}
 	let cmdline = join(' ', args);
 
 	// 块处理：从（桥接 socket 或 popen 管道）读一块并转发（v1.8.3 回环桥）
@@ -5132,8 +6385,14 @@ function handleChat(conn, bodyRaw) {
 	// 自定义上游：不走凭据池，改用该上游自己的 Key 轮询
 	if (customUp !== null) {
 		let up = null;
-		let all = loadUpstreams();
-		for (let u in all) if (u.id === customUp) { up = u; break; }
+		// freeAI 是内置上游（v2.6.0），不占 upstreams.json —— 路由层已经按前缀
+		// 找到了它（adaptBody -> findUpstreamByPrefix），这里必须能接住它的 id。
+		if (customUp === FRE_UPID) {
+			up = freeaiUsable() ? freeaiUpstream() : null;
+		} else {
+			let all = loadUpstreams();
+			for (let u in all) if (u.id === customUp) { up = u; break; }
+		}
 		if (up === null) {
 			jsonResponse(conn, 404, { error: { message: 'upstream not found' } });
 			return;
@@ -5181,6 +6440,14 @@ F.upstreamLooksFailed = upstreamLooksFailed;
 // 文件很靠前的位置，只能走这张前向引用表。
 F.releaseGate = releaseGate;
 F.pumpQueue = pumpQueue;
+// freeAI（v2.6.0）：这些函数定义在调用点之后，必须走前向引用表。
+// 注意 freeaiModels/freeaiSaveToken/freeaiPurifyLine 等定义在管理页之前，
+// 所以这里赋值是安全的（都在本行之前已加载）。
+F.nowMs = nowMs;
+F.freeaiModels = freeaiModels;
+F.freeaiSaveToken = freeaiSaveToken;
+F.freeaiBrandMessage = freeaiBrandMessage;
+F.freeaiPurifyLine = freeaiPurifyLine;
 
 // ---------- v2.0：通用端点透传 ----------
 //
@@ -5210,7 +6477,13 @@ function routePassthrough(body, path) {
 				if (up === null)
 					return { error: 'unknown upstream prefix: ' + ref.prefix };
 				upstreamId = up.id;
-				body.model = ref.model;
+				// v2.7.0：模型映射。客户端写的是对外的名字（别名或真名），
+				// 这里翻译成上游认得的真名再转发。没有映射时原样透传，
+				// 保证"直接写上游裸模型名"的老用法继续可用。
+				let mapped = mapUpstreamModel(up, ref.model);
+				if (mapped !== ref.model)
+					logInfo(sprintf('model map: %s/%s -> %s', up.prefix, ref.model, mapped));
+				body.model = mapped;
 			}
 		}
 	}
@@ -5514,6 +6787,7 @@ function adminAppPage() {
     <button data-t="ups" onclick="tab('ups')">服务器管理</button>
     <button data-t="creds" onclick="tab('creds')">凭据池</button>
     <button data-t="relay" onclick="tab('relay')">中转日志</button>
+    <button data-t="free" onclick="tab('free')">freeAI</button>
     <button data-t="cfg" onclick="tab('cfg')">设置</button>
   </div>
 
@@ -5583,6 +6857,14 @@ function adminAppPage() {
         <label for="upKeys">API Key 密钥（每行一条，可批量粘贴）</label>
         <textarea id="upKeys" rows="5" placeholder="sk-xxxxxxxx&#10;sk-yyyyyyyy&#10;sk-zzzzzzzz"></textarea>
         <p class="hint">所有 Key 组成一个池子，请求时轮流使用，实现负载均衡。</p>
+      </div>
+
+      <div class="field">
+        <label for="upModels">模型映射（可选）</label>
+        <textarea id="upModels" rows="4" placeholder="每行一条：&#10;deepseek-v4-flash&#10;gpt-4o=glm-5.2&#10;# 井号开头是注释"></textarea>
+        <p class="hint"><code>别名=真名</code> 表示对外用别名、转发时换成真名；只写
+          <code>真名</code> 表示照原样暴露。<strong>留空则自动使用上游返回的模型列表。</strong>
+          填了以后 <code>/v1/models</code> 以这里为准，上游临时不可用也不会让列表变空。</p>
       </div>
 
       <button class="primary" onclick="addUpstreamUI()">添加服务器</button>
@@ -5661,6 +6943,61 @@ function adminAppPage() {
     </div>
   </div>
 
+  <div id="t-free" class="hide">
+    <div class="card">
+      <h2>freeAI 内置上游</h2>
+      <p class="desc">在 freeAI 平台激活过授权码后，本机可作为 freeAI 的免费模型网关。
+        模型以 <code>freeai/模型名</code> 形式出现在 <code>/v1/models</code>，例如
+        <code>freeai/big-pickle</code>。会话包由授权服务端下发，本机只做转发与净化。</p>
+
+      <div class="field">
+        <label for="freEnabled">
+          <span class="sw"><input type="checkbox" id="freEnabled"><span></span></span>
+          启用 freeAI 免费模型
+        </label>
+      </div>
+
+      <div class="field">
+        <label for="freLicense">授权码</label>
+        <div class="row">
+          <div style="flex:3"><input type="text" id="freLicense" placeholder="FA-XXXX-XXXX-XXXX" autocomplete="off"></div>
+          <div style="flex:2"><input type="text" id="freMachine" placeholder="机器码（可留空）"></div>
+        </div>
+        <p class="hint">授权码与机器码会写入 <code>/etc/workbuddy/freeai.json</code>。</p>
+      </div>
+
+      <div class="field">
+        <label for="freModel">默认模型</label>
+        <input type="text" id="freModel" placeholder="big-pickle" list="freModels">
+        <datalist id="freModels"></datalist>
+        <p class="hint">作为 <code>freeai/默认模型</code> 暴露；客户端不指定模型时使用。</p>
+      </div>
+
+      <div class="field">
+        <label class="row" style="align-items:center;gap:9px;cursor:pointer">
+          <span class="sw"><input type="checkbox" id="freFp"><span></span></span>
+          <span>注入平台指纹（system + 工具桩，官方网关同款）</span>
+        </label>
+        <p class="hint">上游校验会话形态，缺省请求可能被 403。默认开启。</p>
+      </div>
+
+      <div class="field">
+        <label class="row" style="align-items:center;gap:9px;cursor:pointer">
+          <span class="sw"><input type="checkbox" id="freBrand"><span></span></span>
+          <span>品牌中和（把系统提示换成 freeAI 官方文案）</span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div style="flex:0"><button class="primary" onclick="saveFree()">保存设置</button></div>
+        <div style="flex:0"><button onclick="testFree()">立即测试</button></div>
+        <div style="flex:0"><button class="danger" onclick="resetFree()">重置会话</button></div>
+      </div>
+      <div id="freStatus" style="margin-top:12px">加载中…</div>
+      <div id="freTest" style="margin-top:8px"></div>
+    </div>
+  </div>
+
   <div id="t-cfg" class="hide">
     <div class="card">
       <h2>服务设置</h2>
@@ -5687,7 +7024,22 @@ function adminAppPage() {
     </div>
 
     <div class="card">
-      <h2>公网访问</h2>
+      <h2>每日模型巡检</h2>
+      <p class="desc">每天定时拉取所有启用上游的最新模型列表，并逐个验证模型可用性。</p>
+      <div class="field">
+        <label class="row" style="align-items:center;gap:9px;cursor:pointer">
+          <span class="sw"><input type="checkbox" id="cModelRefresh"><span></span></span>
+          <span>启用每日模型巡检</span>
+        </label>
+        <p class="hint">关闭后仍可在「自定义服务器」点「测试全部模型」手动巡检。</p>
+      </div>
+      <div class="field">
+        <label for="cModelHour">每日刷新时间（小时）</label>
+        <input type="number" id="cModelHour" min="0" max="23" placeholder="1">
+        <p class="hint">到点后自动拉取最新模型并测试连通性，结果写入系统日志。默认凌晨 1 点。</p>
+      </div>
+      <button class="primary" onclick="saveCfg()">保存设置</button>
+    </div>
       <p class="desc">默认只允许局域网访问。打开后，外网可直连本服务。</p>
 
       <div class="field">
@@ -5753,7 +7105,7 @@ function api(path, body) {
 }
 
 function tab(name) {
-  var names = ['ov','keys','ups','creds','relay','cfg'];
+  var names = ['ov','keys','ups','creds','relay','free','cfg'];
   for (var i = 0; i < names.length; i++) {
     document.getElementById('t-' + names[i]).className = (names[i] === name) ? '' : 'hide';
   }
@@ -5773,7 +7125,7 @@ function load() {
   api('state').then(function(d) {
     S = d;
     document.getElementById('bVer').textContent = 'v' + d.version;
-    renderOv(d); renderModels(d); renderKeys(d); renderCreds(d); renderUpstreams(d); renderRelay(d); renderCfg(d); renderWan(d);
+    renderOv(d); renderModels(d); renderKeys(d); renderCreds(d); renderUpstreams(d); renderRelay(d); renderCfg(d); renderWan(d); renderFree(d);
 
     // 如果服务端还有一个登录流程在等授权（比如页面被刷新过），
     // 就恢复显示并接着轮询，不要让它变成"看不见的后台任务"。
@@ -5927,6 +7279,11 @@ function renderUpstreams(d) {
     // 前缀 + 地址：这两个是用户配置客户端时要抄的
     h += '<div class="uprow"><span class="lbl">模型前缀</span><code>' + esc(u.prefix) + '/</code></div>';
     h += '<div class="uprow"><span class="lbl">服务器</span><code>' + esc(u.baseUrl) + '</code></div>';
+    // v2.7.0：配了模型映射就显式标出来，否则用户看不出"为什么不外呼上游了"
+    if (u.modelCount > 0) {
+      h += '<div class="uprow"><span class="lbl">模型映射</span><span class="badge ok">' +
+           u.modelCount + ' 个（自定义清单）</span></div>';
+    }
 
     // Key 明细（掩码）+ v2.0 权重/用量 + v2.5.0 单 Key 管理入口
     if (u.keys && u.keys.length) {
@@ -5964,11 +7321,39 @@ function renderUpstreams(d) {
     h += '</div>';
   }
 
+  // v2.8.0：批量测试所有启用上游的每个模型是否真正可用
+  h += '<div class="uprow"><span class="lbl">批量操作</span><span style="white-space:nowrap">';
+  h += '<button onclick="testAllUp()">测试全部模型</button> ';
+  h += '<span id="upTestAllStatus" class="hint">对每个启用上游的模型发最小请求验证可用性</span>';
+  h += '</span></div>';
+
   h += '<p class="hint">客户端里模型名写成 <code>前缀/模型名</code>。' +
        '本机 WorkBuddy 的前缀固定为 <code>' + esc(wb) + '/</code>，' +
        '其余用各自服务器配置的前缀。</p>';
 
   box.innerHTML = h;
+}
+
+// v2.8.0：调用 /admin/api/upstreams/test-all，并把结果以提示框展示
+function testAllUp() {
+  var st = document.getElementById('upTestAllStatus');
+  if (st) st.textContent = '测试中，请稍候…';
+  api('upstreams/test-all', {}).then(function(r) {
+    if (!r) { if (st) st.textContent = '请求失败'; return; }
+    var lines = [];
+    for (var i = 0; i < r.results.length && i < 30; i++) {
+      var x = r.results[i];
+      lines.push((x.ok ? '✅ ' : '❌ ') + x.model + (x.ok ? '' : '  ' + (x.error || '')));
+    }
+    if (r.results.length > 30) lines.push('… 共 ' + r.results.length + ' 个');
+    var head = '共 ' + r.total + ' 个模型：' + r.okCount + ' 可用，' + r.failCount + ' 失败';
+    if (lines.length) alert(head + '\n\n' + lines.join('\n'));
+    else alert(head);
+    if (st) st.textContent = r.failCount === 0 ? '全部可用 ✅' : r.failCount + ' 个失败 ❌';
+    load();
+  }).catch(function(e) {
+    if (st) st.textContent = '请求异常';
+  });
 }
 
 // v2.5.0：编辑服务器信息（名称 / 前缀 / 地址）。
@@ -5987,6 +7372,14 @@ function editUpInfo(id) {
       '<input id="mUpPrefix" value="' + esc(u.prefix) + '" placeholder="如 sensenova"></label>' +
     '<label class="fld"><span>API 地址</span>' +
       '<input id="mUpUrl" value="' + esc(u.baseUrl) + '" placeholder="https://api.example.com/v1"></label>' +
+    // v2.7.0：模型映射（one-api / new-api 的「模型重定向」）。
+    // 留空 = 保持上游自己的模型列表；一旦填了，/v1/models 就只列这些名字。
+    '<label class="fld"><span>模型映射（可选）</span>' +
+      '<textarea id="mUpModels" rows="5" placeholder="每行一条：&#10;deepseek-v4-flash&#10;gpt-4o=glm-5.2&#10;# 井号开头是注释">' +
+      esc(u.modelsText || '') + '</textarea></label>' +
+    '<p class="hint"><code>别名=真名</code> 表示对外用别名、转发时换成真名；' +
+      '只写 <code>真名</code> 表示照原样暴露。<strong>留空则不做映射</strong>，' +
+      '名称直接取上游的模型列表。填了以后 <code>/v1/models</code> 以这里为准，也就不再外呼上游。</p>' +
     '<p class="hint">改前缀会让客户端里已写好的 <code>旧前缀/模型</code> 立刻失效，' +
       '记得同步改客户端配置。</p>' +
     '<div class="modal-foot">' +
@@ -5999,8 +7392,13 @@ function saveUpInfo(id) {
   var name = document.getElementById('mUpName').value;
   var prefix = document.getElementById('mUpPrefix').value;
   var url = document.getElementById('mUpUrl').value;
+  var modelsEl = document.getElementById('mUpModels');
+  var models = modelsEl ? modelsEl.value : null;
   if (!prefix || !url) { alert('前缀和 API 地址是必填的'); return; }
-  api('upstreams/edit', { id: id, name: name, prefix: prefix, baseUrl: url }).then(function (r) {
+  var payload = { id: id, name: name, prefix: prefix, baseUrl: url };
+  // 有映射框就一定带上（空串 = 清空映射），避免"清空后保存不生效"。
+  if (models !== null) payload.models = models;
+  api('upstreams/edit', payload).then(function (r) {
     if (r && r.ok) {
       closeModal();
       alert('已保存 ✅' + (r.prefixChanged
@@ -6147,20 +7545,25 @@ function addUpstreamUI() {
   var prefix = document.getElementById('upPrefix').value;
   var url = document.getElementById('upUrl').value;
   var keys = document.getElementById('upKeys').value;
+  var modelsEl = document.getElementById('upModels');
+  var models = modelsEl ? modelsEl.value : null;
 
   if (!prefix || !url || !keys) {
     alert('前缀、API 地址、Key 都是必填的');
     return;
   }
 
-  api('upstreams/add', {
+  var req = {
     name: name, prefix: prefix, baseUrl: url, keys: keys,
-  }).then(function (r) {
+  };
+  if (models !== null) req.models = models;
+  api('upstreams/add', req).then(function (r) {
     if (r && r.ok) {
       document.getElementById('upName').value = '';
       document.getElementById('upPrefix').value = '';
       document.getElementById('upUrl').value = '';
       document.getElementById('upKeys').value = '';
+      if (modelsEl) modelsEl.value = '';
       alert('已添加 ✅\\n模型名前缀：' + r.prefix + '/');
     } else {
       alert('添加失败：' + ((r && r.error) || '未知错误'));
@@ -6549,6 +7952,11 @@ function renderCfg(d) {
   document.getElementById('cAutoVer').checked = !!d.autoVersion;
   document.getElementById('cVer').value = d.clientVersion || '';
   document.getElementById('verWrap').className = d.autoVersion ? 'field hide' : 'field';
+  // v2.8.0：每日模型巡检
+  var cr = document.getElementById('cModelRefresh');
+  if (cr) cr.checked = !!d.modelRefreshEnabled;
+  var ch = document.getElementById('cModelHour');
+  if (ch) ch.value = (d.modelRefreshHour != null) ? d.modelRefreshHour : 1;
 }
 
 document.getElementById('cAutoVer').addEventListener('change', function() {
@@ -6596,10 +8004,16 @@ function delKey(id, name) {
 }
 
 function saveCfg() {
+  var hourEl = document.getElementById('cModelHour');
+  var hour = hourEl ? parseInt(hourEl.value, 10) : 1;
+  if (isNaN(hour) || hour < 0 || hour > 23) { alert('每日刷新时间必须是 0-23 的整数'); return; }
   var body = {
     only_free_models: document.getElementById('cFree').checked ? '1' : '0',
     auto_client_version: document.getElementById('cAutoVer').checked ? '1' : '0',
-    client_version: document.getElementById('cVer').value.trim()
+    client_version: document.getElementById('cVer').value.trim(),
+    // v2.8.0：每日模型巡检
+    model_refresh_enabled: (document.getElementById('cModelRefresh') && document.getElementById('cModelRefresh').checked) ? '1' : '0',
+    model_refresh_hour: String(hour)
   };
   api('config/save', body).then(function(r) {
     if (r.ok) { toast('设置已保存', 'ok'); load(); }
@@ -6673,6 +8087,103 @@ function renderWan(d) {
 function logout() {
   if (!confirm('确定退出登录？')) return;
   location.href = '/admin/logout';
+}
+
+// freeAI 设置卡渲染与操作（v2.6.0）
+function renderFree(d) {
+  var f = d.freeai || {};
+  var lic = document.getElementById('freLicense');
+  var mac = document.getElementById('freMachine');
+  var mdl = document.getElementById('freModel');
+  var fp = document.getElementById('freFp');
+  var br = document.getElementById('freBrand');
+  var en = document.getElementById('freEnabled');
+  if (!lic) return;
+  lic.value = f.license || '';
+  mac.value = f.machine || '';
+  if (mdl) mdl.value = f.model || '';
+  if (fp) fp.checked = !!f.injectFingerprint;
+  if (br) br.checked = !!f.brandNeutralize;
+  if (en) en.checked = !!f.enabled;
+
+  // 填充模型候选（来自 /v1/models 里的 freeai/ 条目）
+  var dl = document.getElementById('freModels');
+  if (dl) {
+    var opts = '';
+    var seen = {};
+    var list = (d && d.models) || [];
+    for (var i = 0; i < list.length; i++) {
+      var id = list[i].id || '';
+      if (id.indexOf('freeai/') !== 0) continue;
+      var name = id.slice(7);
+      if (seen[name]) continue;
+      seen[name] = 1;
+      opts += '<option value="' + esc(name) + '"></option>';
+    }
+    dl.innerHTML = opts;
+  }
+
+  var st = document.getElementById('freStatus');
+  var h = '';
+  function kv(k, v) { h += '<div class="kv"><span class="k">' + k + '</span><span>' + v + '</span></div>'; }
+  if (!f.configured) {
+    kv('配置', '<span class="badge err">未配置授权码</span>');
+  } else {
+    kv('授权码', '<code>' + esc(f.license) + '</code>');
+    kv('机器码', f.machine ? '<code>' + esc(f.machine) + '</code>' : '<span class="badge warn">未填</span>');
+    kv('token', f.hasToken ? '已写入' : '<span class="badge warn">缺失</span>');
+    kv('可用', f.usable ? '<span class="badge ok">是</span>' : '<span class="badge err">否</span>');
+  }
+  if (f.model) kv('默认模型', '<code>' + esc(f.model) + '</code>');
+  kv('会话', f.session ? ('已领取，' + f.session.ageSec + 's / ttl ' + f.session.ttl + 's') : '<span class="badge warn">未领取</span>');
+  if (f.lastError) kv('最近错误', '<span class="badge err">' + esc(f.lastError) + '</span>');
+  if (f.usage) {
+    kv('用量', 'ok ' + (f.usage.ok || 0) + ' / fail ' + (f.usage.fail || 0) +
+      ' / tokens ' + ((f.usage.tokens && f.usage.tokens.total) || 0));
+  }
+  st.innerHTML = h;
+}
+
+function saveFree() {
+  var body = {
+    license: document.getElementById('freLicense').value.trim(),
+    machine: document.getElementById('freMachine').value.trim(),
+    model: document.getElementById('freModel').value.trim(),
+    enabled: document.getElementById('freEnabled').checked,
+    injectFingerprint: document.getElementById('freFp').checked,
+    brandNeutralize: document.getElementById('freBrand').checked,
+  };
+  api('freeai/save', body).then(function(r) {
+    if (r.ok) { toast('freeAI 设置已保存', 'ok'); renderFree({ freeai: r.freeai, models: S.models }); }
+    else toast('保存失败：' + (r.error || '未知错误'), 'err');
+  }).catch(function(e) { toast('保存失败：' + e.message, 'err'); });
+}
+
+function testFree() {
+  var box = document.getElementById('freTest');
+  box.innerHTML = '<span class="badge warn">测试中…（约 10 秒）</span>';
+  api('freeai/test', {}).then(function(r) {
+    var h = '';
+    h += '<div class="kv"><span class="k">会话包</span><span>' +
+      (r.session ? 'OK ' + (r.session.url || '') : '<span class="badge err">失败</span>') + '</span></div>';
+    h += '<div class="kv"><span class="k">模型列表</span><span>' +
+      (r.models ? (r.models.count + ' 个，如 ' + esc(r.models.sample || '')) : '<span class="badge err">失败</span>') + '</span></div>';
+    h += '<div class="kv"><span class="k">实测对话</span><span>' +
+      (r.chat ? (r.chat.ok ? ('OK：' + esc(r.chat.text || '')) : ('<span class="badge err">' + esc(r.chat.error || '失败') + '</span>'))
+             : '<span class="badge warn">未执行</span>') + '</span></div>';
+    if (r.error) h += '<div class="kv"><span class="k">错误</span><span class="badge err">' + esc(r.error) + '</span></div>';
+    box.innerHTML = h;
+  }).catch(function(e) {
+    box.innerHTML = '<span class="badge err">测试请求失败：' + esc(e.message) + '</span>';
+  });
+}
+
+function resetFree() {
+  if (!confirm('重置 freeAI 会话缓存？授权码与机器码不会变。')) return;
+  api('freeai/reset', {}).then(function(r) {
+    if (r.ok) { toast('已重置会话缓存', 'ok'); load(); }
+    else toast('重置失败', 'err');
+  }).catch(function(e) { toast('重置失败：' + e.message, 'err'); });
 }
 
 load();
@@ -6910,6 +8421,9 @@ function handleAdmin(conn, req, method, path, query, body) {
 			models: models,
 			onlyFreeModels: cfg.onlyFree,
 			autoVersion: cfg.autoVersion,
+			// v2.8.0：每日模型巡检（管理页「服务设置」卡片回显）
+			modelRefreshEnabled: cfg.modelRefreshEnabled,
+			modelRefreshHour: cfg.modelRefreshHour,
 			wanAccess: cfg.wanAccess,
 			wanPort: cfg.wanPort,
 			wan: wanAccessStatus(cfg),
@@ -6923,7 +8437,119 @@ function handleAdmin(conn, req, method, path, query, body) {
 			// 中转日志（v2.2.0）。管理页的「中转日志」页签全靠这一块，
 			// 少了它前端只会显示"本版本未提供中转日志"。
 			relay: relaySnapshot(time() - metrics.since),
+			// freeAI（v2.6.0）：独立设置项，不混进 upstreams 列表 ——
+			// 它的配置形态（授权码 + 机器码 + 会话）与"地址 + 一串 Key"完全不同，
+			// 混排会让编辑表单必须长出两套字段。
+			freeai: freeaiStatus(),
 		});
+		return;
+	}
+
+	// ---- freeAI 内置上游（v2.6.0） ----
+
+	if (path === '/admin/api/freeai/save' && method === 'POST') {
+		let j = parseJsonBody(body);
+		let cur = freeaiRaw();
+		// 注意：ucode 没有 undefined 标识符，JSON 缺字段访问得到 null。
+		let lic = (j.license === null) ? cur.license : ('' + j.license).trim;
+		let mac = (j.machine === null) ? cur.machine : ('' + j.machine).trim;
+		let tok = (j.token === null) ? cur.token : ('' + j.token).trim;
+		writeJsonFile(FRE_CFG_FILE, {
+			enabled: (j.enabled === null) ? cur.enabled : truthy(j.enabled),
+			license: lic, machine: mac, token: tok,
+			tokenAt: cur.tokenAt, model: (j.model === null) ? cur.model : ('' + j.model),
+			base: cur.base, ver: cur.ver,
+			injectFingerprint: (j.injectFingerprint === null) ? cur.injectFingerprint : truthy(j.injectFingerprint),
+			brandNeutralize: (j.brandNeutralize === null) ? cur.brandNeutralize : truthy(j.brandNeutralize),
+		});
+		freCache = { at: 0, cfg: null };
+		freSession = null;              // 配置变了，旧会话作废
+		logInfo('admin saved freeai config (enabled=' + freeaiRaw().enabled + ')');
+		jsonResponse(conn, 200, { ok: true, freeai: freeaiStatus() });
+		return;
+	}
+
+	if (path === '/admin/api/freeai/test' && method === 'POST') {
+		// 三步探活：领会话包 → 拉模型列表 → 实打一次最小 chat。
+		// 分开报是因为它们的失败原因完全不同（机器码错 / 授权过期 / 额度用尽），
+		// 合一个"失败"会让用户无从下手。
+		let out = { ok: false, session: null, models: null, chat: null, license: freeaiRaw().license };
+		let r = freeaiRefreshPack(true);
+		if (!r.ok) {
+			out.error = r.err || '会话包领取失败';
+			jsonResponse(conn, 200, out);
+			return;
+		}
+		out.session = { ok: true, url: r.pack.url, wm: r.pack.wm, ttl: r.pack.ttl };
+		let ms = freeaiModels();
+		out.models = { ok: length(ms) > 0, count: length(ms), sample: length(ms) > 0 ? ms[0].id : '' };
+		// 实打一次：用当前配置的模型（没有就取列表第一个）
+		let mdl = freeaiRaw().model;
+		if (length(mdl) === 0 && length(ms) > 0) mdl = ms[0].id;
+		if (length(mdl) > 0) {
+			let body = freeaiShape({
+				model: mdl,
+				messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+				stream: true, max_tokens: 32,
+			}, r.pack);
+			let file = sprintf('/tmp/wb-fretest-%d.json', time());
+			writefile(file, sprintf('%.J', body));
+			let hdrs = freeaiHeaders(r.pack);
+			let args = ['curl', '-sS', '-N', '-m', '40', '-X', 'POST',
+				'--retry', '2', '--retry-all-errors', '--retry-delay', '1',
+				'-H', shquote('Content-Type: application/json')];
+			for (let k in hdrs) { push(args, shquote('-H')); push(args, shquote(k + ': ' + hdrs[k])); }
+			push(args, shquote('--data-binary'));
+			push(args, shquote('@' + file));
+			push(args, shquote(r.pack.url));
+			let raw = runCurlStr(join(' ', args));
+			try { let fs = require('fs'); fs.unlink(file); } catch (e) { }
+			if (raw === null) {
+				out.chat = { ok: false, error: '请求无响应' };
+			} else {
+				let txt = '';
+				let done = (index(raw, '[DONE]') >= 0);
+				// 从 SSE 里抠正文（与探针脚本同一套朴素做法）
+				let lines = split(raw, '\n');
+				for (let ln in lines) {
+					let s = trim('' + ln);
+					if (substr(s, 0, 6) !== 'data: ') continue;
+					let p = substr(s, 6);
+					if (p === '[DONE]') break;
+					let j2 = null;
+					try { j2 = json(p); } catch (e) { continue; }
+					if (type(j2) !== 'object' || j2 === null) continue;
+					if (type(j2.error) === 'object' && j2.error !== null) {
+						out.chat = { ok: false, error: '' + (j2.error.message || 'upstream error') };
+						break;
+					}
+					if (type(j2.choices) === 'array' && length(j2.choices) > 0) {
+						let d = j2.choices[0].delta;
+						if (type(d) === 'object' && d !== null && type(d.content) === 'string')
+							txt += d.content;
+					}
+				}
+				if (out.chat === null) out.chat = {
+					ok: done, model: mdl, done: done,
+					text: substr(txt, 0, 120),
+					bytes: length(raw),
+				};
+			}
+		} else {
+			out.chat = { ok: false, error: '没有可用模型' };
+		}
+		out.ok = (out.session && out.session.ok && out.models && out.models.count > 0 &&
+			out.chat && out.chat.ok);
+		jsonResponse(conn, 200, out);
+		return;
+	}
+
+	if (path === '/admin/api/freeai/reset' && method === 'POST') {
+		// 只清本地会话缓存，不碰 ipcfg / 授权码 —— 用途是"换了机器码后强制重领"。
+		freSession = null;
+		freSessionFailAt = 0;
+		freSessionErr = '';
+		jsonResponse(conn, 200, { ok: true });
 		return;
 	}
 
@@ -7102,7 +8728,8 @@ function handleAdmin(conn, req, method, path, query, body) {
 			'' + (j.name || ''),
 			'' + (j.prefix || ''),
 			'' + (j.baseUrl || ''),
-			'' + (j.keys || '')
+			'' + (j.keys || ''),
+			('models' in j) ? ('' + (j.models || '')) : null
 		);
 		if (!r.ok) {
 			jsonResponse(conn, 400, { ok: false, error: r.error });
@@ -7149,6 +8776,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 	}
 
 	// v2.5.0：编辑服务器信息（名称/前缀/地址/启停），Key 保持不变。
+	// v2.7.0：追加 models（模型映射文本；null=本次不改，''=清空）。
 	if (path === '/admin/api/upstreams/edit' && method === 'POST') {
 		let j = parseJsonBody(body);
 		let r = editUpstream(
@@ -7156,17 +8784,20 @@ function handleAdmin(conn, req, method, path, query, body) {
 			'' + (j.name || ''),
 			'' + (j.prefix || ''),
 			'' + (j.baseUrl || ''),
-			('enabled' in j) ? truthy(j.enabled) : null
+			('enabled' in j) ? truthy(j.enabled) : null,
+			('models' in j) ? ('' + (j.models || '')) : null
 		);
 		if (!r.ok) {
 			jsonResponse(conn, 400, { ok: false, error: r.error });
 			return;
 		}
-		logInfo('admin edited upstream ' + r.id + ' prefix ' + r.oldPrefix + ' -> ' + r.prefix + who);
+		logInfo('admin edited upstream ' + r.id + ' prefix ' + r.oldPrefix + ' -> ' + r.prefix +
+			' models ' + r.modelCount + who);
 		jsonResponse(conn, 200, {
 			ok: true, id: r.id, name: r.name,
 			prefix: r.prefix, oldPrefix: r.oldPrefix,
 			prefixChanged: r.prefixChanged,
+			modelCount: r.modelCount,
 		});
 		return;
 	}
@@ -7218,6 +8849,20 @@ function handleAdmin(conn, req, method, path, query, body) {
 		return;
 	}
 
+	// v2.8.0：测试全部启用上游的每个模型是否真正可用（发最小 chat 请求）
+	if (path === '/admin/api/upstreams/test-all' && method === 'POST') {
+		let t = testAllUpstreamModels();
+		logInfo('admin ran test-all: ' + t.okCount + '/' + t.total + ' ok, ' + t.failCount + ' failed' + who);
+		jsonResponse(conn, 200, {
+			ok: t.ok,
+			total: t.total,
+			okCount: t.okCount,
+			failCount: t.failCount,
+			results: t.results,
+		});
+		return;
+	}
+
 	if (path === '/admin/api/config/save' && method === 'POST') {
 		let j = parseJsonBody(body);
 		let ctx = uci.cursor();
@@ -7239,6 +8884,22 @@ function handleAdmin(conn, req, method, path, query, body) {
 		if (type(j.client_version) === 'string' && length(trim(j.client_version)) > 0) {
 			ctx.set('workbuddy', 'main', 'client_version', trim(j.client_version));
 			push(changed, 'client_version');
+		}
+
+		// v2.8.0：每日模型巡检开关与小时（0-23）
+		if ('model_refresh_enabled' in j) {
+			ctx.set('workbuddy', 'main', 'model_refresh_enabled',
+				truthy(j.model_refresh_enabled) ? '1' : '0');
+			push(changed, 'model_refresh_enabled');
+		}
+		if ('model_refresh_hour' in j) {
+			let mh = +j.model_refresh_hour;
+			if (!(mh >= 0 && mh <= 23) || mh !== int(mh)) {
+				jsonResponse(conn, 200, { ok: false, error: '每日刷新时间必须是 0-23 之间的整数' });
+				return;
+			}
+			ctx.set('workbuddy', 'main', 'model_refresh_hour', '' + mh);
+			push(changed, 'model_refresh_hour');
 		}
 
 		// 公网访问开关 + 外部端口。先写配置再落地防火墙规则，这样即使规则失败，
@@ -7540,6 +9201,8 @@ function dispatch(conn, head, body) {
 			upstreams: length(ups),
 			upstreamsEnabled: upEnabled,
 			upstreamKeys: upKeys,
+			modelRefreshEnabled: cfg.modelRefreshEnabled,
+			modelRefreshHour: cfg.modelRefreshHour,
 			version: APP_VERSION,
 		});
 		return;
@@ -7581,6 +9244,21 @@ function dispatch(conn, head, body) {
 		let ups = loadUpstreams();
 		for (let u in ups) {
 			if (!u.enabled) continue;
+			// v2.7.0：管理员显式配了模型清单时，以它为准，**不外呼上游**。
+			// 这样上游挂掉/限流也不会让 /v1/models 变空，也省掉一次 1.66s 的外呼；
+			// 清单里出现的是对外的名字（别名），映射在 adaptBody 里做。
+			if (type(u.modelList) === 'array' && length(u.modelList) > 0) {
+				for (let mid in u.modelList) {
+					push(data, {
+						id: u.prefix + '/' + mid,
+						name: mid + ' · ' + u.name,
+						object: 'model',
+						provider: u.prefix,
+						base_url: u.baseUrl,
+					});
+				}
+				continue;
+			}
 			let ck = u.prefix + '|' + u.baseUrl + '|' + length(u.keys);
 			let ce = upModelCache[ck];
 			let remote;
@@ -7589,7 +9267,14 @@ function dispatch(conn, head, body) {
 			} else {
 				remote = fetchUpstreamModels(u);
 				// 只在成功时写缓存：上游临时限流返回空列表时，别把它缓存 5 分钟
-				if (length(remote) > 0) upModelCache[ck] = { at: time(), list: remote };
+				if (length(remote) > 0) {
+					upModelCache[ck] = { at: time(), list: remote };
+					saveModelCache();
+				} else if (ce && type(ce.list) === 'array' && length(ce.list) > 0) {
+					// v2.8.0：上游暂时拉不到模型（限流/抖动），用最后已知列表兜底，
+					// 避免上游抖动时 /v1/models 突然变空、客户端以为自己配错了。
+					remote = ce.list;
+				}
 			}
 			for (let m in remote) {
 				push(data, {
@@ -7598,6 +9283,30 @@ function dispatch(conn, head, body) {
 					object: 'model',
 					provider: u.prefix,
 					base_url: u.baseUrl,
+				});
+			}
+		}
+
+		// freeAI 内置上游（v2.6.0）：不占 upstreams.json，独立呈现。
+		// 它有自己独立的模型清单缓存（freModelCache），不走 upModelCache，
+		// 因为 freeAI 的「上游」在路由层是动态合成的，没有持久化的 cacheKey。
+		if (freeaiUsable()) {
+			let freCfg = freeaiRaw();
+			let fr = freModelCache.list;
+			if (forceRefresh || !freModelCache.at || (time() - freModelCache.at) >= UP_MODEL_TTL) {
+				let got = freeaiModels();
+				if (length(got) > 0) {
+					freModelCache = { at: time(), list: got };
+					fr = got;
+				}
+			}
+			for (let m in fr) {
+				push(data, {
+					id: FRE_PREFIX + '/' + m.id,
+					name: m.id + ' · freeAI',
+					object: 'model',
+					provider: FRE_PREFIX,
+					base_url: freCfg.base,
 				});
 			}
 		}
@@ -7894,6 +9603,15 @@ function main() {
 	// 启动排队超时扫描（同样自重置，句柄必须持有，否则定时器会被回收）
 	queueTimer = uloop.timer(UP_QUEUE_TICK_MS, () => queueTick());
 
+	// freeAI 心跳续签：每 60s 滑动刷新 token，避免闲置后 token 过期触发重激活
+	// （重激活受 20 次/时/IP 限制，能靠心跳续签就别走激活）。
+	freHeartbeatTimer = uloop.timer(FRE_HEARTBEAT_MS * 1000, () => freHeartbeatTick());
+
+	// v2.8.0：载入「最后已知可用」模型列表（上游抖动时 /v1/models 的兜底），
+	// 并启动每日模型巡检定时器（默认凌晨 1 点拉取最新模型 + 全模型连通性测试）。
+	loadModelCache();
+	modelRefreshTimer = uloop.timer(MODEL_REFRESH_CHECK_MS, () => modelRefreshTick());
+
 	logInfo(sprintf('forward tuning: idle=%ds/%ds first_byte=%ds rate_cool=%ds/%ds model_ttl=%ds backlog=128',
 		cfg.upIdleSec, cfg.wbIdleSec, cfg.upFirstByteSec, UP_RATE_COOL, UP_RATE_COOL_MAX, UP_MODEL_TTL));
 	// 上限为 0 是"不限流"而不是"闸门值 0"，日志里必须一眼看出这个区别
@@ -7909,6 +9627,11 @@ function main() {
 	logInfo(sprintf('rate-limit brake: %s (hits=%d/%ds -> brake %ds, retry_after max %ds)',
 		cfg.brakeHits > 0 ? 'on' : 'off',
 		cfg.brakeHits, cfg.brakeWindow, cfg.brakeSec, cfg.brakeMaxRa));
+
+	// v2.8.0：模型巡检排期。关闭时同样要打出来，便于事后区分"没跑"与"被关了"。
+	logInfo(sprintf('model refresh: %s (daily %02d:00, test timeout %ds, max %d models/upstream)',
+		cfg.modelRefreshEnabled ? 'on' : 'off',
+		cfg.modelRefreshHour, MODEL_TEST_TIMEOUT, MODEL_TEST_MAX_PER_UP));
 
 	uloop.run();
 	uloop.done();

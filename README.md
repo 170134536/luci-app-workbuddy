@@ -579,6 +579,123 @@ api('POST', '/admin/api/upstreams/test', {id})   // 错误：path='POST'，body=
 | 管理页 UI | 编辑服务器模态框、Key 管理模态框、Key 池徽章交互均正常（浏览器实测） |
 | 长流连通性 | 8 路并发长流式输出无队列拒绝（`up_max_inflight=8`）、4 个 Key 全部有 usage 消耗 |
 
+### 模型可用性测试与每日刷新（v2.8.0）
+
+用户的原始诉求是：「优化测试确保所有模型正常可用，有时候模型会变更所有每天
+凌晨1点定时获取最新的模型。」
+
+#### ① 模型可用性测试：拉列表 ≠ 能用
+
+v2.5.0 的「测试」按钮只做了一件事——用 Key 拉一次上游 `/models`。这只证明
+**鉴权过了**，不证明**模型能推理**：一个模型可以被上游下架、可以只对特定账号
+开放、可以被限流到每次都超时，而 `/models` 依旧把它列出来。用户于是会遇到
+"列表里有、一调用就报错"。
+
+v2.8.0 增加真正走推理路径的测试：
+
+| 函数 | 行为 |
+| --- | --- |
+| `testUpstreamModel(up, modelName)` @3431 | 直连 `POST {baseUrl}/chat/completions`，body `{model, messages:[{role:'user',content:'ping'}], max_tokens:1, stream:false}`，`curl -sS -m 20`。**能过鉴权 + 能完成一次推理**才算可用 |
+| `testAllUpstreamModels()` @3487 | 遍历所有启用上游的每个模型；模型来源优先级 = 自定义清单 > 最后已知列表 > 现场拉取；去重 + 每上游上限 20 个；跳过 freeAI（它有独立的 `/freeai/test`） |
+
+端点 `POST /admin/api/upstreams/test-all`，管理页「服务器管理」页签的「批量操作」
+行新增 **「测试全部模型」** 按钮，结果以 ✅/❌ 清单弹窗展示，失败项附上游原始
+错误文本。
+
+请求体经 `mapUpstreamModel()` 翻译——**测试走的是与真实转发完全相同的映射
+路径**，所以测 `gpt-4o` 实际打的是 `glm-5.2`，别名配错会在这里直接暴露。
+
+> **为什么直连上游，而不是复用本机的 `handleChat`？**
+> 走代理会占用并发闸门（`up_max_inflight`）和排队槽位。一次「测试全部」在模型
+> 多的上游上可能把在途额度吃光，把真实用户请求挤进排队——**用一个诊断功能去
+> 影响它本要诊断的生产链路**，是自相矛盾的。测试请求本身极小（`max_tokens:1`），
+> 直连最省事也最不打扰。
+
+#### ② 每天凌晨 1 点自动拉取最新模型
+
+模型会变（上游上架、下架、改名），配置一次就永远正确的假设不成立。v2.8.0 增加
+每日巡检定时器：
+
+```
+modelRefreshTick() @3552  ──每 60s 自重排──▶  localtime().hour === modelRefreshHour ?
+                                              └─ 是且今天没跑过 ──▶ 强制刷新模型列表
+                                                                   └─▶ 跑全模型连通性测试
+```
+
+关键实现细节：
+
+| 点 | 做法 | 理由 |
+| --- | --- | --- |
+| 自重排位置 | **在业务逻辑之前**先 `uloop.timer(MODEL_REFRESH_CHECK_MS, ...)` | 无论本次是否到点都要排下一次；放在 `return` 之后就再也不会被调度 |
+| 当日去重 | `modelRefreshLastDay === today`（`today` = `year*10000+(mon+1)*100+day`） | 定时器 60s 一跳，没有去重的话整点那一小时内会跑 60 次 |
+| 时钟口径 | `localtime(time())` | 用路由器本地时间，用户说的"凌晨 1 点"就是墙上时钟的 1 点，不做时区换算 |
+| 关闭时打日志 | `model refresh: off (daily 01:00, ...)` | 与刹车一致：事后翻日志要能分清"没到点"和"被关了" |
+
+配置项（UCI `workbuddy.main`，管理页「设置」页签有「每日模型巡检」卡片）：
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `model_refresh_enabled` | `1` | 总开关；关闭后仍可手动点「测试全部模型」 |
+| `model_refresh_hour` | `1` | 触发小时，0–23 整数；脏值被拒绝（200 + `ok:false`），不会写进 UCI |
+
+#### ③ 修掉一个让模型映射静默失效的 bug
+
+这是 v2.7.0 留下的缺陷，本轮才定位到根因。
+
+管理页配了模型清单却**不生效**——`/v1/models` 依旧返回上游的远程模型列表。
+根因在 `loadUpstreams()`：它从 `upstreams.json` 读出记录后**构造了一个新的
+对象**，但新对象里**没有拷贝 `modelList` / `modelMap`** 这两个字段：
+
+```js
+push(out, {
+    id: id, name: ..., prefix: prefix, baseUrl: baseUrl,
+    keys: keys, weights: weights, enabled: ..., createdAt: ...,
+    // ← modelList / modelMap 在这里被丢掉了
+});
+```
+
+于是 `/v1/models` 的「有自定义清单就直接用、不外呼上游」分支永远进不去，
+`upstreamStatus()` 的 `modelCount` 也恒为 0。写入侧一直是好的
+（`upstreams.json` 里字段齐全），坏的只是读取侧——所以配置看起来"存住了"
+却毫无效果，正是这类 bug 最难查的地方。
+
+修复后两个字段（含 `modelListSeen` 去重）随对象一起带出。
+
+#### ④ 模型列表落盘兜底
+
+`upModelCache` 原本只存在内存，服务一重启就空。上游 `/models` 恰好抖动/限流时，
+`/v1/models` 就返回空列表——客户端会以为自己配错了。新增：
+
+| 机制 | 说明 |
+| --- | --- |
+| `MODEL_CACHE_FILE` | `/etc/workbuddy/modelcache.json`（权限 600），存"最后已知可用"列表，键为 `prefix\|baseUrl\|keyCount` |
+| `saveModelCache()` @2493 | 拉取成功时写盘 |
+| `loadModelCache()` @2507 | 启动时载入 |
+| `/v1/models` 兜底 | 拉取失败**且**有历史列表时用历史列表，不返回空 |
+| `saveUpstreamsFile()` 联动清空 | 上游配置变更时同步清盘 —— 否则会拿"上一个上游配置"的列表兜底，**那是错的列表，比空列表更容易误导人** |
+
+> **位置约束（踩坑记录 #12 的又一例）**：`saveModelCache` 必须定义在
+> `saveUpstreamsFile` **之前**。ucode 不提升声明，函数按定义时的词法作用域解析
+> 自由变量；声明在后会抛 `access to undeclared variable`，而 **`ucode -c` 与
+> 单元测试都拦不住**——只有真正执行到那一行才会炸。第一版把这两个函数放在
+> `fetchUpstreamModels` 之后（约 3007 行），而调用点 `saveUpstreamsFile` 在
+> 2493 行，属于典型的"平时看着正常，一保存上游就死"。已移回 2493 行。
+
+#### 验收记录（真机，2026-10，`v2.8.0`）
+
+| 判据 | 结果 |
+| --- | --- |
+| 静态六项检查 | 全部 OK（顶层函数 278） |
+| 单元测试 | `==== ALL PASS ==== / UNIT_RC=0` |
+| `ucode -c` | RC=0，零输出（398511 字节，无 BOM） |
+| 文件一致性 | 本地与路由器 md5 均为 `db6025984af7e8be4d646d8b527001c1` |
+| `/v1/models` 修复 | 返回 `sensenova/deepseek-v4-flash` + `sensenova/gpt-4o` 两条自定义清单，不再外呼上游（修复前返回 `deepseek-v4.1-flash`/`glm-5.2`/`kimi-k3` 等远程模型） |
+| `modelCount` 修复 | `/admin/api/state` 返回 `2`（修复前恒为 0） |
+| `test-all` 端点 | HTTP 200 / 2.86s / `{"ok":true,"total":2,"okCount":2,"failCount":0}`；`gpt-4o` 经别名→`glm-5.2` 映射后测试通过 |
+| 每日巡检链路 | 把 `model_refresh_hour` 临时设为当前小时后重启，日志依次出现 `model refresh: on (daily 19:00, ...)` → `daily 19:00 run started` → `sensenova -> 7 models` → `test-all done: 2/2 ok, 0 failed`（约 2s 完成，未打满在途额度），随后已改回 `1` |
+| 落盘文件 | `/etc/workbuddy/modelcache.json`（600，428 B）写入 `{"saved":...,"cache":{"sensenova\|https://token.sensenova.cn/v1\|4":{...}}}` |
+| 管理页数据层 | 浏览器实取 `/admin/api/state`：`version="2.8.0"`、`modelRefreshEnabled=true`、`modelRefreshHour=1`、`modelCount=2`、`modelsText="deepseek-v4-flash\ngpt-4o=glm-5.2"`（编辑弹窗可无损回显） |
+
 ### 管理页安全设计
 
 | 项目 | 做法 | 理由 |
