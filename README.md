@@ -911,6 +911,138 @@ if (reason && conn.freeaiPath && conn.upstream &&
 | **尾部帧完整性** | `tail -c 20` hexdump = `…7d 0a 64 61 74 61 3a 20 5b 44 4f 4e 45 5d 0a`，即 `data: [DONE]\n` **精确落在末尾** |
 | 用量记账 | 流内 `prompt_tokens: 8590`，`/metrics` 全局 `prompt: 349177 / completion: 1012` 持续累加 |
 
+### freeAI 深度调试与模型全量获取（v2.9.4）
+
+v2.9.3 把 freeAI 恢复到基本可用后，这一版针对三类问题：**配额自伤**
+（v2.9.3 的误诊把授权服务的 `req_hour=10` 打光）、**模型可见性**
+（管理页只显示计数不显示模型名）、**与官方语义的剩余偏差**
+（心跳频率、会话包过期、请求体形状、会话头派生）。
+
+#### ① 403 即焚收窄：v2.9.3 把误诊变成配额事故
+
+v2.9.3 收到上游 403 就即焚重领会话包重试，把 `FreeTierError`
+（"free tier can only be used within OpenCode"）当成了会话包作废的证据。
+实测证明**重领的包和旧包一模一样，解不了 403** —— FreeTierError 是上游对
+请求形态/频次的瞬时拒绝，不是会话失效。误诊的代价是每次 403 白烧一次
+`fp.php`，而授权服务端对该接口限 `req_hour=10`/`req_day=50`，
+并发下十几个请求就把配额打光，之后 freeAI 全通道 `too_frequent`
+不可用，直到小时窗口滚过。
+
+修法：即焚条件收窄到**只认明确作废证据**的措辞：
+
+```ucode
+if (reason && conn.freeaiPath && conn.upstream.id === FRE_UPID && !conn.freeaiBurned) {
+    let lr = lc('' + reason);
+    if (index(lr, 'session_replayed') >= 0 || index(lr, 'session invalid') >= 0 ||
+        index(lr, 'invalid session') >= 0 || index(lr, '会话失效') >= 0) {
+        conn.freeaiBurned = true;
+        freeaiBurnSession();
+        conn.upTry--;
+        F.spawnUpstreamDirect(conn);
+        return;
+    }
+}
+```
+
+FreeTierError 走普通失败路径（品牌化文案 + `Retry-After`），不再烧授权配额。
+`conn.freeaiBurned` 是 per-connection 预算，一次完整请求最多即焚重试一次。
+
+> 教训：**重试机制的触发条件必须是"重试可能改变结果"**。403 后重领的包
+> 和旧包完全一致（同一机器码、同一 token、同一 sig_block），结果必然不变 ——
+> 这种重试就是纯烧配额。上"自动自愈"之前先回答：这个失败在服务端对应什么
+> 状态，我的动作会改变那个状态吗？
+
+#### ② 模型列表全量获取 + 管理页显示模型名
+
+`freeaiModels()` 原先丢弃 `dead` 表中的模型，而官方 `gateway.mjs:352-358`
+**不过滤**（dead 只用于挑 `DEFAULT_MODEL`，`:316`）。本版改为全量返回
+`{id, name, dead}`，活模型排前。`/v1/models` 对 dead 模型在 `name` 上追加
+「暂不可用」标记（id 不变 —— 客户端可能硬编码了 id）。
+
+管理页「服务器管理」显示每个上游实际获取到的模型名列表（原先只有
+`modelCount` 计数）：`upstreamStatus()` 新增 `detectedModels` 字段，
+前端渲染「可用模型」徽章行，超过 24 个折叠成「…共 N 个」。数据源是模型
+缓存（`/v1/models` 拉取时回写的 `modelList`），状态接口**纯本地读取** ——
+`/admin/api/state` 是 5 秒轮询，在状态接口里打授权服务端或上游等于自我 DoS。
+
+#### ③ 会话种子与净化器半行缓冲 per-connection 化
+
+会话头种子（首条 user 消息派生）原先存在**模块级全局** `freSessionSeed` ——
+uloop 单线程并发交错时 A 流的种子会覆盖 B 流的。同类问题还有 `frePurifyTail`
+（SSE 半行缓冲）：多路 freeAI 流交错回调会把 A 流的残段拼到 B 流的 chunk 上。
+
+修法：
+
+- `freeaiSeedOf(body)` 扫 messages 取首条非空 user content；
+- `freeaiSessionId(seed)`：有种子用 `sha256Hex('ses\0'+seed)` 派生
+  12 hex + 14 Base62，无种子回落随机 `freeaiOid()`；
+- `freeaiHeaders(pack, seed)` 的三个会话头
+  （`x-opencode-session`/`x-session-affinity`/`X-Session-Id`）**只派生一次**
+  同值 —— 原先三次独立调用在无种子回落分支会给出三个不同随机值（隐藏 bug）；
+- `conn.freSeed` 在 `freeaiCurlArgs` 内计算一次，全程复用；
+- 净化器改为 `freeaiPurifyFeed(conn, chunk)` / `freeaiPurifyFlush(conn)`，
+  半行缓冲放 `conn.freTail`。`conn.sseBuf` 仍攒原始字节（usage 提取与
+  截断检测依赖上游原样内容）。
+
+> 教训：单文件 uloop 服务里，**模块级可变变量 = 所有并发连接共享的全局态**。
+> 判断标准：变量的生命周期若应是"一次请求/一条连接"而非"整个进程"，
+> 就不该放模块级。本版挖出两处，都是自己此前引入的。
+
+#### ④ 心跳频率跟随服务端下发
+
+官方 `gateway.mjs:121`：`auth.interval = (j.heartbeat_interval || 600) * 1000`；
+`:136` 注释自证："token TTL 已缩至 2min(防逆向)，定时器必须跟随服务器下发的
+heartbeat_interval(60s) 而非写死 10min"。我们原先写死 60 秒（值碰巧对，
+但没有依据）。本版心跳成功时采纳 `j.heartbeat_interval`（夹在 10–3600 合法
+区间），存入运行时变量 `freHeartbeatSec`，下一次 tick 动态生效；未下发或
+非法值**保持当前值**（绝不回落官方的 600 兜底 —— token TTL 2 分钟时
+600 秒心跳会掉线）。常量同步改名 `FRE_HEARTBEAT_SEC`（原名 `_MS`
+但值一直是秒，名不副实）。
+
+官方另外两条教训一并吸收：`startHeartbeat` 起新链前先 `clearTimeout`
+（原实现叠加递归链导致频率翻倍打满限流，20261006-07 事故帮凶）—— 我们的
+tick 是单链自重排且**先重排再执行业务**，结构上不可能叠加；心跳 429
+不计入失败计数（服务端限流 ≠ 授权失败，官方原逻辑任何 `!ok` 都 fails++，
+3 次误锁合法用户，同事故根因）。
+
+#### ⑤ 会话包过期以服务端下发的 `exp` 为准
+
+官方 `gateway.mjs:390`：`Date.now() < DIRECT.exp - 30000`（提前 30 秒刷新）。
+我们原先用本地常量 `FRE_SESSION_TTL=240` 判新鲜，服务端下发的 `exp`
+存了但没用。本版改为优先 `pack.exp`（毫秒）比较，缺失才回落本地 TTL。
+
+#### ⑥ 请求体形状：`max_tokens` 与 `max_completion_tokens` 互斥
+
+官方 `gateway.mjs:491,501` 是逐字段白名单**新建对象**，恒只写 `max_tokens`。
+我们是就地 mutation 客户端对象 —— 新版客户端两个字段齐发时上游直接 400
+`[invalid_request_error] max_tokens and max_completion_tokens cannot both be set`。
+修法：两字段合并取一，`delete body.max_completion_tokens`，
+最终只写 `max_tokens`（夹在 `FRE_MAX_TOKENS=4000`）。
+
+#### ⑦ 其他清理
+
+- `/admin/api/freeai/test` 的 chat 步显式挑第一个非 dead 模型
+  （原先取 `ms[0]`，撞上 dead 会误报"chat 不可用"）；
+- 删除死码 `freeaiPurifyChunk`（v2.9.3 用 feed/flush 取代后遗留，零调用点）；
+- 纠正两处错误的语言注释（"ucode 不支持 delete" —— 路由器实测
+  `delete o.b` / `delete o[k]` / 嵌套删除全部可用；真正踩过的坑是对
+  **非对象**取下标 delete）。
+
+#### 验收记录（真机，v2.9.4）
+
+| 判据 | 结果 |
+| --- | --- |
+| 静态六项检查 | 全部 OK（顶层函数 283） |
+| 单元测试 | `==== ALL PASS ==== / UNIT_RC=0` |
+| `ucode -c` | RC=0 |
+| 文件一致性 | 本地与路由器 md5 均为 `d279333e3f044ceb6235abd6628a9301`（425042 字节） |
+| `/health` | `"version": "2.9.4"`，upstreams:1 / upstreamKeys:4 / modelRefreshEnabled:true |
+| `/admin/api/freeai/test` | 三步全 ok：session（ttl:300）/ models（count:13）/ chat（done:true，text:"OK"） |
+| 端到端流式（`freeai/big-pickle`） | 1470 字节，`data: [DONE]` 收尾，流内 usage `8855/3/8858` |
+| 用量记账 | `/metrics` `usage.byUp.ufreeai = 8855/3/8858` 与流内**完全一致**（per-conn 净化器不影响原始字节提取） |
+| `/v1/models` | 13 个 `freeai/*` 全列出，其中 6 个带「暂不可用」标记 |
+| 管理页 | 内联 JS `node --check` RC=0；浏览器实测 `window.load`="function"、`window.S`="object"、版本徽章 v2.9.4；「可用模型」徽章行渲染出真实模型名列表 |
+
 ### 管理页安全设计
 
 | 项目 | 做法 | 理由 |
