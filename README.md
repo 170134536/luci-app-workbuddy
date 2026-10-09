@@ -813,6 +813,104 @@ OpenCode|provider \(Console\)|zen'` = **0**。
 > `ses_` 26 字符形态、**body 必须是 agent 形态（`stream:true` + 含 `bash`/`read`
 > 工具桩）**。生产路径一直能通，正因为 `freeaiShape()` 无条件注入这 12 个工具。
 
+### freeAI 网关移植审计与四项 P0 修复（v2.9.3）
+
+对照官方 PC 端网关 `gateway.mjs`（786 行）逐项审计路由器的 ucode 移植版，
+发现并修复四处**与官方语义不一致**的缺陷，另清理一处同类死代码。
+
+#### ① 流式净化是死代码（最严重）
+
+`freeaiPurifyChunk`/`freeaiPurifyLine` 定义了、单测也覆盖了，但**全文件零调用点** ——
+真正的流式转发在 `makeOnChunk` 里直接 `safeSend(conn, chunk)` 下发原始字节。
+官方 `gateway.mjs:538-551` 的 `fixChunk` 承担两件事，因此这两项保障在路由器上从未生效：
+
+1. 丢弃"既无 `usage` 又无 `choices`"的噪声帧；
+2. 给缺 `id` 的帧补 `chatcmpl-*` id（严格客户端会因缺 id 报错）。
+
+修法：新增 `freeaiPurifyFeed(chunk)`，把任意切分的 chunk 逐字符扫 `\n`，
+**只把完整行**交给 `freeaiPurifyLine`，跨 chunk 的半行攒在全局 `frePurifyTail` 里
+（不补换行 —— 补了会伪造一个完整帧边界）。`makeOnChunk` 里改为：
+
+```ucode
+let sendBuf = chunk;
+if (conn.freeaiPath) sendBuf = freeaiPurifyFeed(chunk);
+if (length(sendBuf) > 0 && !safeSend(conn, sendBuf)) { ... }
+```
+
+注意 `conn.sseBuf` **仍攒原始字节** —— usage 提取与截断检测都依赖上游原样内容。
+
+#### ② 收尾缺 `freeaiPurifyFlush`，最后一行会丢
+
+修好①之后立刻暴露出**同一类**问题：净化的半行缓冲若在流结束时不清空，
+最后那一行会被永久留在 `frePurifyTail` 里丢掉 —— 而丢的往往正是带 `usage`
+的计费块或 `[DONE]`，客户端会一直等不到结束帧。在 `onUpstreamDirectEnd`
+的收尾路径补上：
+
+```ucode
+if (conn.freeaiPath && conn.headersSent && !conn.aborted && !conn.writeBroken) {
+    let tailOut = freeaiPurifyFlush();
+    if (length(tailOut) > 0 && !safeSend(conn, tailOut)) conn.aborted = true;
+}
+```
+
+> 教训：**"定义了函数"不等于"接上了线"**。两次都是同一形态 —— 先发现
+> `freeaiPurifyChunk` 零调用点，修完又在同一条链路上发现 `freeaiPurifyFlush`
+> 零调用点。查这类缺陷的有效手段是 `grep -n '函数名'` 看**调用点行号**，
+> 而不是看定义是否存在；单测覆盖了函数本身，反而掩盖了它从未被调用。
+
+#### ③ 上游 403 未做"即焚重领会话包"
+
+官方 `gateway.mjs:523-527` 在收到 403 时 `burnSession()` 后立刻重领会话包重发一次。
+我们原先只在 `args === null`（会话包**缺失**）时重领，**不覆盖"包还在但已被上游作废"**。
+更糟的是 403 会被 `isClientErrorReason` 判成"客户端错误"，于是原样返回 400/404 给用户
+—— 而请求本身没有任何问题。
+
+修法：新增 `freeaiBurnSession()`，并在 `tryNextUpKey` 里**放在 `isClientErrorReason`
+分支之前**拦截：
+
+```ucode
+if (reason && conn.freeaiPath && conn.upstream &&
+    conn.upstream.id === FRE_UPID && !conn.freeaiBurned) {
+    let lr = lc('' + reason);
+    if (index(lr, 'free tier') >= 0 || index(lr, 'within opencode') >= 0 ||
+        index(lr, 'freetiererror') >= 0) {
+        conn.freeaiBurned = true;
+        let np = freeaiBurnSession();
+        if (np !== null) { conn.upTry--; F.spawnUpstreamDirect(conn); return; }
+    }
+}
+```
+
+`FRE_SESSION_BURN_MIN = 10` 解决并发放大：作废是**上游侧**状态，本地缓存看不出来，
+若并发请求都撞上 403 而各领一次，会直接打爆授权服务端（`activate.php` 限 20 次/时/IP）。
+
+#### ④ `freeaiHttp` 用 `-k` 跳过证书校验
+
+授权服务端下发的是 token / `sig_block` / `fingerprint` / `upstream_url` —— **全是信任输入**。
+跳过证书校验叠加"我们不做 Ed25519 验签"，等于**完全没有任何信任锚**，中间人可任意改写上游地址。
+已去掉 `-k`，保留 `--resolve`：某条 IP 证书真有问题时它会回 421/TLS 重置，
+而代码本来就会换下一条 IP。
+
+#### ⑤ `routePassthrough` 漏标 freeAI 通道
+
+`conn.freeaiPath` 原先只在 `handleChat` 的 customUp 分支设置，
+`routePassthrough` 里另有一处 `conn.upstream = up`（同样可能命中 `FRE_UPID`）
+未标记 ⇒ 走 `/v1/messages` 一类透传端点打 freeAI 时，净化与"即焚重领"两道保障都不生效。
+
+#### 验收记录（真机，v2.9.3）
+
+| 判据 | 结果 |
+| --- | --- |
+| 静态六项检查 | 全部 OK（顶层函数 282） |
+| 单元测试 | `==== ALL PASS ==== / UNIT_RC=0` |
+| `ucode -c` | RC=0，零输出（414164 字节，无 BOM） |
+| 文件一致性 | 本地与路由器 md5 均为 `8f5ec9506ec68ec8cde16d3292d351f1` |
+| 调用点接线 | `freeaiPurifyFeed` @5720、`freeaiPurifyFlush` @6237、`freeaiBurnSession` @6080、`freeaiPath` @6624/@6776 |
+| 证书校验 | `grep -c 'curl -sS -k'` = **0** |
+| 流式请求（`freeai/big-pickle`） | HTTP 200 / 2945 字节，`[DONE]` 计数 1 |
+| **尾部帧完整性** | `tail -c 20` hexdump = `…7d 0a 64 61 74 61 3a 20 5b 44 4f 4e 45 5d 0a`，即 `data: [DONE]\n` **精确落在末尾** |
+| 用量记账 | 流内 `prompt_tokens: 8590`，`/metrics` 全局 `prompt: 349177 / completion: 1012` 持续累加 |
+
 ### 管理页安全设计
 
 | 项目 | 做法 | 理由 |

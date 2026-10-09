@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.9.0';
+const APP_VERSION = '2.9.3';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -4562,6 +4562,17 @@ let freHeartbeatFail = 0;     // 连续心跳失败次数，>=3 清除 token 走
 let freActivateFailAt = 0;    // 激活失败退避截止时间（Unix 秒）
 let freGoodIp = null;        // 当前可达的 Cloudflare A 记录（freeaiHttp 探测后缓存）
 let freSessionSeed = '';     // 本次请求的第一条 user 消息内容，用于派生会话头（每次请求重置）
+// v2.9.3：freeAI 流的 SSE 半行缓冲 —— chunk 是任意切分的，净化必须按"完整行"
+// 进行，否则会把半行截断。跨 chunk 的残段攒在这里，凑到换行才交给
+// freeaiPurifyLine 处理；流结束时把残留的尾段一并冲出（否则最后一行会丢）。
+let frePurifyTail = '';
+// v2.9.3：会话包被上游作废（403 FreeTierError）时的"即焚"节流时间戳。
+// 作废是**上游侧**的状态，本地缓存里的包看起来仍然有效（未到 exp），
+// 所以必须由收到 403 的那条请求主动烧掉并重领；但重领要打授权服务端，
+// 期间若并发请求都撞上 403，不能让每个请求各领一次 ⇒ 用这个时间戳
+// 把"即焚重领"限制在 FRE_SESSION_BURN_MIN 秒一次（其余请求直接失败重试）。
+let freSessionBurnAt = 0;
+const FRE_SESSION_BURN_MIN = 10;
 
 // 对 freeAI 授权服务端执行一次 HTTP 请求，自动挑选当前可达的 Cloudflare IP。
 // 返回 { code: <3位状态码>, body: <解析后的 JSON 对象> }，全部候选 IP 都失败时返回 null。
@@ -4583,7 +4594,12 @@ function freeaiHttp(method, url, headers, body, timeoutSec, retries) {
 	}
 	let bodyFile = '/tmp/fre_http_body';
 	for (let ip in candidates) {
-		let cmd = 'curl ' + shquote('-sS') + ' ' + shquote('-k') + ' ' + shquote('-m') + ' ' + shquote('' + to) +
+		// v2.9.3：去掉 -k。授权服务端下发的是 token / sig_block / fingerprint /
+		// upstream_url —— 全是网关的信任输入，跳过证书校验等于把信任锚交给
+		// 任何能做中间人的攻击者（叠加我们不做 Ed25519 验签，就是完全无锚）。
+		// 保留 --resolve 钉 IP（真正解决"坏 IP"的手段），让 curl 正常校验证书；
+		// 某条 IP 证书真有问题时它会回 421/TLS 重置，代码本来就会换下一条。
+		let cmd = 'curl ' + shquote('-sS') + ' ' + shquote('-m') + ' ' + shquote('' + to) +
 			' ' + shquote('--retry') + ' ' + shquote('' + rt) + ' ' +
 			shquote('--retry-all-errors') + ' ' + shquote('--retry-delay') + ' ' + shquote('1') + ' ' +
 			shquote('--resolve') + ' ' + shquote(FRE_CF_HOST + ':443:' + ip) + ' ' +
@@ -4825,6 +4841,23 @@ function freeaiSaveToken(tok) {
 	}
 }
 
+// v2.9.3：上游用 403 FreeTierError 作废了会话包 —— 本地缓存看不出来
+// （exp 还没到），只有真正发出去才知道。官方 gateway.mjs:523-527 的
+// 处理是 burnSession() 之后立刻重领会话包重发一次。这里照做，但：
+//   1) 用 freSessionBurnAt 节流，避免并发请求各领一次打爆授权服务端；
+//   2) 返回 null 表示"没重领，你按普通失败处理"（调用方继续换路径）。
+// 注意 freeaiRefreshPack(true) 会跳过退避与缓存，所以节流只能在这里做。
+function freeaiBurnSession() {
+	let now = time();
+	if (freSessionBurnAt + FRE_SESSION_BURN_MIN > now) return null;
+	freSessionBurnAt = now;
+	freSession = null;              // 作废本地缓存
+	freSessionFailAt = 0;           // 清退避，允许本次立刻重领
+	let rr = freeaiRefreshPack(true);
+	if (rr.ok) return rr.pack;
+	return null;
+}
+
 // 拉取免费模型列表。失败返回 []（不让一个挂掉的上游拖垮 /v1/models）。
 function freeaiModels() {
 	let j = freeaiApi('/models.php', 'act=list');
@@ -5060,6 +5093,35 @@ function freeaiPurifyChunk(chunk) {
 	// 末尾没有换行的半行原样带出（不补换行 —— 补了会伪造一个完整帧）
 	out += cur;
 	return out;
+}
+
+// v2.9.3：把任意切分的 chunk 送进净化器，跨 chunk 的半行攒在 frePurifyTail 里，
+// 只把**完整的行**交给 freeaiPurifyLine，返回可安全下发的字节。
+// 官方 gateway.mjs:538-551 的做法是 split("\n") 后留末段；这里等价，
+// 但保留"行尾本来是否有 \n"的信息（否则会伪造出一个完整帧边界）。
+function freeaiPurifyFeed(chunk) {
+	frePurifyTail += chunk;
+	let out = '';
+	let start = 0;
+	let n = length(frePurifyTail);
+	for (let i = 0; i < n; i++) {
+		if (substr(frePurifyTail, i, 1) !== '\n') continue;
+		let line = substr(frePurifyTail, start, i - start);
+		let kept = F.freeaiPurifyLine(line);
+		if (length(kept) > 0) out += kept + '\n';
+		start = i + 1;
+	}
+	// 残段留到下一轮（不补换行 —— 补了会伪造一个完整帧）
+	frePurifyTail = substr(frePurifyTail, start);
+	return out;
+}
+
+// 流结束/换 Key 时把残留尾段冲出，避免最后一行丢失。
+function freeaiPurifyFlush() {
+	if (length(frePurifyTail) === 0) return '';
+	let kept = F.freeaiPurifyLine(frePurifyTail);
+	frePurifyTail = '';
+	return (length(kept) > 0) ? (kept + '\n') : '';
 }
 
 function freeaiPurifyLine(line) {
@@ -5646,8 +5708,21 @@ function makeOnChunk(conn, onFail, onEnd) {
 			}
 			sseHeaders(conn);
 		}
+		// v2.9.3：freeAI 流必须过净化器再下发。官方 gateway.mjs:538-551 的
+		// fixChunk 承担两件事：①丢弃"既无 usage 又无 choices"的噪声帧；
+		// ②给缺 id 的帧补 chatcmpl-* id（严格客户端会因缺 id 报错）。
+		// 此前 freeaiPurifyChunk 定义了却零调用点，等于整条保障失效。
+		// 注意：净化的**输入必须是原始 chunk**（它自己维护半行缓冲），
+		// 而 conn.sseBuf 仍要攒**原始**字节 —— usage 提取与截断检测都
+		// 依赖上游原样内容，攒净化后的会丢 [DONE] 之外的原始字段。
+		let sendBuf = chunk;
+		if (conn.freeaiPath) {
+			let purified = freeaiPurifyFeed(chunk);
+			// 净化后暂无可下发内容（整块都是半行，或全是噪声帧）时不发空包
+			sendBuf = purified;
+		}
 		// v2.1.0：写侧检查 —— 客户端慢/断开会短写，send 不再静默失败。
-		if (!safeSend(conn, chunk)) {
+		if (length(sendBuf) > 0 && !safeSend(conn, sendBuf)) {
 			conn.aborted = true;
 			closeConn(conn);
 			return;
@@ -5989,6 +6064,32 @@ function tryNextUpKey(conn, reason) {
 	// 并且不把它算作这把 Key 的失败（否则池一挂就会连坐冷却掉一批好 Key）。
 	if (poolFallback(conn)) return;
 
+	// v2.9.3：freeAI 的 403 FreeTierError 是**上游作废了会话包**，不是请求本身
+	// 有问题。这必须放在 isClientErrorReason 分支**之前** —— 403 会被判成
+	// "客户端错误"，于是我们原地返回 400/404 给用户，而正解是即焚重领一次
+	// （官方 gateway.mjs:523-527）。这条同时覆盖 isClientErrorReason 之外的
+	// 含 FreeTierError 字样的各种包装（网关 HTML 错误页、provider 报错文本）。
+	if (reason && conn.freeaiPath && conn.upstream &&
+	    conn.upstream.id === FRE_UPID && !conn.freeaiBurned) {
+		let lr = lc('' + reason);
+		let burnable = (index(lr, 'free tier') >= 0 ||
+		                index(lr, 'within opencode') >= 0 ||
+		                index(lr, 'freetiererror') >= 0);
+		if (burnable) {
+			conn.freeaiBurned = true;
+			let np = freeaiBurnSession();
+			if (np !== null) {
+				conn.upTry--;          // 退回槽位，用重领到的包重发
+				logInfo('freeai session burned by upstream, refetched and retrying');
+				F.spawnUpstreamDirect(conn);
+				return;
+			}
+			// 节流窗口内没能重领：继续往下走普通失败路径，但记一笔，
+			// 免得看起来像"无缘无故失败"。
+			logInfo(sprintf('freeai session burn skipped (throttled): %s', '' + reason));
+		}
+	}
+
 	// 客户端错误（模型名不被接受 / 请求体不被接受）：
 	// 确定性失败，换 Key 结果一模一样，所以就地返回，不进换 Key 链。
 	// 这一步必须放在 markUpKeyFail **之前** —— 否则一次"模型名写错"或
@@ -6127,6 +6228,15 @@ function onUpstreamDirectEnd(conn) {
 	// v2.0：用量统计：流式场景从累积的 sseBuf 里提取最后一个 usage。
 	let usage = extractUsage(conn.sseBuf);
 	if (usage) recordUsage(conn, usage);
+
+	// v2.9.3：freeAI 流收尾 —— 把净化器里残留的半行冲出。
+	// 不加这一步，若上游最后一行没有以 \n 结尾（或最后一个 chunk 正好切在
+	// 行中间），那一行会被永久留在 frePurifyTail 里丢掉。丢的往往正是
+	// 带 usage 的计费块或 [DONE]，客户端会一直等不到结束帧。
+	if (conn.freeaiPath && conn.headersSent && !conn.aborted && !conn.writeBroken) {
+		let tailOut = freeaiPurifyFlush();
+		if (length(tailOut) > 0 && !safeSend(conn, tailOut)) conn.aborted = true;
+	}
 
 	if (conn.wantNonStream) {
 		// v2.0：透传端点不做合并，原样回传累积内容。
@@ -6518,6 +6628,9 @@ function handleChat(conn, bodyRaw) {
 		conn.upstream = up;
 		conn.upKeys = keys;
 		conn.upTry = 0;
+		// v2.9.3：标记 freeAI 通道 —— 流式转发要对它的字节过净化器
+		// （见 makeOnChunk 里 freeaiPurifyFeed 的调用点）。
+		conn.freeaiPath = (up.id === FRE_UPID);
 		// 首次尝试过并发闸门；换 Key 的重试沿用已持有的额度（gateHeld）
 		gateStart(conn, 'direct');
 		return;
@@ -6667,6 +6780,9 @@ function handlePassthrough(conn, bodyRaw, path) {
 		conn.upstream = up;
 		conn.upKeys = keys;
 		conn.upTry = 0;
+		// v2.9.3：透传路径同样要标记 freeAI 通道 —— 否则 /v1/messages 一类
+		// 非 chat 端点打到 freeAI 时，净化与"即焚重领"两道保障都不生效。
+		conn.freeaiPath = (up.id === FRE_UPID);
 		gateStart(conn, 'direct');
 		return;
 	}
@@ -7454,7 +7570,7 @@ function testAllUp() {
     }
     if (r.results.length > 30) lines.push('… 共 ' + r.results.length + ' 个');
     var head = '共 ' + r.total + ' 个模型：' + r.okCount + ' 可用，' + r.failCount + ' 失败';
-    if (lines.length) alert(head + '\n\n' + lines.join('\n'));
+    if (lines.length) alert(head + '\\n\\n' + lines.join('\\n'));
     else alert(head);
     if (st) st.textContent = r.failCount === 0 ? '全部可用 ✅' : r.failCount + ' 个失败 ❌';
     load();
@@ -8563,13 +8679,32 @@ function handleAdmin(conn, req, method, path, query, body) {
 		// array or object` —— 于是**只要用户填了授权码或机器码，保存请求
 		// 还没写盘就 500**，配置静默存不下去（只有不改这两个字段时才侥幸成功）。
 		// 静态检查与单测都拦不住这种"运行到那一行才炸"的错。
-		let lic = (j.license === null) ? cur.license : trim('' + j.license);
-		let mac = (j.machine === null) ? cur.machine : trim('' + j.machine);
+		// v2.9.2 修复：本地回环覆盖（display → persistence 回灌）。
+		// 管理页的 renderFree() 把 freeaiStatus() 的**展示投影**填进表单：
+		// license 是掩码 `FA-UY****-DUWT`，machine/model 在展示层可能为空。
+		// 而 saveFree() 原样 POST 回来，服务端见字段非 null 就写盘 —— 于是
+		// 「打开页面直接点保存」会把真实授权码覆盖成掩码、把机器码清空。
+		// 判定规则：值里带 `*`（掩码特征）或与当前值相等 ⇒ 视为"未改动"。
+		// `*` 不可能出现在合法授权码/机器码里，所以这条判定不会误伤真值。
+		function unchanged(v, curv) {
+			if (v === null) return true;
+			let s = trim('' + v);
+			if (length(s) === 0) return true;       // 空 = 没填，保留原值
+			if (index(s, '*') >= 0) return true;    // 掩码回灌，不是真值
+			return (s === ('' + curv));
+		}
+		let lic = unchanged(j.license, cur.license) ? cur.license : trim('' + j.license);
+		let mac = unchanged(j.machine, cur.machine) ? cur.machine : trim('' + j.machine);
 		let tok = (j.token === null) ? cur.token : trim('' + j.token);
+		// v2.9.2：tokenAt 只在 token 真的换了时才刷新。原写法恒为 cur.tokenAt，
+		// 于是管理页手工粘贴新 token 后时间戳还是旧的（tokenAge 显示成
+		// "来自很久以前"，用户会以为没存进去）；而恒写 time() 又会让每次
+		// 「打开页面点保存」都伪装成刚续签过，掩盖真正的过期。用差异判定。
+		let tokAt = (tok === cur.token) ? cur.tokenAt : time();
 		writeJsonFile(FRE_CFG_FILE, {
 			enabled: (j.enabled === null) ? cur.enabled : truthy(j.enabled),
 			license: lic, machine: mac, token: tok,
-			tokenAt: cur.tokenAt, model: (j.model === null) ? cur.model : ('' + j.model),
+			tokenAt: tokAt, model: (j.model === null) ? cur.model : ('' + j.model),
 			base: cur.base, ver: cur.ver,
 			injectFingerprint: (j.injectFingerprint === null) ? cur.injectFingerprint : truthy(j.injectFingerprint),
 			brandNeutralize: (j.brandNeutralize === null) ? cur.brandNeutralize : truthy(j.brandNeutralize),
