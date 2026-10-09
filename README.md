@@ -1043,6 +1043,87 @@ tick 是单链自重排且**先重排再执行业务**，结构上不可能叠�
 | `/v1/models` | 13 个 `freeai/*` 全列出，其中 6 个带「暂不可用」标记 |
 | 管理页 | 内联 JS `node --check` RC=0；浏览器实测 `window.load`="function"、`window.S`="object"、版本徽章 v2.9.4；「可用模型」徽章行渲染出真实模型名列表 |
 
+### freeAI 协议对齐二期与配置链路硬化（v2.9.5）
+
+v2.9.4 让 freeAI 通道恢复可用并把模型全量暴露。本版落地移植审计的 P1/P2
+收尾项（DNS 回落、重试降档、协议/UA 对齐、退避分档），并在真机验收中
+连带修复了三处**配置持久化链路**的真实缺陷。
+
+#### ① freeaiHttp 重写：系统 DNS 回落 + 自愈式好 IP 发现（P2-a）
+
+`FRE_CF_IPS` 两条钉死的 Cloudflare IP 会随边缘路由翻转失效。此前全部失败
+就等于 freeAI 授权服务不可达，直到手动改配置。v2.9.5 在候选列表**末位追加
+`null`（不加 `--resolve`，走系统 DNS）**，并把 `-w` 扩为
+`%{http_code} %{remote_ip}` —— DNS 回落连上的实际 IP 回填 `freGoodIp`，
+下一个请求恢复"钉 IP"快路径。Cloudflare 轮换 A 记录后无需任何人工干预。
+
+同批修正一个老 bug：`'000'`（连接级失败）满足旧判定
+`length(out) === 3 && out !== '421'`，**曾被当作成功**——坏 IP 被缓存进
+`freGoodIp` 且循环不再前移，整条授权链路跟着一个死 IP 一起坏。
+任何"长度为 3 就是 http_code"的松散检查都要显式列出全部合法值。
+
+#### ② 重试降档与协议对齐（P2-b/d/e）
+
+- **四处 `--retry` 降为 1**（freeaiApi / freeaiActivate / freeaiCurlArgs /
+  test 端点）。`--retry-all-errors` 连 429 也重发，等于把 `fp.php` 的
+  `req_hour=10` 配额双倍烧掉；官方 gateway 用 undici，**零重试**——
+  连接级韧性由候选 IP 轮换提供，不用 curl 重试叠配额事故。
+- **freeAI 路径默认 HTTP/1.1**（与官方 undici 一致），管理页新增
+  「HTTP/1.1 对齐」开关，取消勾选回退 `--http2`；通用上游的
+  `curlArgs`（HTTP/2 + TCP FastOpen）不变。
+- freeAI 路径移除 `--tcp-fastopen`（curl 8.6 上 FASTOPEN+HTTP2 组合有兼容问题）。
+- **User-Agent 可配置**：`freeai.json` 新增 `ua` 字段（管理页留空 =
+  回退内置默认 `opencode/1.18.31 …`）。上游收紧版本闸门时改一处配置即可跟上，
+  不必重新刷机。
+
+#### ③ 会话包失败退避分档（P1-g/h）
+
+新增 `freeaiSessionBackoff(err)`：`too_frequent` / `must_upgrade` 属于
+"60 秒后再试也解不了"的闸（前者是 fp.php 自身的 10 次/时配额，后者在官方
+`gateway.mjs:402-424` 是客户端版本闸/服务端闸），退避改用
+`FRE_ACTIVATE_BACKOFF`（900s）；其余瞬时错误保持 60s；拉取成功重置回 60。
+同时把 `must_upgrade` 从 403「重领自愈」的匹配里剔除——重领解不开版本闸，
+只会白烧 20 次/时的激活配额。
+
+#### ④ 真机验收暴露的三处配置链路缺陷（热修）
+
+- **保存端点只防 `null` 不防空串**：`/admin/api/freeai/save` 旧写法
+  `(j.token === null) ? cur.token : trim('' + j.token)`，API 侧发
+  `"token": ""` 会直接把 token 洗空 → freeAI 全瘫。改为走
+  `unchanged()`（空串 / 含 `*` 掩码 / 与当前值相同 = 未改动，保持原值）。
+  UI 表单本身不带 token 字段所以日常踩不到，但配置接口是真实攻击面。
+- **`force` 语义过载封死自愈**：`freeaiRefreshPack` 原
+  `if (force || freReauthing)` 直接返回错误——而 test 端点、
+  burnSession、换 Key 重领**都传 force=true**，token 一旦为空这些路径全部
+  失去"自动重新激活"能力。改为仅 `if (freReauthing)`（防递归本来就有
+  freReauthing + 非 force 分支双保险；`freeaiActivate` 自带 900s 节流）。
+  部署硬化版后跑一次 `/admin/api/freeai/test`，日志即出现
+  `freeai activated, new token saved`，链路自愈成功。
+- **`freeaiSaveToken` 字段清单漏 `ua`/`http11`**：它按字段清单整体重写
+  `freeai.json`，新增配置字段没进清单 → 每次 token 刷新（激活/心跳轮换）
+  把自定义 UA 与协议开关洗回默认。教训：**字段清单式重写配置的地方有两处
+  （保存端点 + freeaiSaveToken），加字段必须 grep 全部
+  `writeJsonFile(FRE_CFG_FILE)` 调用点**。
+- 前端 `testAllUp()` 点击时捕获的状态节点会被 5 秒轮询重建 DOM 变成游离
+  节点（结果写了看不见）→ 改为每次按 id 重查后写入。
+
+#### 上线验收（v2.9.5）
+
+| 判据 | 结果 |
+| --- | --- |
+| 静态六项 + 单测 + `ucode -c` | 全部通过（顶层函数 284） |
+| 文件一致性 | 本地与路由器 md5 `86ae293ca973ffb14fe78b6228769814`（433998 字节），`/health` 2.9.5 |
+| `/admin/api/freeai/test` | 三步全 ok，且缺 token 时**自动重激活自愈**（session ttl:300 / models 13 / chat done:true） |
+| 端到端流式（`freeai/big-pickle`，HTTP/1.1 对齐生效） | 8377 字节 `[DONE]` 收尾，`FINAL_OK`；上游品牌字样（opencode/zen）出现 0 次 |
+| 用量记账 | `/metrics` `usage.byUp.ufreeai = 8593/56/8649` 与流内 usage **完全一致** |
+| 配置链路 | 保存 round-trip（真值/掩码/空串三态）不再洗掉 license/machine/token/model；disk `ua:""`（=默认生效）、`http11:true` |
+| `/v1/models` | 13 个 `freeai/*`，6 个带「暂不可用」标记 |
+| 管理页 | 内联 JS 52417 字节 `node --check` RC=0；「可用模型」徽章正常 |
+
+> 验收方法论：脚本**按 UI 真实发值的形态**（含 null / 空串 / 掩码三态）发
+> 保存请求，才暴露了"UI 表单不带 token 字段"掩护下的端点清空缺陷——
+> 只测 UI 会永远漏掉它。
+
 ### 管理页安全设计
 
 | 项目 | 做法 | 理由 |

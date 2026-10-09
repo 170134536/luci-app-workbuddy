@@ -34,7 +34,7 @@ function logErr(msg) { logMsg('error', msg); }
 
 // ---------- 常量 ----------
 
-const APP_VERSION = '2.9.4';
+const APP_VERSION = '2.9.5';
 
 // 产品显示名。集中在这里，改名字只需改这一处。
 //
@@ -506,6 +506,9 @@ const FRE_MAX_TOKENS = 4000;          // 与官方网关一致：max_tokens 上�
 // 不是额度耗尽也不是配置错误。给客户端一个够长的退避窗口，避免它立刻重撞；
 // 报 429 + Retry-After 而不是 502，是为了让客户端走标准退避语义。
 const FRE_TRANSIENT_RETRY_SEC = 5;
+// freeAI 聊天上游的 User-Agent（模拟官方 opencode 客户端）。
+// v2.9.5 起可被 freeai.json 的 ua 字段覆盖（上游若开始按版本闸 must_upgrade，
+// 管理员可就地升版本号而不用等插件发版）；此常量只是默认值。
 const FRE_UA = 'opencode/1.18.31 (windows amd64; node22)';
 // web-deepseek.gd7.cn 在 Cloudflare 后有两条 A 记录，但"哪条证书正常"会随
 // Cloudflare 边缘路由变化而翻转（实测 104.21.89.29 与 172.67.136.143 先后
@@ -1935,6 +1938,13 @@ function freeaiRaw() {
 		ver: '' + (c.ver || FRE_VER_DEFAULT),
 		injectFingerprint: (c.injectFingerprint !== false),
 		brandNeutralize: (c.brandNeutralize !== false),
+		// v2.9.5：UA 可配（默认 FRE_UA）。上游按 opencode 版本做闸门时，
+		// 管理员可在 freeai.json 写 "ua": "opencode/x.y.z (...)" 就地升版本。
+		ua: '' + (c.ua || FRE_UA),
+		// v2.9.5：HTTP 协议版本对齐官方。官方客户端是 Node undici = HTTP/1.1；
+		// 我们此前强制 --http2，ALPN 协商结果是 TLS 层可见的指纹偏差。
+		// 默认 true（h1.1 对齐官方）；显式写 false 可切回 h2。
+		http11: (c.http11 !== false),
 	};
 	freCache = { at: now, data: out };
 	return out;
@@ -4581,6 +4591,11 @@ function runCurl(cfg, args) {
 // （activate.php 限 20 次/时/IP，会话接口虽未实测限流也要有礼貌）。
 let freSession = null;        // { pack, at, sid, exp }
 let freSessionFailAt = 0;
+// v2.9.5：会话包拉取失败的退避时长（秒），按失败类型动态调整 ——
+// too_frequent / must_upgrade 是小时级配额窗 / 版本闸，60s 后重试毫无意义
+// 还继续烧 fp.php 的 req_hour=10 配额，改用 FRE_ACTIVATE_BACKOFF(900s)；
+// 其余（网络抖动等）保持 FRE_SESSION_BACKOFF(60s)。成功后重置回 60。
+let freSessionBackoffSec = FRE_SESSION_BACKOFF;
 let freSessionErr = '';
 let freReauthing = false;     // 防止并发请求同时触发重激活
 let freHeartbeatTimer = null;
@@ -4636,6 +4651,14 @@ const FRE_SESSION_BURN_MIN = 60;
 // 会随边缘路由翻转（实测两条先后当过坏 IP）。坏 IP 返回 421（SAN 不匹配）或
 // TLS 重置（code=000）。这里逐条 --resolve 探测，把最近一次成功的 IP 缓存到
 // freGoodIp，下次优先试它；坏 IP 换下一条。
+// v2.9.5 (P2-a)：钉死 IP 全部失败后回落一次系统 DNS（末位候选 null = 不加
+// --resolve）。Cloudflare 轮换 A 记录后 FRE_CF_IPS 两条可能全坏，DNS 回落是
+// 自愈通道；-w 同时打出 %{remote_ip}，把实际连上的好 IP 回填 freGoodIp，
+// 下次请求恢复"钉 IP"快路径。
+// v2.9.5 同时修正一个老 bug：此前 '000'（连接级失败）满足旧判定
+// `length(code)===3 && code!=='421'` 会被当成"成功"——坏 IP 反而被缓存进
+// freGoodIp、循环不再前移（注释声称 000 换下一条，代码却没排除它），
+// 调用方只能靠 body:null 兜底。现在 '000'/'421'/空输出统一换下一候选。
 function freeaiHttp(method, url, headers, body, timeoutSec, retries) {
 	let to = +timeoutSec || 15;
 	let rt = +retries || 0;
@@ -4646,8 +4669,10 @@ function freeaiHttp(method, url, headers, body, timeoutSec, retries) {
 		for (let x in candidates) if (x === ip) dup = true;
 		if (!dup) push(candidates, ip);
 	}
+	push(candidates, null);   // 末位候选：系统 DNS（不加 --resolve）
 	let bodyFile = '/tmp/fre_http_body';
-	for (let ip in candidates) {
+	for (let ci = 0; ci < length(candidates); ci++) {
+		let ip = candidates[ci];
 		// v2.9.3：去掉 -k。授权服务端下发的是 token / sig_block / fingerprint /
 		// upstream_url —— 全是网关的信任输入，跳过证书校验等于把信任锚交给
 		// 任何能做中间人的攻击者（叠加我们不做 Ed25519 验签，就是完全无锚）。
@@ -4656,8 +4681,14 @@ function freeaiHttp(method, url, headers, body, timeoutSec, retries) {
 		let cmd = 'curl ' + shquote('-sS') + ' ' + shquote('-m') + ' ' + shquote('' + to) +
 			' ' + shquote('--retry') + ' ' + shquote('' + rt) + ' ' +
 			shquote('--retry-all-errors') + ' ' + shquote('--retry-delay') + ' ' + shquote('1') + ' ' +
-			shquote('--resolve') + ' ' + shquote(FRE_CF_HOST + ':443:' + ip) + ' ' +
-			shquote('-o') + ' ' + shquote(bodyFile) + ' ' + shquote('-w') + ' ' + shquote('%{http_code}');
+			// v2.9.5 (P2-e)：显式 HTTP/1.1 —— 官方网关对授权服务端走 Node fetch
+			// (undici)=h1.1；curl 裸 https 默认也是 h1.1，写出来是为了确定行为，
+			// 免得将来有人加全局 --http2 把授权路径的 ALPN 也带偏。
+			shquote('--http1.1') + ' ';
+		if (ip !== null)
+			cmd += shquote('--resolve') + ' ' + shquote(FRE_CF_HOST + ':443:' + ip) + ' ';
+		cmd += shquote('-o') + ' ' + shquote(bodyFile) + ' ' +
+			shquote('-w') + ' ' + shquote('%{http_code} %{remote_ip}');
 		if (method === 'POST') {
 			cmd += ' ' + shquote('-X') + ' ' + shquote('POST') + ' ' +
 				shquote('-H') + ' ' + shquote('Content-Type: application/json') + ' ' +
@@ -4666,35 +4697,48 @@ function freeaiHttp(method, url, headers, body, timeoutSec, retries) {
 		for (let k in headers)
 			cmd += ' ' + shquote('-H') + ' ' + shquote(k + ': ' + headers[k]);
 		cmd += ' ' + shquote(url);
-		let code = runCurlStr(cmd);
-		if (code !== null) code = trim(code);
-		// 只认真正的 3 位 HTTP 状态码；421 是 Cloudflare 证书路由错误（坏 IP 的特征），
-		// 000/空表示连接级失败（TLS 重置/超时）。这两类都换下一个 IP 重试。
-		if (code !== null && length(code) === 3 && code !== '421') {
+		let out = runCurlStr(cmd);
+		if (out !== null) out = trim(out);
+		// 输出形如 "<code>[ <remote_ip>]"。只认真正的 3 位 HTTP 状态码：
+		// 421 = Cloudflare 证书路由错误（坏 IP 的特征），000 = 连接级失败
+		// （TLS 重置/超时），空/null = curl 没跑起来。三类都换下一候选。
+		if (out === null || length(out) < 3) continue;
+		let code = substr(out, 0, 3);
+		if (code === '000' || code === '421') continue;
+		// 拿到真实 HTTP 响应：缓存实际连上的 IP —— DNS 回落时这是新发现的
+		// 好 IP（自愈），钉 IP 命中时 remote_ip 与 ip 相同（保持缓存新鲜）。
+		let sp = index(out, ' ');
+		if (sp > 0) {
+			let rip = trim(substr(out, sp + 1));
+			if (length(rip) > 0) freGoodIp = rip;
+		} else if (ip !== null) {
 			freGoodIp = ip;
-			let raw = null;
-			try {
-				let fs = require('fs');
-				if (fs.access(bodyFile, 'f')) raw = fs.readfile(bodyFile);
-			} catch (e) { raw = null; }
-			if (raw === null) return null;
-			let j = null;
-			try { j = json(raw); } catch (e) { j = null; }
-			return { code: code, body: j };
 		}
+		let raw = null;
+		try {
+			let fs = require('fs');
+			if (fs.access(bodyFile, 'f')) raw = fs.readfile(bodyFile);
+		} catch (e) { raw = null; }
+		if (raw === null) return null;
+		let j = null;
+		try { j = json(raw); } catch (e) { j = null; }
+		return { code: code, body: j };
 	}
 	return null;
 }
 
 // GET 一个 JSON 响应（fp.php）。请求签名对齐官方网关：官方对 freeAI-admin 的
 // 请求用 Node fetch 默认头（User-Agent: node，Accept: */*），不能带 opencode UA
-// （后台识别非官方客户端会限制）。-k 仅用于消化 Cloudflare 证书路由怪癖，
-// 对授权服务端不可见；聊天上游 opencode.ai 不走这里。
+// （后台识别非官方客户端会限制）；证书校验保持开启（v2.9.3 已去掉 -k），
+// 坏 IP 由 freeaiHttp 换下一条候选；聊天上游 opencode.ai 不走这里。
+// v2.9.5：重试由 3 降为 1 —— fp.php 有 req_hour=10 配额，curl 的
+// --retry-all-errors 连 429 都会重发，3 次重试等于配额双倍烧。连接级
+// 韧性已由 freeaiHttp 的候选 IP 循环提供，这里不再叠加。
 function freeaiApi(path, query) {
 	let c = freeaiRaw();
 	let url = c.base + path;
 	if (length(query) > 0) url += '?' + query;
-	let r = freeaiHttp('GET', url, { 'Accept': '*/*', 'User-Agent': 'node' }, '', 30, 3);
+	let r = freeaiHttp('GET', url, { 'Accept': '*/*', 'User-Agent': 'node' }, '', 30, 1);
 	if (r === null) return null;
 	return r.body;
 }
@@ -4722,8 +4766,10 @@ function freeaiActivate() {
 	let now = time();
 	if (now < freActivateFailAt)
 		return { ok: false, err: '激活退避中' };
+	// v2.9.5：重试 2→1。activate.php 有人机配额（20 次/时/IP），
+	// --retry-all-errors 会把 429 也重发，叠加重试最容易把配额烧光。
 	let j = freeaiPost('/activate.php', { code: c.license, machine: c.machine },
-		FRE_ACTIVATE_TIMEOUT, 2);
+		FRE_ACTIVATE_TIMEOUT, 1);
 	if (j === null) {
 		freActivateFailAt = now + FRE_ACTIVATE_BACKOFF;
 		return { ok: false, err: '激活请求失败（网络或超时）' };
@@ -4794,6 +4840,18 @@ function freHeartbeatTick() {
 	if (c.enabled === true && length(c.token) > 0)
 		freeaiHeartbeat();
 }
+// v2.9.5 (P1-g/P1-h)：会话包失败退避分档。too_frequent / must_upgrade 属于
+// "60 秒后再试也解不了"的闸 —— 前者是 fp.php 自身 10 次/时 的配额，后者在官方
+// gateway.mjs:402-424 有两种语义（客户端版本闸 / 服务端连接中断），都需要
+// 长时间等待或升级客户端，短退避只会反复撞闸并把配额烧光。其余瞬时错误
+// （网络抖动/会话被服务端轮换）60 秒退避即可。
+function freeaiSessionBackoff(err) {
+	let l = lc('' + err);
+	if (index(l, 'too_frequent') >= 0 || index(l, 'too frequent') >= 0 ||
+	    index(l, 'must_upgrade') >= 0 || index(l, '频繁') >= 0)
+		return FRE_ACTIVATE_BACKOFF;
+	return FRE_SESSION_BACKOFF;
+}
 function freeaiRefreshPack(force) {
 	let c = freeaiRaw();
 	let now = time();
@@ -4810,16 +4868,25 @@ function freeaiRefreshPack(force) {
 	}
 	if (fresh)
 		return { ok: true, pack: freSession.pack };
-	if (!force && freSessionFailAt + FRE_SESSION_BACKOFF > now)
+	// v2.9.5 (P1-h)：退避时长用分档结果 freSessionBackoffSec，不再写死 60s
+	//（见 freeaiSessionBackoff —— too_frequent/must_upgrade → 15 分钟）。
+	if (!force && freSessionFailAt + freSessionBackoffSec > now)
 		return { ok: false, err: freSessionErr || '会话包拉取退避中' };
 	if (length(c.machine) === 0)
 		return { ok: false, err: 'freeAI 未配置机器码' };
 
 	// token 为空（首次部署或心跳判定失效后清除）→ 先激活换新 token 再领会话包。
 	// 不激活直接调 fp.php 只会得到 "token required"，自愈正则也救不回来。
+	// v2.9.5 修复：这里原为 `if (force || freReauthing)` —— force 的语义是
+	// "跳过会话缓存与失败退避"，不该禁止自愈激活。实测后果：管理页测试与
+	// 403 重领路径（都传 force=true）在 token 缺失时只会报"授权已失效"，
+	// 永远不自愈。递归保护本就由 freReauthing 承担，另 :4922 的重激活
+	// 分支也只在非 force 时进入，去掉 force 判定不会造成激活风暴；
+	// activate.php 自身的 15 分钟失败退避（freActivateFailAt）兜底节流。
 	if (length(c.token) === 0) {
-		if (force || freReauthing) {
+		if (freReauthing) {
 			freSessionFailAt = now;
+			freSessionBackoffSec = FRE_SESSION_BACKOFF;
 			freSessionErr = 'freeAI 未配置 token';
 			return { ok: false, err: freSessionErr };
 		}
@@ -4828,6 +4895,7 @@ function freeaiRefreshPack(force) {
 		freReauthing = false;
 		if (!ra.ok) {
 			freSessionFailAt = now;
+			freSessionBackoffSec = FRE_SESSION_BACKOFF;   // 激活本身另有 15 分钟退避
 			freSessionErr = ra.err;
 			return { ok: false, err: freSessionErr };
 		}
@@ -4844,16 +4912,21 @@ function freeaiRefreshPack(force) {
 	let j = freeaiApi('/fp.php', q);
 	if (j === null) {
 		freSessionFailAt = now;
+		freSessionBackoffSec = FRE_SESSION_BACKOFF;
 		freSessionErr = '会话包请求失败（网络或超时）';
 		return { ok: false, err: freSessionErr };
 	}
 	if (j.ok !== true) {
 		let err = '' + (j.error || ('会话包被拒（' + (j.code || '未知') + '）'));
-		// token invalid / token required / must_upgrade(403 凭据被拒) / 服务端说过期、封禁
+		// token invalid / token required / 服务端说过期、封禁、禁用、不存在
 		// → 静默重激活一次再重领。与官方网关的"用一下就断"自愈一致：
 		// 激活成功后重新领取，成功则本次请求无感通过。
+		// v2.9.5 (P1-g)：must_upgrade 移出本列表。官方 gateway.mjs:402-424 证明
+		// 它是版本闸/服务连接中断，**重激活解决不了**，留在列表里只会白烧
+		// 20 次/时的激活配额（v2.9.3 把 FreeTierError 当会话作废打光配额是同源
+		// 误诊）。落入下面的通用失败路径，由 freeaiSessionBackoff 给长退避。
 		if (!force && !freReauthing &&
-		    match(err, /token invalid|token required|must_upgrade|过期|封禁|禁用|不存在/)) {
+		    match(err, /token invalid|token required|过期|封禁|禁用|不存在/)) {
 			freReauthing = true;
 			// 激活失败则保留原始错误（版本闸/服务端问题会由退避节流）
 			let ra = freeaiActivate();
@@ -4868,6 +4941,7 @@ function freeaiRefreshPack(force) {
 			freReauthing = false;
 		}
 		freSessionFailAt = now;
+		freSessionBackoffSec = freeaiSessionBackoff(err);
 		freSessionErr = err;
 		return { ok: false, err: freSessionErr };
 	}
@@ -4889,12 +4963,14 @@ function freeaiRefreshPack(force) {
 	};
 	if (length(pack.url) === 0) {
 		freSessionFailAt = now;
+		freSessionBackoffSec = FRE_SESSION_BACKOFF;
 		freSessionErr = '会话包缺少 upstream_url';
 		return { ok: false, err: freSessionErr };
 	}
 	freSession = { pack: pack, at: now, sid: sid };
 	freSessionFailAt = 0;
 	freSessionErr = '';
+	freSessionBackoffSec = FRE_SESSION_BACKOFF;   // 成功后复位分档退避
 	return { ok: true, pack: pack };
 }
 
@@ -4905,7 +4981,14 @@ function freeaiSaveToken(tok) {
 		writeJsonFile(FRE_CFG_FILE, {
 			enabled: c.enabled, license: c.license, machine: c.machine,
 			token: '' + tok, tokenAt: time(), model: c.model, base: c.base,
-			ver: c.ver, injectFingerprint: c.injectFingerprint,
+			ver: c.ver,
+			// v2.9.5 修复：重写配置必须带上 ua/http11 —— 原字段集没有它们，
+			// 于是每次 token 刷新（激活/心跳轮换/refreshed_token）都会把
+			// 自定义 UA 与协议开关洗回默认。等于默认的串落空串，保持
+			// "配置里不写死默认值"的约定（与 save 端点同一规则）。
+			ua: (c.ua === FRE_UA) ? '' : c.ua,
+			http11: c.http11,
+			injectFingerprint: c.injectFingerprint,
 			brandNeutralize: c.brandNeutralize,
 		});
 		freCache = { at: 0, data: null };   // 让下次读取拿到新值
@@ -5040,7 +5123,10 @@ function freeaiHeaders(pack, seed) {
 	let sess = freeaiSessionId(seed);
 	let out = {
 		'Authorization': 'Bearer public',
-		'User-Agent': FRE_UA,
+		// v2.9.5：UA 可经 freeai.json `ua` 覆盖（官方客户端升级 1.18.31→新号时
+		// 后台会比对 UA 版本；改配置文件即可跟上，不必重刷插件）。freeaiRaw()
+		// 已保证空/缺失时回退 FRE_UA，且有 60s 缓存，开销可忽略。
+		'User-Agent': freeaiRaw().ua,
 		'x-opencode-client': 'cli',
 		'x-opencode-project': 'prj_' + substr(sha256Hex(readRandom(16)), 0, 12),
 		// 官方网关每次请求都生成"请求/session 绑定头"（gateway.mjs）：
@@ -5273,7 +5359,7 @@ function freeaiBrandMessage(msg) {
 	if (length(s) === 0) return 'freeAI 服务暂时不可用，请稍后重试';
 	let l = lc(s);
 	if (index(l, 'rate limit') >= 0 || index(l, 'too many request') >= 0 ||
-	    index(l, 'too frequent') >= 0 ||
+	    index(l, 'too frequent') >= 0 || index(l, 'too_frequent') >= 0 ||
 	    index(l, '额度') >= 0 || index(l, 'quota') >= 0)
 		return 'freeAI 免费额度已用完：可在控制面板切换出口后重试，或稍后再试';
 	if (index(l, 'not supported') >= 0 || index(l, 'unknown model') >= 0 ||
@@ -5607,6 +5693,9 @@ function freeaiStatus() {
 		ver: c.ver,
 		injectFingerprint: c.injectFingerprint,
 		brandNeutralize: c.brandNeutralize,
+		// v2.9.5 (P2-d/P2-e)：UA 与协议版本回显给管理页，配置与生效值一致才放心
+		ua: c.ua,
+		http11: c.http11,
 		prefix: FRE_PREFIX,
 		upstreamId: FRE_UPID,
 		session: (freSession === null) ? null : {
@@ -5672,16 +5761,26 @@ function freeaiCurlArgs(conn, o) {
 	let args = ['curl', '-sS', '-N', '-X', 'POST'];
 	// 不要 -4：授权服务端与聊天上游都是 Cloudflare 多 A 记录，
 	// -4 会放大 TLS 重置概率（实测不加 -4 时成功率 4/5，加 -4 更低）。
-	// 连接级错误（TLS 重置/连接被重置）在 curl 层重试 2 次 —— freeAI 的
-	// 请求体在文件里，重发是安全的；`--retry-all-errors` 只覆盖"尚未收到
+	// v2.9.5：curl 层重试 2→1 —— `--retry-all-errors` 对 429 也会整请求重发，
+	// 聊天一次打两枪最容易烧免费额度；上游还有我们自己的会话重领与换 Key 重试，
+	// curl 不需要再叠加。请求体在文件里，重发本身是安全的；只覆盖"尚未收到
 	// 任何响应数据"的连接失败，不会对已开始推流的响应做重复生成。
 	push(args, '--retry');
-	push(args, '2');
+	push(args, '1');
 	push(args, '--retry-all-errors');
 	push(args, '--retry-delay');
 	push(args, '1');
-	push(args, '--http2');
-	push(args, '--tcp-fastopen');
+	// v2.9.5：默认 HTTP/1.1 —— 官方网关走 Node undici，ALPN 协商 http/1.1；
+	// 我们强制 --http2 会让 TLS 指纹与官方客户端明显不一致（后台识别非官方
+	// 客户端就限制，见硬约束"模拟 freeai 发的所有请求"）。需切回 h2 时把
+	// freeai.json 的 http11 置 false。
+	let freCfg = freeaiRaw();
+	if (freCfg.http11)
+		push(args, '--http1.1');
+	else
+		push(args, '--http2');
+	// v2.9.5：去掉 --tcp-fastopen —— undici 不使用 TFO，SYN 段携带 TFO cookie
+	// 同样是可观测偏差；且与上面的重试叠加时个别链路行为异常。
 	push(args, '--connect-timeout');
 	push(args, o.connectTimeout);
 	push(args, '--speed-limit');
@@ -7341,6 +7440,19 @@ function adminAppPage() {
         </label>
       </div>
 
+      <div class="field">
+        <label for="freUa">客户端 UA（高级）</label>
+        <input type="text" id="freUa" placeholder="留空 = 默认 opencode/1.18.31 (windows amd64; node22)" autocomplete="off">
+        <p class="hint">留空 = 恢复默认。若官方按 opencode 版本设闸门，在此填新版本号即可跟上，不必重刷插件。</p>
+      </div>
+
+      <div class="field">
+        <label class="row" style="align-items:center;gap:9px;cursor:pointer">
+          <span class="sw"><input type="checkbox" id="freHttp11"><span></span></span>
+          <span>HTTP/1.1 对齐（官方网关同协议；取消勾选则回退 HTTP/2）</span>
+        </label>
+      </div>
+
       <div class="row">
         <div style="flex:0"><button class="primary" onclick="saveFree()">保存设置</button></div>
         <div style="flex:0"><button onclick="testFree()">立即测试</button></div>
@@ -7706,10 +7818,12 @@ function renderUpstreams(d) {
 
 // v2.8.0：调用 /admin/api/upstreams/test-all，并把结果以提示框展示
 function testAllUp() {
-  var st = document.getElementById('upTestAllStatus');
-  if (st) st.textContent = '测试中，请稍候…';
+  // v2.9.5：状态行不再捕获引用 —— load() 每 5 秒轮询会重建 DOM，捕获的 st
+  // 到回调时多半已成 detached 节点，结果写进去页面看不见。改为每次按 id 重查。
+  function setSt(t) { var s = document.getElementById('upTestAllStatus'); if (s) s.textContent = t; }
+  setSt('测试中，请稍候…');
   api('upstreams/test-all', {}).then(function(r) {
-    if (!r) { if (st) st.textContent = '请求失败'; return; }
+    if (!r) { setSt('请求失败'); return; }
     var lines = [];
     for (var i = 0; i < r.results.length && i < 30; i++) {
       var x = r.results[i];
@@ -7719,10 +7833,10 @@ function testAllUp() {
     var head = '共 ' + r.total + ' 个模型：' + r.okCount + ' 可用，' + r.failCount + ' 失败';
     if (lines.length) alert(head + '\\n\\n' + lines.join('\\n'));
     else alert(head);
-    if (st) st.textContent = r.failCount === 0 ? '全部可用 ✅' : r.failCount + ' 个失败 ❌';
+    setSt(r.failCount === 0 ? '全部可用 ✅' : r.failCount + ' 个失败 ❌');
     load();
   }).catch(function(e) {
-    if (st) st.textContent = '请求异常';
+    setSt('请求异常');
   });
 }
 
@@ -8468,6 +8582,8 @@ function renderFree(d) {
   var fp = document.getElementById('freFp');
   var br = document.getElementById('freBrand');
   var en = document.getElementById('freEnabled');
+  var ua = document.getElementById('freUa');
+  var h11 = document.getElementById('freHttp11');
   if (!lic) return;
   lic.value = f.license || '';
   mac.value = f.machine || '';
@@ -8475,6 +8591,10 @@ function renderFree(d) {
   if (fp) fp.checked = !!f.injectFingerprint;
   if (br) br.checked = !!f.brandNeutralize;
   if (en) en.checked = !!f.enabled;
+  // v2.9.5：UA 回显当前**生效值**（未自定义时就是默认串）；清空并保存 =
+  // 恢复默认。http11 用 !== false 判定，字段缺失（旧投影）时保持勾选默认。
+  if (ua) ua.value = f.ua || '';
+  if (h11) h11.checked = (f.http11 !== false);
 
   // 填充模型候选（来自 /v1/models 里的 freeai/ 条目）
   var dl = document.getElementById('freModels');
@@ -8522,6 +8642,10 @@ function saveFree() {
     enabled: document.getElementById('freEnabled').checked,
     injectFingerprint: document.getElementById('freFp').checked,
     brandNeutralize: document.getElementById('freBrand').checked,
+    // v2.9.5：UA 与协议版本随表单一起提交。空 UA = 恢复默认（服务端落空串，
+    // freeaiRaw() 回退 FRE_UA）；http11 复选框未勾 = 回退 HTTP/2。
+    ua: document.getElementById('freUa').value.trim(),
+    http11: document.getElementById('freHttp11').checked,
   };
   api('freeai/save', body).then(function(r) {
     if (r.ok) { toast('freeAI 设置已保存', 'ok'); renderFree({ freeai: r.freeai, models: S.models }); }
@@ -8842,17 +8966,27 @@ function handleAdmin(conn, req, method, path, query, body) {
 		}
 		let lic = unchanged(j.license, cur.license) ? cur.license : trim('' + j.license);
 		let mac = unchanged(j.machine, cur.machine) ? cur.machine : trim('' + j.machine);
-		let tok = (j.token === null) ? cur.token : trim('' + j.token);
+		let tok = unchanged(j.token, cur.token) ? cur.token : trim('' + j.token);
 		// v2.9.2：tokenAt 只在 token 真的换了时才刷新。原写法恒为 cur.tokenAt，
 		// 于是管理页手工粘贴新 token 后时间戳还是旧的（tokenAge 显示成
 		// "来自很久以前"，用户会以为没存进去）；而恒写 time() 又会让每次
 		// 「打开页面点保存」都伪装成刚续签过，掩盖真正的过期。用差异判定。
 		let tokAt = (tok === cur.token) ? cur.tokenAt : time();
+		// v2.9.5 (P2-d)：UA 可配。空串或等于默认串 ⇒ 落空（freeaiRaw() 回退
+		// FRE_UA，配置里不写死一份和默认一样的长字符串）；其它值按自定义 UA
+		// 落盘。null（旧表单没带这个字段）保持当前生效值，和 lic/mac 同规矩。
+		let uaNew = cur.ua;
+		if (j.ua !== null) {
+			let vua = trim('' + j.ua);
+			uaNew = (length(vua) === 0 || vua === FRE_UA) ? '' : vua;
+		}
 		writeJsonFile(FRE_CFG_FILE, {
 			enabled: (j.enabled === null) ? cur.enabled : truthy(j.enabled),
 			license: lic, machine: mac, token: tok,
-			tokenAt: tokAt, model: (j.model === null) ? cur.model : ('' + j.model),
+			tokenAt: tokAt, model: unchanged(j.model, cur.model) ? cur.model : trim('' + j.model),
 			base: cur.base, ver: cur.ver,
+			ua: uaNew,
+			http11: (j.http11 === null) ? cur.http11 : truthy(j.http11),
 			injectFingerprint: (j.injectFingerprint === null) ? cur.injectFingerprint : truthy(j.injectFingerprint),
 			brandNeutralize: (j.brandNeutralize === null) ? cur.brandNeutralize : truthy(j.brandNeutralize),
 		});
@@ -8908,7 +9042,7 @@ function handleAdmin(conn, req, method, path, query, body) {
 			writefile(file, sprintf('%.J', body));
 			let hdrs = freeaiHeaders(r.pack, freeaiSeedOf(body));
 			let args = ['curl', '-sS', '-N', '-m', '40', '-X', 'POST',
-				'--retry', '2', '--retry-all-errors', '--retry-delay', '1',
+				'--retry', '1', '--retry-all-errors', '--retry-delay', '1',
 				'-H', shquote('Content-Type: application/json')];
 			for (let k in hdrs) { push(args, shquote('-H')); push(args, shquote(k + ': ' + hdrs[k])); }
 			push(args, shquote('--data-binary'));
